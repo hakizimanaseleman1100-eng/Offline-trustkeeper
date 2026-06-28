@@ -84,3 +84,15 @@ db.version(4).stores({
 db.version(5).stores({
   inventory: 'id, item_code, category',
 });
+
+/*
+ * version(6): adds a local audit trail for destructive POS actions
+ * (removing a cart item, voiding a whole tab). Logged BEFORE the delete
+ * happens, so even if the rest of the operation fails partway, there's
+ * still a record that someone attempted it. Synced to Supabase the same
+ * way sales are — synced_status 0/1, never a boolean, for the same
+ * indexing reason noted above.
+ */
+db.version(6).stores({
+  audit_logs: '++id, action_type, timestamp, synced_status',
+});

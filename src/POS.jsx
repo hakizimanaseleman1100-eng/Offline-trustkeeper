@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './db';
 import { supabase } from './supabaseClient';
@@ -6,16 +6,53 @@ import { CURRENT_BUSINESS_ID } from './config';
 
 function POS({ onLogout }) {
   const [activeTabId, setActiveTabId] = useState(null);
-  const [category, setCategory] = useState(null);
+  const [selectedCategory, setSelectedCategory] = useState('All');
+  const [searchQuery, setSearchQuery] = useState('');
   const [toast, setToast] = useState('');
   const [syncing, setSyncing] = useState(false);
   const [showCustomerDetails, setShowCustomerDetails] = useState(false);
   const [customerTin, setCustomerTin] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
+  const [cartOpen, setCartOpen] = useState(false);
+  const [fabPos, setFabPos] = useState(() => ({
+    x: window.innerWidth - 88,
+    y: window.innerHeight - 240,
+  }));
+  const dragRef = useRef({ dragging: false, moved: false, startX: 0, startY: 0, origX: 0, origY: 0 });
 
   const showToast = (message, duration = 2500) => {
     setToast(message);
     setTimeout(() => setToast(''), duration);
+  };
+
+  // Dragging the floating cart button moves it; releasing without much
+  // movement counts as a tap that opens the cart drawer instead.
+  const onFabPointerDown = (e) => {
+    e.target.setPointerCapture(e.pointerId);
+    dragRef.current = {
+      dragging: true,
+      moved: false,
+      startX: e.clientX,
+      startY: e.clientY,
+      origX: fabPos.x,
+      origY: fabPos.y,
+    };
+  };
+
+  const onFabPointerMove = (e) => {
+    if (!dragRef.current.dragging) return;
+    const dx = e.clientX - dragRef.current.startX;
+    const dy = e.clientY - dragRef.current.startY;
+    if (Math.abs(dx) > 5 || Math.abs(dy) > 5) dragRef.current.moved = true;
+    setFabPos({
+      x: Math.min(Math.max(0, dragRef.current.origX + dx), window.innerWidth - 64),
+      y: Math.min(Math.max(0, dragRef.current.origY + dy), window.innerHeight - 64),
+    });
+  };
+
+  const onFabPointerUp = () => {
+    if (!dragRef.current.moved) setCartOpen(true);
+    dragRef.current.dragging = false;
   };
 
   const openTabs = useLiveQuery(
@@ -32,11 +69,14 @@ function POS({ onLogout }) {
   // Categories come from whatever is actually in inventory — no hardcoded list.
   const categories = useLiveQuery(() => db.inventory.orderBy('category').uniqueKeys(), [], []);
 
-  const items = useLiveQuery(
-    () => (category ? db.inventory.where('category').equals(category).toArray() : []),
-    [category],
-    []
-  );
+  // Items are loaded flat (no category routing step) and filtered in memory
+  // by both the selected category pill and the search query.
+  const allItems = useLiveQuery(() => db.inventory.toArray(), [], []);
+  const items = allItems.filter((item) => {
+    const matchesCategory = selectedCategory === 'All' || item.category === selectedCategory;
+    const matchesSearch = item.item_name.toLowerCase().includes(searchQuery.toLowerCase());
+    return matchesCategory && matchesSearch;
+  });
 
   // Cart for the open tab — joined with inventory so the list can show item names.
   const cartItems = useLiveQuery(
@@ -54,6 +94,16 @@ function POS({ onLogout }) {
     []
   );
   const cartTotal = cartItems.reduce((sum, row) => sum + row.total_price, 0);
+  const cartItemCount = cartItems.reduce((sum, row) => sum + (row.quantity ?? 1), 0);
+  const currentRound = activeTab?.current_round ?? 1;
+  const roundsMap = cartItems.reduce((acc, row) => {
+    const r = row.round ?? 1;
+    (acc[r] ||= []).push(row);
+    return acc;
+  }, {});
+  const roundNumbers = Object.keys(roundsMap)
+    .map(Number)
+    .sort((a, b) => a - b);
 
   const createTab = async () => {
     const tabNumber = (await db.active_tabs.count()) + 1;
@@ -61,9 +111,11 @@ function POS({ onLogout }) {
       name: `Tab ${tabNumber}`,
       created_at: Date.now(),
       status: 'open',
+      current_round: 1,
     });
     setActiveTabId(id);
-    setCategory(null);
+    setSelectedCategory('All');
+    setSearchQuery('');
   };
 
   // A waiter can optionally rename the tab later, from the Customer Details
@@ -74,19 +126,52 @@ function POS({ onLogout }) {
 
   const closeTabView = () => {
     setActiveTabId(null);
-    setCategory(null);
+    setSelectedCategory('All');
+    setSearchQuery('');
     setShowCustomerDetails(false);
     setCustomerTin('');
     setCustomerPhone('');
+    setCartOpen(false);
+  };
+
+  const logAudit = (actionType, details) =>
+    db.audit_logs.add({
+      action_type: actionType,
+      details,
+      timestamp: Date.now(),
+      synced_status: 0,
+    });
+
+  const removeItemFromTab = async (saleId, itemName) => {
+    // Log BEFORE deleting — if anything goes wrong mid-operation, there's
+    // still a record that this removal was attempted.
+    await logAudit('VOID_ITEM', `Removed ${itemName} from Tab ${activeTab?.name ?? ''}`);
+    await db.sales.delete(saleId);
+  };
+
+  const cancelTab = async () => {
+    if (!window.confirm(`Void ${activeTab?.name ?? 'this tab'} and discard all its items?`)) return;
+    await logAudit(
+      'CANCEL_TAB',
+      `Cancelled Tab ${activeTab?.name ?? ''} with ${cartItems.length} item(s)`
+    );
+    await db.sales.where('tab_id').equals(activeTabId).delete();
+    await db.active_tabs.delete(activeTabId);
+    showToast(`${activeTab?.name ?? 'Tab'} voided`);
+    closeTabView();
   };
 
   const addItemToTab = async (item) => {
-    // Repeated taps on the same item bump quantity on its existing cart line
-    // instead of stacking up duplicate rows — one line per item, not per tap.
+    const currentRound = activeTab?.current_round ?? 1;
+
+    // Repeated taps on the same item bump quantity on its existing cart line —
+    // but only within the SAME round. A repeat order after "Send Round" gets
+    // its own new line, so the kitchen/bar can see it's a fresh request, not
+    // silently folded into a round that's already been sent.
     const existing = await db.sales
       .where('tab_id')
       .equals(activeTabId)
-      .filter((row) => row.item_id === item.id)
+      .filter((row) => row.item_id === item.id && (row.round ?? 1) === currentRound)
       .first();
 
     if (existing) {
@@ -103,6 +188,7 @@ function POS({ onLogout }) {
     await db.sales.add({
       item_id: item.id,
       tab_id: activeTabId,
+      round: currentRound,
       quantity: 1,
       total_price: item.unit_price,
       cost_price: item.cost_price,
@@ -111,6 +197,12 @@ function POS({ onLogout }) {
       timestamp: Date.now(),
       synced_status: 0,
     });
+  };
+
+  const sendRound = async () => {
+    const currentRound = activeTab?.current_round ?? 1;
+    await db.active_tabs.update(activeTabId, { current_round: currentRound + 1 });
+    showToast(`Round ${currentRound} sent`);
   };
 
   const checkout = async (paymentMethod) => {
@@ -170,6 +262,23 @@ function POS({ onLogout }) {
       await db.sales.bulkUpdate(
         unsynced.map((sale) => ({ key: sale.id, changes: { synced_status: 1 } }))
       );
+
+      const unsyncedLogs = await db.audit_logs.where('synced_status').equals(0).toArray();
+      if (unsyncedLogs.length > 0) {
+        const { error: auditError } = await supabase.from('audit_logs').insert(
+          unsyncedLogs.map((log) => ({
+            business_id: CURRENT_BUSINESS_ID,
+            action_type: log.action_type,
+            details: log.details,
+            timestamp: new Date(log.timestamp).toISOString(),
+          }))
+        );
+        if (auditError) throw auditError;
+
+        await db.audit_logs.bulkUpdate(
+          unsyncedLogs.map((log) => ({ key: log.id, changes: { synced_status: 1 } }))
+        );
+      }
 
       showToast(`Sync Complete: ${unsynced.length} records uploaded`);
     } catch (err) {
@@ -242,116 +351,197 @@ function POS({ onLogout }) {
         ) : (
           /* INSIDE A TAB: category → items → running cart */
           <div className="space-y-8">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-3">
               <h2 className="text-2xl font-extrabold text-slate-900">{activeTab?.name}</h2>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={cancelTab}
+                  className="px-4 py-2 rounded-xl border-2 border-red-500 text-red-600 font-semibold active:scale-95"
+                >
+                  Void Tab
+                </button>
+                <button
+                  onClick={closeTabView}
+                  className="px-4 py-2 rounded-xl bg-white shadow-md font-semibold text-slate-600 active:scale-95"
+                >
+                  ← Back to Tabs
+                </button>
+              </div>
+            </div>
+
+            {categories.length === 0 ? (
+              <p className="text-slate-400 text-lg">No inventory yet — connect to the internet to sync products.</p>
+            ) : (
+              <>
+                {/* Search bar — items show immediately, no category routing step */}
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search items…"
+                  className="w-full px-5 py-4 rounded-2xl border border-gray-300 text-lg shadow-sm"
+                />
+
+                {/* Category pills — horizontally scrolling, "All" prepended */}
+                <div className="flex gap-2 overflow-x-auto pb-1 -mx-1 px-1">
+                  {['All', ...categories].map((cat) => (
+                    <button
+                      key={cat}
+                      onClick={() => setSelectedCategory(cat)}
+                      className={`shrink-0 px-5 py-2 rounded-full font-semibold text-sm transition active:scale-95 ${
+                        selectedCategory === cat ? 'bg-amber-500 text-white' : 'bg-white text-slate-600 shadow-sm'
+                      }`}
+                    >
+                      {cat}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Item grid — tapping adds straight to the tab's cart */}
+                {items.length === 0 ? (
+                  <p className="text-slate-400 text-lg">No items match.</p>
+                ) : (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-5">
+                    {items.map((item) => (
+                      <button
+                        key={item.id}
+                        onClick={() => addItemToTab(item)}
+                        className="p-4 sm:p-6 rounded-2xl text-lg sm:text-xl font-bold bg-white shadow-md text-left transition active:scale-95 border-4 border-transparent"
+                      >
+                        <span className="block text-slate-900">{item.item_name}</span>
+                        <span className="block text-base font-semibold text-slate-500 mt-1">
+                          {item.unit_price.toLocaleString()} RWF
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+
+          </div>
+        )}
+      </main>
+
+      {/* Floating draggable cart button — drag to reposition, tap to open */}
+      {activeTabId !== null && (
+        <button
+          onPointerDown={onFabPointerDown}
+          onPointerMove={onFabPointerMove}
+          onPointerUp={onFabPointerUp}
+          style={{ left: fabPos.x, top: fabPos.y, touchAction: 'none' }}
+          className="fixed z-20 w-16 h-16 rounded-full bg-slate-900 text-white shadow-xl flex items-center justify-center text-2xl active:scale-95"
+        >
+          🛒
+          {cartItemCount > 0 && (
+            <span className="absolute -top-1 -right-1 bg-red-500 text-white text-xs font-bold rounded-full w-6 h-6 flex items-center justify-center">
+              {cartItemCount}
+            </span>
+          )}
+        </button>
+      )}
+
+      {/* Cart drawer — replaces the old inline list; grouped by round */}
+      {activeTabId !== null && cartOpen && (
+        <div className="fixed inset-0 z-30 flex flex-col justify-end" onClick={() => setCartOpen(false)}>
+          <div className="absolute inset-0 bg-black/40" />
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="relative bg-white rounded-t-3xl shadow-xl max-h-[75vh] flex flex-col"
+          >
+            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+              <h3 className="text-xl font-extrabold text-slate-900">{activeTab?.name} — Order</h3>
               <button
-                onClick={closeTabView}
-                className="px-4 py-2 rounded-xl bg-white shadow-md font-semibold text-slate-600 active:scale-95"
+                onClick={() => setCartOpen(false)}
+                aria-label="Close cart"
+                className="text-slate-400 text-2xl leading-none w-8 h-8"
               >
-                ← Back to Tabs
+                ×
               </button>
             </div>
 
-            {/* TAP 1: Category — read from whatever categories exist in inventory */}
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-5">
-              {categories.length === 0 ? (
-                <p className="col-span-2 sm:col-span-3 lg:col-span-4 text-slate-400 text-lg">
-                  No inventory yet — connect to the internet to sync products.
-                </p>
+            <div className="overflow-y-auto flex-1">
+              {cartItems.length === 0 ? (
+                <p className="text-slate-400 text-lg p-5">Nothing added yet.</p>
               ) : (
-                categories.map((cat) => (
-                  <button
-                    key={cat}
-                    onClick={() => setCategory(cat)}
-                    className={`h-20 sm:h-24 rounded-2xl text-lg sm:text-2xl font-bold bg-white shadow-md transition active:scale-95 border-4 ${
-                      category === cat ? 'border-amber-500 text-amber-600' : 'border-transparent text-slate-800'
-                    }`}
-                  >
-                    {cat}
-                  </button>
+                roundNumbers.map((r) => (
+                  <div key={r} className="divide-y divide-gray-100">
+                    <p className="text-xs font-bold uppercase text-slate-400 px-5 pt-4 pb-1">
+                      {r === currentRound ? 'Current Round' : `Round ${r} — sent`}
+                    </p>
+                    {roundsMap[r].map((row) => (
+                      <div key={row.id} className="flex items-center justify-between px-5 py-3 text-lg gap-3">
+                        <span className="font-semibold text-slate-800">
+                          {row.name}
+                          {row.quantity > 1 && (
+                            <span className="text-slate-400 font-normal"> × {row.quantity}</span>
+                          )}
+                        </span>
+                        <div className="flex items-center gap-3">
+                          <span className="text-slate-500">{row.total_price.toLocaleString()} RWF</span>
+                          <button
+                            onClick={() => removeItemFromTab(row.id, row.name)}
+                            aria-label={`Remove ${row.name}`}
+                            className="w-9 h-9 shrink-0 rounded-full bg-red-50 text-red-600 font-bold text-lg active:scale-95"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 ))
               )}
             </div>
 
-            {/* TAP 2: Item grid — tapping adds straight to the tab's cart */}
-            {category && (
-              <div>
-                <p className="text-slate-500 font-semibold mb-4 text-lg">Tap to add</p>
-                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-5">
-                  {items.map((item) => (
-                    <button
-                      key={item.id}
-                      onClick={() => addItemToTab(item)}
-                      className="p-4 sm:p-6 rounded-2xl text-lg sm:text-xl font-bold bg-white shadow-md text-left transition active:scale-95 border-4 border-transparent"
-                    >
-                      <span className="block text-slate-900">{item.item_name}</span>
-                      <span className="block text-base font-semibold text-slate-500 mt-1">
-                        {item.unit_price.toLocaleString()} RWF
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Running cart for this tab */}
-            <div>
-              <p className="text-slate-500 font-semibold mb-4 text-lg">Order so far</p>
-              {cartItems.length === 0 ? (
-                <p className="text-slate-400 text-lg">Nothing added yet.</p>
-              ) : (
-                <div className="bg-white rounded-2xl shadow-md divide-y divide-gray-100">
-                  {cartItems.map((row) => (
-                    <div key={row.id} className="flex justify-between px-5 py-3 text-lg">
-                      <span className="font-semibold text-slate-800">
-                        {row.name}
-                        {row.quantity > 1 && <span className="text-slate-400 font-normal"> × {row.quantity}</span>}
-                      </span>
-                      <span className="text-slate-500">{row.total_price.toLocaleString()} RWF</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* Optional details — collapsed by default, no text input forced while serving */}
-            <div>
+            <div className="p-4 border-t border-gray-100 space-y-3">
               <button
-                onClick={() => setShowCustomerDetails((open) => !open)}
-                className="text-slate-500 font-semibold underline"
+                onClick={sendRound}
+                disabled={!roundsMap[currentRound]?.length}
+                className="w-full py-3 rounded-xl bg-slate-900 text-white font-bold disabled:opacity-40 active:scale-95"
               >
-                {showCustomerDetails ? '− Hide' : '+ Add'} Customer Details (optional)
+                Send Round {currentRound} to Kitchen/Bar
               </button>
-              {showCustomerDetails && (
-                <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <input
-                    type="text"
-                    placeholder="Table / Guest name"
-                    defaultValue={activeTab?.name ?? ''}
-                    onChange={(e) => renameTab(e.target.value)}
-                    className="px-4 py-3 rounded-xl border border-gray-300 text-lg sm:col-span-2"
-                  />
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    placeholder="Customer TIN"
-                    value={customerTin}
-                    onChange={(e) => setCustomerTin(e.target.value)}
-                    className="px-4 py-3 rounded-xl border border-gray-300 text-lg"
-                  />
-                  <input
-                    type="tel"
-                    placeholder="Customer Phone"
-                    value={customerPhone}
-                    onChange={(e) => setCustomerPhone(e.target.value)}
-                    className="px-4 py-3 rounded-xl border border-gray-300 text-lg"
-                  />
-                </div>
-              )}
+
+              {/* Optional details — collapsed by default, no text input forced while serving */}
+              <div>
+                <button
+                  onClick={() => setShowCustomerDetails((open) => !open)}
+                  className="text-slate-500 font-semibold underline text-sm"
+                >
+                  {showCustomerDetails ? '− Hide' : '+ Add'} Customer Details (optional)
+                </button>
+                {showCustomerDetails && (
+                  <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <input
+                      type="text"
+                      placeholder="Table / Guest name"
+                      defaultValue={activeTab?.name ?? ''}
+                      onChange={(e) => renameTab(e.target.value)}
+                      className="px-4 py-3 rounded-xl border border-gray-300 text-lg sm:col-span-2"
+                    />
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      placeholder="Customer TIN"
+                      value={customerTin}
+                      onChange={(e) => setCustomerTin(e.target.value)}
+                      className="px-4 py-3 rounded-xl border border-gray-300 text-lg"
+                    />
+                    <input
+                      type="tel"
+                      placeholder="Customer Phone"
+                      value={customerPhone}
+                      onChange={(e) => setCustomerPhone(e.target.value)}
+                      className="px-4 py-3 rounded-xl border border-gray-300 text-lg"
+                    />
+                  </div>
+                )}
+              </div>
             </div>
           </div>
-        )}
-      </main>
+        </div>
+      )}
 
       {/* Toast */}
       {toast && (
