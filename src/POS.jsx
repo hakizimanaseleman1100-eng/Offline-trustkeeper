@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './db';
 import { supabase } from './supabaseClient';
@@ -14,51 +14,46 @@ function POS({ onLogout }) {
   const [customerTin, setCustomerTin] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
   const [cartOpen, setCartOpen] = useState(false);
-  const [fabPos, setFabPos] = useState(() => ({
-    x: window.innerWidth - 88,
-    y: window.innerHeight - 240,
-  }));
-  const dragRef = useRef({ dragging: false, moved: false, startX: 0, startY: 0, origX: 0, origY: 0 });
+  const [showBill, setShowBill] = useState(false);
 
   const showToast = (message, duration = 2500) => {
     setToast(message);
     setTimeout(() => setToast(''), duration);
   };
 
-  // Dragging the floating cart button moves it; releasing without much
-  // movement counts as a tap that opens the cart drawer instead.
-  const onFabPointerDown = (e) => {
-    e.target.setPointerCapture(e.pointerId);
-    dragRef.current = {
-      dragging: true,
-      moved: false,
-      startX: e.clientX,
-      startY: e.clientY,
-      origX: fabPos.x,
-      origY: fabPos.y,
-    };
-  };
-
-  const onFabPointerMove = (e) => {
-    if (!dragRef.current.dragging) return;
-    const dx = e.clientX - dragRef.current.startX;
-    const dy = e.clientY - dragRef.current.startY;
-    if (Math.abs(dx) > 5 || Math.abs(dy) > 5) dragRef.current.moved = true;
-    setFabPos({
-      x: Math.min(Math.max(0, dragRef.current.origX + dx), window.innerWidth - 64),
-      y: Math.min(Math.max(0, dragRef.current.origY + dy), window.innerHeight - 64),
-    });
-  };
-
-  const onFabPointerUp = () => {
-    if (!dragRef.current.moved) setCartOpen(true);
-    dragRef.current.dragging = false;
-  };
-
   const openTabs = useLiveQuery(
     () => db.active_tabs.where('status').equals('open').reverse().sortBy('created_at'),
     [],
     []
+  );
+
+  // Per-tab running totals for the Home screen cards, keyed by tab_id.
+  const tabTotals = useLiveQuery(
+    async () => {
+      const sales = await db.sales.toArray();
+      return sales.reduce((acc, sale) => {
+        acc[sale.tab_id] = (acc[sale.tab_id] ?? 0) + sale.total_price;
+        return acc;
+      }, {});
+    },
+    [],
+    {}
+  );
+
+  // Lets staff see at a glance whether a sync is actually needed, instead of
+  // tapping "Sync to Cloud" speculatively.
+  const unsyncedCount = useLiveQuery(
+    async () => {
+      const paidTabIds = new Set(
+        (await db.active_tabs.where('status').equals('paid').toArray()).map((tab) => tab.id)
+      );
+      const unsynced = (await db.sales.where('synced_status').equals(0).toArray()).filter((sale) =>
+        paidTabIds.has(sale.tab_id)
+      );
+      return unsynced.length;
+    },
+    [],
+    0
   );
 
   const activeTab = useLiveQuery(
@@ -105,6 +100,19 @@ function POS({ onLogout }) {
     .map(Number)
     .sort((a, b) => a - b);
 
+  // The customer-facing bill collapses lines for the same item across
+  // rounds into one entry — the kitchen needs the round-by-round breakdown,
+  // the customer just needs "what" and "how much".
+  const billItems = Object.values(
+    cartItems.reduce((acc, row) => {
+      const key = row.item_id;
+      if (!acc[key]) acc[key] = { item_id: key, name: row.name, quantity: 0, total_price: 0 };
+      acc[key].quantity += row.quantity ?? 1;
+      acc[key].total_price += row.total_price;
+      return acc;
+    }, {})
+  );
+
   const createTab = async () => {
     const tabNumber = (await db.active_tabs.count()) + 1;
     const id = await db.active_tabs.add({
@@ -132,6 +140,23 @@ function POS({ onLogout }) {
     setCustomerTin('');
     setCustomerPhone('');
     setCartOpen(false);
+    setShowBill(false);
+  };
+
+  // Quick-access from a tab card on the Home screen — jump straight into the
+  // tab's cart or bill instead of opening the tab then hunting for the icon.
+  const openTabWithCart = (id) => {
+    setActiveTabId(id);
+    setSelectedCategory('All');
+    setSearchQuery('');
+    setCartOpen(true);
+  };
+
+  const openTabWithBill = (id) => {
+    setActiveTabId(id);
+    setSelectedCategory('All');
+    setSearchQuery('');
+    setShowBill(true);
   };
 
   const logAudit = (actionType, details) =>
@@ -147,6 +172,23 @@ function POS({ onLogout }) {
     // still a record that this removal was attempted.
     await logAudit('VOID_ITEM', `Removed ${itemName} from Tab ${activeTab?.name ?? ''}`);
     await db.sales.delete(saleId);
+    showToast(`Removed ${itemName}`);
+  };
+
+  // Stepper for an existing cart line — derives unit price from the stored
+  // total/quantity rather than re-reading inventory, so it still works if
+  // the item's price has since changed.
+  const changeQuantity = async (row, delta) => {
+    const newQuantity = (row.quantity ?? 1) + delta;
+    if (newQuantity <= 0) {
+      await removeItemFromTab(row.id, row.name);
+      return;
+    }
+    const unitPrice = row.total_price / (row.quantity ?? 1);
+    await db.sales.update(row.id, {
+      quantity: newQuantity,
+      total_price: unitPrice * newQuantity,
+    });
   };
 
   const cancelTab = async () => {
@@ -203,6 +245,75 @@ function POS({ onLogout }) {
     const currentRound = activeTab?.current_round ?? 1;
     await db.active_tabs.update(activeTabId, { current_round: currentRound + 1 });
     showToast(`Round ${currentRound} sent`);
+    closeTabView();
+  };
+
+  // Plain-text bill — used for both the share sheet and the clipboard fallback.
+  const billText = () =>
+    [
+      activeTab?.name ?? 'Bill',
+      ...billItems.map((row) => `${row.name} x${row.quantity} — ${row.total_price.toLocaleString()} RWF`),
+      `Total: ${cartTotal.toLocaleString()} RWF`,
+    ].join('\n');
+
+  const escapeHtml = (s) =>
+    String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  // Prints just the bill, in its own window — printing the live app would
+  // also capture the header, item grid, and bottom nav bar.
+  const printBill = () => {
+    const win = window.open('', '_blank', 'width=380,height=600');
+    if (!win) {
+      showToast('Allow pop-ups to print the bill');
+      return;
+    }
+    const rows = billItems
+      .map(
+        (row) =>
+          `<div class="row"><span>${escapeHtml(row.name)}${row.quantity > 1 ? ` x${row.quantity}` : ''}</span><span>${row.total_price.toLocaleString()} RWF</span></div>`
+      )
+      .join('');
+    win.document.write(`<!doctype html><html><head><title>${escapeHtml(activeTab?.name ?? 'Bill')}</title>
+      <style>
+        body { font-family: monospace; padding: 16px; color: #111; }
+        h2 { margin: 0 0 12px; }
+        .row { display: flex; justify-content: space-between; gap: 12px; margin: 4px 0; }
+        .total { border-top: 1px solid #111; margin-top: 10px; padding-top: 10px; font-weight: bold; }
+      </style></head><body>
+      <h2>${escapeHtml(activeTab?.name ?? 'Bill')}</h2>
+      ${rows}
+      <div class="row total"><span>Total</span><span>${cartTotal.toLocaleString()} RWF</span></div>
+      </body></html>`);
+    win.document.close();
+    win.onload = () => {
+      win.focus();
+      win.print();
+    };
+    win.onafterprint = () => win.close();
+  };
+
+  const copyBillToClipboard = async (text) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast('Bill copied to clipboard');
+    } catch {
+      showToast('Could not share or copy the bill');
+    }
+  };
+
+  const shareBill = async () => {
+    const text = billText();
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: activeTab?.name ?? 'Bill', text });
+      } catch (err) {
+        // AbortError just means the waiter closed the share sheet — anything
+        // else (no share target, permission denied) should fall back.
+        if (err?.name !== 'AbortError') await copyBillToClipboard(text);
+      }
+    } else {
+      await copyBillToClipboard(text);
+    }
   };
 
   const checkout = async (paymentMethod) => {
@@ -290,28 +401,33 @@ function POS({ onLogout }) {
   };
 
   return (
-    <div className="min-h-screen bg-gray-50 font-sans pb-44">
+    <div className="min-h-screen bg-gray-50 font-sans pb-20">
       {/* Header */}
-      <header className="bg-slate-900 text-white px-4 sm:px-6 py-4 sm:py-5 flex flex-wrap gap-3 justify-between items-center shadow-lg">
-        <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight">Sovereign POS</h1>
-        <div className="flex items-center gap-3 sm:gap-5">
+      <header className="bg-slate-900 text-white px-3 sm:px-6 py-2 sm:py-3 flex flex-wrap gap-2 justify-between items-center shadow-lg">
+        <h1 className="text-lg sm:text-2xl font-extrabold tracking-tight">Sovereign POS</h1>
+        <div className="flex items-center gap-2 sm:gap-4">
           <div className="text-right">
-            <div className="text-xs uppercase tracking-widest text-slate-400">Open Tabs</div>
-            <div className="text-xl sm:text-2xl font-bold">{openTabs.length}</div>
+            <div className="text-[10px] uppercase tracking-widest text-slate-400">Open Tabs</div>
+            <div className="text-base sm:text-xl font-bold">{openTabs.length}</div>
           </div>
           <button
             onClick={syncData}
             disabled={syncing}
             aria-label="Sync to Cloud"
-            className="px-3 sm:px-4 py-2 rounded-xl bg-emerald-600 font-semibold text-sm transition active:scale-95 disabled:opacity-50"
+            className="relative px-2.5 sm:px-4 py-1.5 rounded-xl bg-emerald-600 font-semibold text-xs sm:text-sm transition active:scale-95 disabled:opacity-50"
           >
             <span className="sm:hidden">☁</span>
             <span className="hidden sm:inline">{syncing ? 'Syncing…' : '☁ Sync to Cloud'}</span>
+            {!syncing && unsyncedCount > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 bg-red-500 text-white text-[10px] font-bold rounded-full w-5 h-5 flex items-center justify-center">
+                {unsyncedCount}
+              </span>
+            )}
           </button>
           <button
             onClick={onLogout}
             aria-label="Logout"
-            className="px-3 py-2 rounded-xl bg-slate-700 font-semibold text-sm transition active:scale-95"
+            className="px-2.5 py-1.5 rounded-xl bg-slate-700 font-semibold text-xs sm:text-sm transition active:scale-95"
           >
             <span className="sm:hidden">⏏</span>
             <span className="hidden sm:inline">Logout</span>
@@ -319,7 +435,7 @@ function POS({ onLogout }) {
         </div>
       </header>
 
-      <main className="p-4 sm:p-5 space-y-8 max-w-5xl mx-auto">
+      <main className="p-3 sm:p-5 space-y-4 max-w-7xl mx-auto">
         {activeTabId === null ? (
           /* HOME: split screen — active tabs grid (left) + create tab (right), stacked on mobile */
           <div className="flex flex-col sm:grid sm:grid-cols-3 gap-5">
@@ -330,13 +446,37 @@ function POS({ onLogout }) {
               ) : (
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
                   {openTabs.map((tab) => (
-                    <button
-                      key={tab.id}
-                      onClick={() => setActiveTabId(tab.id)}
-                      className="h-20 sm:h-24 rounded-2xl text-lg sm:text-xl font-bold bg-white shadow-md transition active:scale-95 border-4 border-transparent text-slate-800"
-                    >
-                      {tab.name}
-                    </button>
+                    <div key={tab.id} className="relative">
+                      <button
+                        onClick={() => setActiveTabId(tab.id)}
+                        className="h-20 sm:h-24 w-full rounded-2xl bg-white shadow-md transition active:scale-95 border-4 border-transparent text-slate-800 flex flex-col items-center justify-center gap-0.5"
+                      >
+                        <span className="text-lg sm:text-xl font-bold">{tab.name}</span>
+                        <span className="text-xs font-semibold text-slate-400">
+                          {(tabTotals[tab.id] ?? 0).toLocaleString()} RWF
+                        </span>
+                      </button>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openTabWithCart(tab.id);
+                        }}
+                        aria-label={`Cart for ${tab.name}`}
+                        className="absolute top-1.5 left-1.5 w-6 h-6 rounded-full bg-slate-900/80 text-white text-xs flex items-center justify-center active:scale-95"
+                      >
+                        🛒
+                      </button>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openTabWithBill(tab.id);
+                        }}
+                        aria-label={`Bill for ${tab.name}`}
+                        className="absolute top-1.5 right-1.5 w-6 h-6 rounded-full bg-slate-900/80 text-white text-xs flex items-center justify-center active:scale-95"
+                      >
+                        🧾
+                      </button>
+                    </div>
                   ))}
                 </div>
               )}
@@ -350,23 +490,24 @@ function POS({ onLogout }) {
           </div>
         ) : (
           /* INSIDE A TAB: category → items → running cart */
-          <div className="space-y-8">
+          <div className="space-y-3">
             <div className="flex items-center justify-between gap-3">
-              <h2 className="text-2xl font-extrabold text-slate-900">{activeTab?.name}</h2>
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={cancelTab}
-                  className="px-4 py-2 rounded-xl border-2 border-red-500 text-red-600 font-semibold active:scale-95"
-                >
-                  Void Tab
-                </button>
-                <button
-                  onClick={closeTabView}
-                  className="px-4 py-2 rounded-xl bg-white shadow-md font-semibold text-slate-600 active:scale-95"
-                >
-                  ← Back to Tabs
-                </button>
-              </div>
+              <button
+                onClick={closeTabView}
+                aria-label="Back to tabs"
+                className="w-9 h-9 shrink-0 rounded-full bg-white shadow-md text-slate-600 text-lg flex items-center justify-center active:scale-95"
+              >
+                ←
+              </button>
+              <h2 className="text-lg font-extrabold text-slate-900 truncate text-center flex-1">{activeTab?.name}</h2>
+              <span className="text-lg font-bold text-slate-800 shrink-0">{cartTotal.toLocaleString()} RWF</span>
+              <button
+                onClick={cancelTab}
+                aria-label="Void tab"
+                className="w-9 h-9 shrink-0 rounded-full text-slate-400 text-base flex items-center justify-center active:scale-95"
+              >
+                🗑️
+              </button>
             </div>
 
             {categories.length === 0 ? (
@@ -374,42 +515,57 @@ function POS({ onLogout }) {
             ) : (
               <>
                 {/* Search bar — items show immediately, no category routing step */}
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search items…"
-                  className="w-full px-5 py-4 rounded-2xl border border-gray-300 text-lg shadow-sm"
-                />
-
-                {/* Category pills — horizontally scrolling, "All" prepended */}
-                <div className="flex gap-2 overflow-x-auto pb-1 -mx-1 px-1">
-                  {['All', ...categories].map((cat) => (
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="Search items…"
+                    className="w-full px-4 py-2 pr-9 rounded-xl border border-gray-300 text-sm shadow-sm"
+                  />
+                  {searchQuery && (
                     <button
-                      key={cat}
-                      onClick={() => setSelectedCategory(cat)}
-                      className={`shrink-0 px-5 py-2 rounded-full font-semibold text-sm transition active:scale-95 ${
-                        selectedCategory === cat ? 'bg-amber-500 text-white' : 'bg-white text-slate-600 shadow-sm'
-                      }`}
+                      onClick={() => setSearchQuery('')}
+                      aria-label="Clear search"
+                      className="absolute right-2 top-1/2 -translate-y-1/2 w-6 h-6 rounded-full text-slate-400 text-lg leading-none flex items-center justify-center active:scale-95"
                     >
-                      {cat}
+                      ×
                     </button>
-                  ))}
+                  )}
+                </div>
+
+                {/* Category pills — horizontally scrolling, "All" prepended; fade
+                    on the right hints there's more to scroll */}
+                <div className="relative">
+                  <div className="flex gap-1.5 overflow-x-auto pb-1 -mx-1 px-1">
+                    {['All', ...categories].map((cat) => (
+                      <button
+                        key={cat}
+                        onClick={() => setSelectedCategory(cat)}
+                        className={`shrink-0 px-3.5 py-1.5 rounded-full font-semibold text-xs transition active:scale-95 ${
+                          selectedCategory === cat ? 'bg-amber-500 text-white' : 'bg-white text-slate-600 shadow-sm'
+                        }`}
+                      >
+                        {cat}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="pointer-events-none absolute right-0 top-0 bottom-1 w-8 bg-gradient-to-l from-gray-50 to-transparent" />
                 </div>
 
                 {/* Item grid — tapping adds straight to the tab's cart */}
                 {items.length === 0 ? (
                   <p className="text-slate-400 text-lg">No items match.</p>
                 ) : (
-                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-5">
+                  <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 gap-2 sm:gap-3">
                     {items.map((item) => (
                       <button
                         key={item.id}
                         onClick={() => addItemToTab(item)}
-                        className="p-4 sm:p-6 rounded-2xl text-lg sm:text-xl font-bold bg-white shadow-md text-left transition active:scale-95 border-4 border-transparent"
+                        className="p-2.5 sm:p-3 rounded-xl text-sm sm:text-base font-bold bg-white shadow-md text-left transition active:scale-95 border-4 border-transparent"
                       >
-                        <span className="block text-slate-900">{item.item_name}</span>
-                        <span className="block text-base font-semibold text-slate-500 mt-1">
+                        <span className="block text-slate-900 leading-tight">{item.item_name}</span>
+                        <span className="block text-xs sm:text-sm font-semibold text-slate-500 mt-1">
                           {item.unit_price.toLocaleString()} RWF
                         </span>
                       </button>
@@ -423,22 +579,30 @@ function POS({ onLogout }) {
         )}
       </main>
 
-      {/* Floating draggable cart button — drag to reposition, tap to open */}
+      {/* Bottom icon bar — Void lives up top next to the total, away from these
+          two high-frequency buttons so it can't be mis-tapped in the same row */}
       {activeTabId !== null && (
-        <button
-          onPointerDown={onFabPointerDown}
-          onPointerMove={onFabPointerMove}
-          onPointerUp={onFabPointerUp}
-          style={{ left: fabPos.x, top: fabPos.y, touchAction: 'none' }}
-          className="fixed z-20 w-16 h-16 rounded-full bg-slate-900 text-white shadow-xl flex items-center justify-center text-2xl active:scale-95"
-        >
-          🛒
-          {cartItemCount > 0 && (
-            <span className="absolute -top-1 -right-1 bg-red-500 text-white text-xs font-bold rounded-full w-6 h-6 flex items-center justify-center">
-              {cartItemCount}
-            </span>
-          )}
-        </button>
+        <footer className="fixed bottom-0 left-0 right-0 z-20 bg-white border-t border-gray-200 shadow-[0_-4px_12px_rgba(0,0,0,0.08)] grid grid-cols-2">
+          <button
+            onClick={() => setCartOpen(true)}
+            className="h-16 flex flex-col items-center justify-center gap-0.5 text-slate-700 active:scale-95 relative"
+          >
+            <span className="text-2xl">🛒</span>
+            <span className="text-xs font-semibold">Cart</span>
+            {cartItemCount > 0 && (
+              <span className="absolute top-1 right-1/3 bg-red-500 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
+                {cartItemCount}
+              </span>
+            )}
+          </button>
+          <button
+            onClick={() => setShowBill(true)}
+            className="h-16 flex flex-col items-center justify-center gap-0.5 text-slate-700 active:scale-95"
+          >
+            <span className="text-2xl">🧾</span>
+            <span className="text-xs font-semibold">Bill</span>
+          </button>
+        </footer>
       )}
 
       {/* Cart drawer — replaces the old inline list; grouped by round */}
@@ -470,22 +634,32 @@ function POS({ onLogout }) {
                       {r === currentRound ? 'Current Round' : `Round ${r} — sent`}
                     </p>
                     {roundsMap[r].map((row) => (
-                      <div key={row.id} className="flex items-center justify-between px-5 py-3 text-lg gap-3">
-                        <span className="font-semibold text-slate-800">
-                          {row.name}
-                          {row.quantity > 1 && (
-                            <span className="text-slate-400 font-normal"> × {row.quantity}</span>
+                      <div key={row.id} className="flex items-center justify-between px-5 py-3 gap-3">
+                        <span className="font-semibold text-slate-800 text-base flex-1 min-w-0">{row.name}</span>
+                        <div className="flex items-center gap-3 shrink-0">
+                          {r === currentRound ? (
+                            <div className="flex items-center gap-1 bg-slate-100 rounded-full px-1">
+                              <button
+                                onClick={() => changeQuantity(row, -1)}
+                                aria-label={`Decrease ${row.name}`}
+                                className="w-7 h-7 rounded-full font-bold text-slate-700 active:scale-95"
+                              >
+                                −
+                              </button>
+                              <span className="w-6 text-center font-semibold text-sm">{row.quantity ?? 1}</span>
+                              <button
+                                onClick={() => changeQuantity(row, 1)}
+                                aria-label={`Increase ${row.name}`}
+                                className="w-7 h-7 rounded-full font-bold text-slate-700 active:scale-95"
+                              >
+                                +
+                              </button>
+                            </div>
+                          ) : (
+                            // Already sent to kitchen/bar — quantity is locked, no silent edits after the fact.
+                            <span className="text-sm text-slate-400 font-semibold px-2">x{row.quantity ?? 1}</span>
                           )}
-                        </span>
-                        <div className="flex items-center gap-3">
-                          <span className="text-slate-500">{row.total_price.toLocaleString()} RWF</span>
-                          <button
-                            onClick={() => removeItemFromTab(row.id, row.name)}
-                            aria-label={`Remove ${row.name}`}
-                            className="w-9 h-9 shrink-0 rounded-full bg-red-50 text-red-600 font-bold text-lg active:scale-95"
-                          >
-                            ×
-                          </button>
+                          <span className="text-slate-500 w-20 text-right text-sm">{row.total_price.toLocaleString()} RWF</span>
                         </div>
                       </div>
                     ))}
@@ -538,6 +712,82 @@ function POS({ onLogout }) {
                   </div>
                 )}
               </div>
+
+              <div className="grid grid-cols-2 gap-3 pt-1">
+                <button
+                  onClick={() => checkout('cash')}
+                  disabled={cartItems.length === 0}
+                  className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-green-600 text-white transition active:scale-95 disabled:opacity-40"
+                >
+                  PAY CASH
+                </button>
+                <button
+                  onClick={() => checkout('momo')}
+                  disabled={cartItems.length === 0}
+                  className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-blue-600 text-white transition active:scale-95 disabled:opacity-40"
+                >
+                  MOMO
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bill drawer — read-only itemized bill for printing/sharing with the customer */}
+      {activeTabId !== null && showBill && (
+        <div className="fixed inset-0 z-30 flex flex-col justify-end" onClick={() => setShowBill(false)}>
+          <div className="absolute inset-0 bg-black/40" />
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="relative bg-white rounded-t-3xl shadow-xl max-h-[75vh] flex flex-col"
+          >
+            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+              <h3 className="text-xl font-extrabold text-slate-900">{activeTab?.name} — Bill</h3>
+              <button
+                onClick={() => setShowBill(false)}
+                aria-label="Close bill"
+                className="text-slate-400 text-2xl leading-none w-8 h-8"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="overflow-y-auto flex-1 divide-y divide-gray-100">
+              {billItems.length === 0 ? (
+                <p className="text-slate-400 text-lg p-5">Nothing added yet.</p>
+              ) : (
+                billItems.map((row) => (
+                  <div key={row.item_id} className="flex items-center justify-between px-5 py-3 text-lg gap-3">
+                    <span className="font-semibold text-slate-800">
+                      {row.name}
+                      {row.quantity > 1 && <span className="text-slate-400 font-normal"> × {row.quantity}</span>}
+                    </span>
+                    <span className="text-slate-500">{row.total_price.toLocaleString()} RWF</span>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="p-4 border-t border-gray-100 space-y-3">
+              <div className="flex items-center justify-between text-xl font-bold text-slate-900 px-1">
+                <span>Total</span>
+                <span>{cartTotal.toLocaleString()} RWF</span>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  onClick={printBill}
+                  className="h-12 rounded-xl bg-slate-900 text-white font-bold active:scale-95"
+                >
+                  🖨️ Print
+                </button>
+                <button
+                  onClick={shareBill}
+                  className="h-12 rounded-xl bg-white shadow-md font-bold text-slate-700 active:scale-95"
+                >
+                  📤 Share
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -545,40 +795,9 @@ function POS({ onLogout }) {
 
       {/* Toast */}
       {toast && (
-        <div className="fixed bottom-48 left-1/2 -translate-x-1/2 bg-slate-900 text-white px-6 py-3 rounded-full shadow-xl text-lg z-10">
+        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 bg-slate-900 text-white px-6 py-3 rounded-full shadow-xl text-lg z-10">
           {toast}
         </div>
-      )}
-
-      {/* TAP 3: Fixed full-width checkout footer — only meaningful inside a tab */}
-      {activeTabId !== null && (
-        <footer className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-[0_-4px_12px_rgba(0,0,0,0.08)]">
-          <div className="text-center py-3 h-12">
-            {cartItems.length > 0 ? (
-              <span className="text-xl font-bold text-slate-800">
-                Total: {cartTotal.toLocaleString()} RWF
-              </span>
-            ) : (
-              <span className="text-slate-400 text-lg">Add items to charge</span>
-            )}
-          </div>
-          <div className="grid grid-cols-2">
-            <button
-              onClick={() => checkout('cash')}
-              disabled={cartItems.length === 0}
-              className="h-20 text-xl sm:text-3xl font-bold bg-green-600 text-white transition active:scale-95 disabled:opacity-40"
-            >
-              PAY CASH
-            </button>
-            <button
-              onClick={() => checkout('momo')}
-              disabled={cartItems.length === 0}
-              className="h-20 text-xl sm:text-3xl font-bold bg-blue-600 text-white transition active:scale-95 disabled:opacity-40"
-            >
-              MOMO
-            </button>
-          </div>
-        </footer>
       )}
     </div>
   );
