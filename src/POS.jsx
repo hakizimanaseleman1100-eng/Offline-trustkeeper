@@ -403,18 +403,18 @@ function POS({ onLogout }) {
   return (
     <div className="min-h-screen bg-gray-50 font-sans pb-20">
       {/* Header */}
-      <header className="bg-slate-900 text-white px-3 sm:px-6 py-2 sm:py-3 flex flex-wrap gap-2 justify-between items-center shadow-lg">
-        <h1 className="text-lg sm:text-2xl font-extrabold tracking-tight">Sovereign POS</h1>
-        <div className="flex items-center gap-2 sm:gap-4">
+      <header className="bg-slate-900 text-white px-3 sm:px-6 lg:px-10 py-2 sm:py-3 lg:py-4 flex flex-wrap gap-2 justify-between items-center shadow-lg">
+        <h1 className="text-lg sm:text-2xl lg:text-3xl font-extrabold tracking-tight">Sovereign POS</h1>
+        <div className="flex items-center gap-2 sm:gap-4 lg:gap-6">
           <div className="text-right">
-            <div className="text-[10px] uppercase tracking-widest text-slate-400">Open Tabs</div>
-            <div className="text-base sm:text-xl font-bold">{openTabs.length}</div>
+            <div className="text-[10px] lg:text-xs uppercase tracking-widest text-slate-400">Open Tabs</div>
+            <div className="text-base sm:text-xl lg:text-2xl font-bold">{openTabs.length}</div>
           </div>
           <button
             onClick={syncData}
             disabled={syncing}
             aria-label="Sync to Cloud"
-            className="relative px-2.5 sm:px-4 py-1.5 rounded-xl bg-emerald-600 font-semibold text-xs sm:text-sm transition active:scale-95 disabled:opacity-50"
+            className="relative px-2.5 sm:px-4 lg:px-5 py-1.5 lg:py-2.5 rounded-xl bg-emerald-600 font-semibold text-xs sm:text-sm lg:text-base transition active:scale-95 disabled:opacity-50"
           >
             <span className="sm:hidden">☁</span>
             <span className="hidden sm:inline">{syncing ? 'Syncing…' : '☁ Sync to Cloud'}</span>
@@ -427,7 +427,7 @@ function POS({ onLogout }) {
           <button
             onClick={onLogout}
             aria-label="Logout"
-            className="px-2.5 py-1.5 rounded-xl bg-slate-700 font-semibold text-xs sm:text-sm transition active:scale-95"
+            className="px-2.5 py-1.5 lg:px-5 lg:py-2.5 rounded-xl bg-slate-700 font-semibold text-xs sm:text-sm lg:text-base transition active:scale-95"
           >
             <span className="sm:hidden">⏏</span>
             <span className="hidden sm:inline">Logout</span>
@@ -435,24 +435,24 @@ function POS({ onLogout }) {
         </div>
       </header>
 
-      <main className="p-3 sm:p-5 space-y-4 max-w-7xl mx-auto">
+      <main className="p-3 sm:p-5 lg:p-8 space-y-4 lg:space-y-6 max-w-7xl mx-auto">
         {activeTabId === null ? (
           /* HOME: split screen — active tabs grid (left) + create tab (right), stacked on mobile */
-          <div className="flex flex-col sm:grid sm:grid-cols-3 gap-5">
+          <div className="flex flex-col sm:grid sm:grid-cols-3 gap-5 lg:gap-8">
             <div className="sm:col-span-2">
-              <p className="text-slate-500 font-semibold mb-4 text-lg">Active Tabs</p>
+              <p className="text-slate-500 font-semibold mb-4 text-lg lg:text-xl">Active Tabs</p>
               {openTabs.length === 0 ? (
                 <p className="text-slate-400 text-lg">No open tabs. Create one to start an order.</p>
               ) : (
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4 lg:gap-5">
                   {openTabs.map((tab) => (
                     <div key={tab.id} className="relative">
                       <button
                         onClick={() => setActiveTabId(tab.id)}
-                        className="h-20 sm:h-24 w-full rounded-2xl bg-white shadow-md transition active:scale-95 border-4 border-transparent text-slate-800 flex flex-col items-center justify-center gap-0.5"
+                        className="h-20 sm:h-24 lg:h-28 w-full rounded-2xl bg-white shadow-md transition active:scale-95 border-4 border-transparent text-slate-800 flex flex-col items-center justify-center gap-0.5"
                       >
-                        <span className="text-lg sm:text-xl font-bold">{tab.name}</span>
-                        <span className="text-xs font-semibold text-slate-400">
+                        <span className="text-lg sm:text-xl lg:text-2xl font-bold">{tab.name}</span>
+                        <span className="text-xs lg:text-sm font-semibold text-slate-400">
                           {(tabTotals[tab.id] ?? 0).toLocaleString()} RWF
                         </span>
                       </button>
@@ -462,7 +462,7 @@ function POS({ onLogout }) {
                           openTabWithCart(tab.id);
                         }}
                         aria-label={`Cart for ${tab.name}`}
-                        className="absolute top-1.5 left-1.5 w-6 h-6 rounded-full bg-slate-900/80 text-white text-xs flex items-center justify-center active:scale-95"
+                        className="absolute top-1.5 left-1.5 w-6 h-6 lg:w-8 lg:h-8 rounded-full bg-slate-900/80 text-white text-xs lg:text-sm flex items-center justify-center active:scale-95"
                       >
                         🛒
                       </button>
@@ -472,7 +472,7 @@ function POS({ onLogout }) {
                           openTabWithBill(tab.id);
                         }}
                         aria-label={`Bill for ${tab.name}`}
-                        className="absolute top-1.5 right-1.5 w-6 h-6 rounded-full bg-slate-900/80 text-white text-xs flex items-center justify-center active:scale-95"
+                        className="absolute top-1.5 right-1.5 w-6 h-6 lg:w-8 lg:h-8 rounded-full bg-slate-900/80 text-white text-xs lg:text-sm flex items-center justify-center active:scale-95"
                       >
                         🧾
                       </button>
@@ -483,28 +483,28 @@ function POS({ onLogout }) {
             </div>
             <button
               onClick={createTab}
-              className="h-20 sm:h-24 rounded-2xl text-xl sm:text-2xl font-bold bg-amber-500 text-white shadow-md transition active:scale-95"
+              className="h-20 sm:h-24 lg:h-28 rounded-2xl text-xl sm:text-2xl lg:text-3xl font-bold bg-amber-500 text-white shadow-md transition active:scale-95"
             >
               + New Tab
             </button>
           </div>
         ) : (
           /* INSIDE A TAB: category → items → running cart */
-          <div className="space-y-3">
+          <div className="space-y-3 lg:space-y-4">
             <div className="flex items-center justify-between gap-3">
               <button
                 onClick={closeTabView}
                 aria-label="Back to tabs"
-                className="w-9 h-9 shrink-0 rounded-full bg-white shadow-md text-slate-600 text-lg flex items-center justify-center active:scale-95"
+                className="w-9 h-9 lg:w-11 lg:h-11 shrink-0 rounded-full bg-white shadow-md text-slate-600 text-lg lg:text-xl flex items-center justify-center active:scale-95"
               >
                 ←
               </button>
-              <h2 className="text-lg font-extrabold text-slate-900 truncate text-center flex-1">{activeTab?.name}</h2>
-              <span className="text-lg font-bold text-slate-800 shrink-0">{cartTotal.toLocaleString()} RWF</span>
+              <h2 className="text-lg lg:text-2xl font-extrabold text-slate-900 truncate text-center flex-1">{activeTab?.name}</h2>
+              <span className="text-lg lg:text-2xl font-bold text-slate-800 shrink-0">{cartTotal.toLocaleString()} RWF</span>
               <button
                 onClick={cancelTab}
                 aria-label="Void tab"
-                className="w-9 h-9 shrink-0 rounded-full text-slate-400 text-base flex items-center justify-center active:scale-95"
+                className="w-9 h-9 lg:w-11 lg:h-11 shrink-0 rounded-full text-slate-400 text-base lg:text-lg flex items-center justify-center active:scale-95"
               >
                 🗑️
               </button>
@@ -521,7 +521,7 @@ function POS({ onLogout }) {
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
                     placeholder="Search items…"
-                    className="w-full px-4 py-2 pr-9 rounded-xl border border-gray-300 text-sm shadow-sm"
+                    className="w-full px-4 lg:px-5 py-2 lg:py-3 pr-9 rounded-xl border border-gray-300 text-sm lg:text-base shadow-sm"
                   />
                   {searchQuery && (
                     <button
@@ -542,7 +542,7 @@ function POS({ onLogout }) {
                       <button
                         key={cat}
                         onClick={() => setSelectedCategory(cat)}
-                        className={`shrink-0 px-3.5 py-1.5 rounded-full font-semibold text-xs transition active:scale-95 ${
+                        className={`shrink-0 px-3.5 lg:px-5 py-1.5 lg:py-2 rounded-full font-semibold text-xs lg:text-sm transition active:scale-95 ${
                           selectedCategory === cat ? 'bg-amber-500 text-white' : 'bg-white text-slate-600 shadow-sm'
                         }`}
                       >
@@ -557,15 +557,15 @@ function POS({ onLogout }) {
                 {items.length === 0 ? (
                   <p className="text-slate-400 text-lg">No items match.</p>
                 ) : (
-                  <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 gap-2 sm:gap-3">
+                  <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-7 gap-2 sm:gap-3 lg:gap-4">
                     {items.map((item) => (
                       <button
                         key={item.id}
                         onClick={() => addItemToTab(item)}
-                        className="p-2.5 sm:p-3 rounded-xl text-sm sm:text-base font-bold bg-white shadow-md text-left transition active:scale-95 border-4 border-transparent"
+                        className="p-2.5 sm:p-3 lg:p-4 rounded-xl text-sm sm:text-base lg:text-lg font-bold bg-white shadow-md text-left transition active:scale-95 border-4 border-transparent"
                       >
                         <span className="block text-slate-900 leading-tight">{item.item_name}</span>
-                        <span className="block text-xs sm:text-sm font-semibold text-slate-500 mt-1">
+                        <span className="block text-xs sm:text-sm lg:text-base font-semibold text-slate-500 mt-1">
                           {item.unit_price.toLocaleString()} RWF
                         </span>
                       </button>
@@ -582,13 +582,13 @@ function POS({ onLogout }) {
       {/* Bottom icon bar — Void lives up top next to the total, away from these
           two high-frequency buttons so it can't be mis-tapped in the same row */}
       {activeTabId !== null && (
-        <footer className="fixed bottom-0 left-0 right-0 z-20 bg-white border-t border-gray-200 shadow-[0_-4px_12px_rgba(0,0,0,0.08)] grid grid-cols-2">
+        <footer className="fixed bottom-0 left-0 right-0 z-20 bg-white border-t border-gray-200 shadow-[0_-4px_12px_rgba(0,0,0,0.08)] grid grid-cols-2 max-w-7xl mx-auto">
           <button
             onClick={() => setCartOpen(true)}
-            className="h-16 flex flex-col items-center justify-center gap-0.5 text-slate-700 active:scale-95 relative"
+            className="h-16 lg:h-20 flex flex-col items-center justify-center gap-0.5 text-slate-700 active:scale-95 relative"
           >
-            <span className="text-2xl">🛒</span>
-            <span className="text-xs font-semibold">Cart</span>
+            <span className="text-2xl lg:text-3xl">🛒</span>
+            <span className="text-xs lg:text-sm font-semibold">Cart</span>
             {cartItemCount > 0 && (
               <span className="absolute top-1 right-1/3 bg-red-500 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
                 {cartItemCount}
@@ -597,21 +597,24 @@ function POS({ onLogout }) {
           </button>
           <button
             onClick={() => setShowBill(true)}
-            className="h-16 flex flex-col items-center justify-center gap-0.5 text-slate-700 active:scale-95"
+            className="h-16 lg:h-20 flex flex-col items-center justify-center gap-0.5 text-slate-700 active:scale-95"
           >
-            <span className="text-2xl">🧾</span>
-            <span className="text-xs font-semibold">Bill</span>
+            <span className="text-2xl lg:text-3xl">🧾</span>
+            <span className="text-xs lg:text-sm font-semibold">Bill</span>
           </button>
         </footer>
       )}
 
       {/* Cart drawer — replaces the old inline list; grouped by round */}
       {activeTabId !== null && cartOpen && (
-        <div className="fixed inset-0 z-30 flex flex-col justify-end" onClick={() => setCartOpen(false)}>
+        <div
+          className="fixed inset-0 z-30 flex flex-col justify-end lg:items-center lg:justify-center"
+          onClick={() => setCartOpen(false)}
+        >
           <div className="absolute inset-0 bg-black/40" />
           <div
             onClick={(e) => e.stopPropagation()}
-            className="relative bg-white rounded-t-3xl shadow-xl max-h-[75vh] flex flex-col"
+            className="relative bg-white rounded-t-3xl lg:rounded-3xl shadow-xl max-h-[75vh] lg:max-h-[85vh] w-full lg:max-w-lg flex flex-col"
           >
             <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
               <h3 className="text-xl font-extrabold text-slate-900">{activeTab?.name} — Order</h3>
@@ -736,11 +739,14 @@ function POS({ onLogout }) {
 
       {/* Bill drawer — read-only itemized bill for printing/sharing with the customer */}
       {activeTabId !== null && showBill && (
-        <div className="fixed inset-0 z-30 flex flex-col justify-end" onClick={() => setShowBill(false)}>
+        <div
+          className="fixed inset-0 z-30 flex flex-col justify-end lg:items-center lg:justify-center"
+          onClick={() => setShowBill(false)}
+        >
           <div className="absolute inset-0 bg-black/40" />
           <div
             onClick={(e) => e.stopPropagation()}
-            className="relative bg-white rounded-t-3xl shadow-xl max-h-[75vh] flex flex-col"
+            className="relative bg-white rounded-t-3xl lg:rounded-3xl shadow-xl max-h-[75vh] lg:max-h-[85vh] w-full lg:max-w-lg flex flex-col"
           >
             <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
               <h3 className="text-xl font-extrabold text-slate-900">{activeTab?.name} — Bill</h3>
