@@ -256,60 +256,40 @@ function POS({ onLogout }) {
       `Total: ${cartTotal.toLocaleString()} RWF`,
     ].join('\n');
 
-  const escapeHtml = (s) =>
-    String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-
-  // Prints just the bill, in its own window — printing the live app would
-  // also capture the header, item grid, and bottom nav bar.
-  const printBill = () => {
-    const win = window.open('', '_blank', 'width=380,height=600');
-    if (!win) {
-      showToast('Allow pop-ups to print the bill');
-      return;
-    }
-    const rows = billItems
-      .map(
-        (row) =>
-          `<div class="row"><span>${escapeHtml(row.name)}${row.quantity > 1 ? ` x${row.quantity}` : ''}</span><span>${row.total_price.toLocaleString()} RWF</span></div>`
-      )
-      .join('');
-    win.document.write(`<!doctype html><html><head><title>${escapeHtml(activeTab?.name ?? 'Bill')}</title>
-      <style>
-        body { font-family: monospace; padding: 16px; color: #111; }
-        h2 { margin: 0 0 12px; }
-        .row { display: flex; justify-content: space-between; gap: 12px; margin: 4px 0; }
-        .total { border-top: 1px solid #111; margin-top: 10px; padding-top: 10px; font-weight: bold; }
-      </style></head><body>
-      <h2>${escapeHtml(activeTab?.name ?? 'Bill')}</h2>
-      ${rows}
-      <div class="row total"><span>Total</span><span>${cartTotal.toLocaleString()} RWF</span></div>
-      </body></html>`);
-    win.document.close();
-    win.onload = () => {
-      win.focus();
-      win.print();
-    };
-    win.onafterprint = () => win.close();
-  };
+  // Prints in-place using a hidden, print-only section of the page (see the
+  // `print:hidden` / `print:block` split at the bottom of the JSX) instead of
+  // a popup window — popups opened via window.open() are routinely blocked
+  // on mobile browsers, which made the old approach silently do nothing on
+  // real Android phones.
+  const printBill = () => window.print();
 
   const copyBillToClipboard = async (text) => {
     try {
+      if (!navigator.clipboard) throw new Error('Clipboard API unavailable');
       await navigator.clipboard.writeText(text);
       showToast('Bill copied to clipboard');
-    } catch {
+    } catch (err) {
+      console.error('Clipboard copy failed:', err);
       showToast('Could not share or copy the bill');
     }
   };
 
   const shareBill = async () => {
     const text = billText();
-    if (navigator.share) {
+    const shareData = { title: activeTab?.name ?? 'Bill', text };
+    // canShare (where supported) catches data the platform will reject
+    // before we even try — e.g. some Android share targets need text only.
+    const shareSupported = navigator.share && (!navigator.canShare || navigator.canShare(shareData));
+    if (shareSupported) {
       try {
-        await navigator.share({ title: activeTab?.name ?? 'Bill', text });
+        await navigator.share(shareData);
       } catch (err) {
         // AbortError just means the waiter closed the share sheet — anything
         // else (no share target, permission denied) should fall back.
-        if (err?.name !== 'AbortError') await copyBillToClipboard(text);
+        if (err?.name !== 'AbortError') {
+          console.error('navigator.share failed:', err);
+          await copyBillToClipboard(text);
+        }
       }
     } else {
       await copyBillToClipboard(text);
@@ -401,7 +381,8 @@ function POS({ onLogout }) {
   };
 
   return (
-    <div className="min-h-screen bg-gray-50 font-sans pb-20">
+    <>
+    <div className="min-h-screen bg-gray-50 font-sans pb-20 print:hidden">
       {/* Header */}
       <header className="bg-slate-900 text-white px-3 sm:px-6 lg:px-10 py-2 sm:py-3 lg:py-4 flex flex-wrap gap-2 justify-between items-center shadow-lg">
         <h1 className="text-lg sm:text-2xl lg:text-3xl font-extrabold tracking-tight">Sovereign POS</h1>
@@ -806,6 +787,29 @@ function POS({ onLogout }) {
         </div>
       )}
     </div>
+
+    {/* Print-only bill — invisible on screen, shown only by window.print().
+        Lives outside the print:hidden tree above so it isn't hidden along
+        with everything else when the page is printed. */}
+    {activeTabId !== null && (
+      <div className="hidden print:block p-6 font-mono text-black">
+        <h2 className="text-lg font-bold mb-3">{activeTab?.name ?? 'Bill'}</h2>
+        {billItems.map((row) => (
+          <div key={row.item_id} className="flex justify-between text-sm py-0.5">
+            <span>
+              {row.name}
+              {row.quantity > 1 ? ` x${row.quantity}` : ''}
+            </span>
+            <span>{row.total_price.toLocaleString()} RWF</span>
+          </div>
+        ))}
+        <div className="flex justify-between border-t border-black mt-2 pt-2 font-bold">
+          <span>Total</span>
+          <span>{cartTotal.toLocaleString()} RWF</span>
+        </div>
+      </div>
+    )}
+    </>
   );
 }
 
