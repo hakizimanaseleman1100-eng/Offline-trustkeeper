@@ -653,49 +653,63 @@ function POS({ onLogout }) {
             </div>
 
             <div className="p-4 border-t border-gray-100 space-y-3">
-              <button
-                onClick={sendRound}
-                disabled={!roundsMap[currentRound]?.length}
-                className="w-full py-3 rounded-xl bg-slate-900 text-white font-bold disabled:opacity-40 active:scale-95"
-              >
-                Send Round {currentRound} to Kitchen/Bar
-              </button>
-
-              {/* Optional details — collapsed by default, no text input forced while serving */}
-              <div>
+              {/* Send Round and Customer Details as a pair of icon buttons —
+                  a full-width "Send Round" button here used to dominate the
+                  drawer and crowd the cart list above it. */}
+              <div className="flex items-center gap-4">
+                <button
+                  onClick={sendRound}
+                  disabled={!roundsMap[currentRound]?.length}
+                  aria-label={`Send Round ${currentRound} to Kitchen/Bar`}
+                  className="flex flex-col items-center gap-0.5 disabled:opacity-40 active:scale-95"
+                >
+                  <span className="w-11 h-11 rounded-full bg-slate-900 text-white flex items-center justify-center text-lg">
+                    📨
+                  </span>
+                  <span className="text-[10px] font-semibold text-slate-500">Send Round {currentRound}</span>
+                </button>
                 <button
                   onClick={() => setShowCustomerDetails((open) => !open)}
-                  className="text-slate-500 font-semibold underline text-sm"
+                  aria-label="Customer details"
+                  className="flex flex-col items-center gap-0.5 active:scale-95"
                 >
-                  {showCustomerDetails ? '− Hide' : '+ Add'} Customer Details (optional)
+                  <span
+                    className={`w-11 h-11 rounded-full flex items-center justify-center text-lg ${
+                      showCustomerDetails ? 'bg-amber-500 text-white' : 'bg-slate-100 text-slate-600'
+                    }`}
+                  >
+                    🚩
+                  </span>
+                  <span className="text-[10px] font-semibold text-slate-500">Details</span>
                 </button>
-                {showCustomerDetails && (
-                  <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <input
-                      type="text"
-                      placeholder="Table / Guest name"
-                      defaultValue={activeTab?.name ?? ''}
-                      onChange={(e) => renameTab(e.target.value)}
-                      className="px-4 py-3 rounded-xl border border-gray-300 text-lg sm:col-span-2"
-                    />
-                    <input
-                      type="text"
-                      inputMode="numeric"
-                      placeholder="Customer TIN"
-                      value={customerTin}
-                      onChange={(e) => setCustomerTin(e.target.value)}
-                      className="px-4 py-3 rounded-xl border border-gray-300 text-lg"
-                    />
-                    <input
-                      type="tel"
-                      placeholder="Customer Phone"
-                      value={customerPhone}
-                      onChange={(e) => setCustomerPhone(e.target.value)}
-                      className="px-4 py-3 rounded-xl border border-gray-300 text-lg"
-                    />
-                  </div>
-                )}
               </div>
+
+              {showCustomerDetails && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <input
+                    type="text"
+                    placeholder="Table / Guest name"
+                    defaultValue={activeTab?.name ?? ''}
+                    onChange={(e) => renameTab(e.target.value)}
+                    className="px-4 py-3 rounded-xl border border-gray-300 text-lg sm:col-span-2"
+                  />
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    placeholder="Customer TIN"
+                    value={customerTin}
+                    onChange={(e) => setCustomerTin(e.target.value)}
+                    className="px-4 py-3 rounded-xl border border-gray-300 text-lg"
+                  />
+                  <input
+                    type="tel"
+                    placeholder="Customer Phone"
+                    value={customerPhone}
+                    onChange={(e) => setCustomerPhone(e.target.value)}
+                    className="px-4 py-3 rounded-xl border border-gray-300 text-lg"
+                  />
+                </div>
+              )}
 
               <div className="grid grid-cols-2 gap-3 pt-1">
                 <button
@@ -708,7 +722,7 @@ function POS({ onLogout }) {
                 <button
                   onClick={() => checkout('momo')}
                   disabled={cartItems.length === 0}
-                  className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-blue-600 text-white transition active:scale-95 disabled:opacity-40"
+                  className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-yellow-400 text-slate-900 transition active:scale-95 disabled:opacity-40"
                 >
                   MOMO
                 </button>
