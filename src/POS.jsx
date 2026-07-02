@@ -263,6 +263,13 @@ function POS({ onLogout }) {
   // real Android phones.
   const printBill = () => window.print();
 
+  // Opens the SMS compose screen directly with the bill pre-filled.
+  // More reliable than navigator.share for SMS because the Messages app
+  // on Android registers for sms: URIs, not generic text/plain share intents.
+  const smsBill = () => {
+    window.open('sms:?body=' + encodeURIComponent(billText()));
+  };
+
   const copyBillToClipboard = async (text) => {
     try {
       if (!navigator.clipboard) throw new Error('Clipboard API unavailable');
@@ -775,16 +782,22 @@ function POS({ onLogout }) {
                 <span>Total</span>
                 <span>{cartTotal.toLocaleString()} RWF</span>
               </div>
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-3 gap-2">
                 <button
                   onClick={printBill}
-                  className="h-12 rounded-xl bg-slate-900 text-white font-bold active:scale-95"
+                  className="h-12 rounded-xl bg-slate-900 text-white font-bold text-sm active:scale-95"
                 >
                   🖨️ Print
                 </button>
                 <button
+                  onClick={smsBill}
+                  className="h-12 rounded-xl bg-green-600 text-white font-bold text-sm active:scale-95"
+                >
+                  💬 SMS
+                </button>
+                <button
                   onClick={shareBill}
-                  className="h-12 rounded-xl bg-white shadow-md font-bold text-slate-700 active:scale-95"
+                  className="h-12 rounded-xl bg-white shadow-md font-bold text-slate-700 text-sm active:scale-95"
                 >
                   📤 Share
                 </button>
