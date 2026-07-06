@@ -29,10 +29,11 @@ async function syncInventory() {
   }
 }
 
-// Mirrors the staff list locally so PIN login works offline. If no staff exist
-// anywhere (server empty AND nothing local — i.e. a fresh first run), seeds a
-// local-only default owner so the app is still usable; the owner then creates
-// real accounts from the Team tab, which sync down and replace this default.
+// Mirrors the staff list locally so PIN login works offline. Seeds a local-only
+// default owner (PIN 1234) whenever there is NO real OWNER account yet — not
+// just when the table is empty. That way adding a waiter first doesn't lock the
+// business out of the dashboard; the default owner stays available until a real
+// OWNER is created in the Team tab, at which point it stops being seeded.
 async function syncStaff() {
   try {
     const { data, error } = await supabase
@@ -48,7 +49,10 @@ async function syncStaff() {
     console.error('Staff down-sync skipped:', err.message);
   }
 
-  if ((await db.staff.count()) === 0) {
+  const hasOwner = await db.staff
+    .filter((s) => s.role === 'OWNER' && s.active !== false)
+    .count();
+  if (!hasOwner) {
     await db.staff.put({
       id: DEFAULT_OWNER_ID,
       business_id: CURRENT_BUSINESS_ID,
