@@ -34,6 +34,11 @@ function POS({ currentUser, onLogout }) {
   const [momoRef, setMomoRef] = useState('');
   const [lastSyncAt, setLastSyncAt] = useState(null);
   const [showDiscount, setShowDiscount] = useState(false);
+  // Room item awaiting a nights count before it's added to the tab.
+  const [roomPrompt, setRoomPrompt] = useState(null);
+  const [nightsInput, setNightsInput] = useState('1');
+  // Even-split calculator on the bill: how many ways to divide the total.
+  const [splitWays, setSplitWays] = useState(1);
 
   const showToast = (message, duration = 2500) => {
     setToast(message);
@@ -190,6 +195,8 @@ function POS({ currentUser, onLogout }) {
     setMomoPrompt(false);
     setMomoRef('');
     setShowDiscount(false);
+    setRoomPrompt(null);
+    setSplitWays(1);
   };
 
   // Persist the bill-level discount on the tab (or clear it). Audit-logged so
@@ -279,7 +286,18 @@ function POS({ currentUser, onLogout }) {
     closeTabView();
   };
 
+  // A room is billed by the night, so instead of adding one unit we ask how
+  // many nights and price accordingly. Detected by category name (works for
+  // "Motel Rooms", "Rooms", "Room", etc.) so it isn't tied to one fixed label.
+  const isRoom = (item) => /room|motel|lodg/i.test(item.category ?? '');
+
   const addItemToTab = async (item) => {
+    if (isRoom(item)) {
+      setRoomPrompt(item);
+      setNightsInput('1');
+      return;
+    }
+
     const currentRound = activeTab?.current_round ?? 1;
 
     // Repeated taps on the same item bump quantity on its existing cart line —
@@ -319,6 +337,36 @@ function POS({ currentUser, onLogout }) {
       timestamp: Date.now(),
       synced_status: 0,
     });
+  };
+
+  // Adds a room stay: quantity = nights, priced per night, with the folio
+  // window (check-in today → check-out today + nights). Always a fresh line
+  // (two separate stays of the same room shouldn't merge).
+  const addRoomLine = async (item, nights) => {
+    const n = Math.max(1, Number(nights) || 1);
+    const checkIn = new Date();
+    checkIn.setHours(0, 0, 0, 0);
+    const checkOut = new Date(checkIn);
+    checkOut.setDate(checkOut.getDate() + n);
+    const iso = (d) => d.toISOString().slice(0, 10);
+
+    await db.sales.add({
+      item_id: item.id,
+      tab_id: activeTabId,
+      round: activeTab?.current_round ?? 1,
+      quantity: n,
+      total_price: item.unit_price * n,
+      cost_price: item.cost_price,
+      tax_label: item.tax_label,
+      tax_rate: item.tax_rate,
+      staff_id: currentUser?.id ?? null,
+      staff_name: currentUser?.name ?? null,
+      check_in_date: iso(checkIn),
+      check_out_date: iso(checkOut),
+      timestamp: Date.now(),
+      synced_status: 0,
+    });
+    setRoomPrompt(null);
   };
 
   const sendRound = async () => {
@@ -449,6 +497,7 @@ function POS({ currentUser, onLogout }) {
               device_id,
               discount_amount: share,
               total_price: row.total_price - share,
+              guest_count: activeTab?.guest_count ?? null,
             },
           };
         })
@@ -503,6 +552,9 @@ function POS({ currentUser, onLogout }) {
           device_id: sale.device_id ?? null,
           momo_ref: sale.momo_ref ?? null,
           discount_amount: sale.discount_amount ?? 0,
+          guest_count: sale.guest_count ?? null,
+          check_in_date: sale.check_in_date ?? null,
+          check_out_date: sale.check_out_date ?? null,
           timestamp: new Date(sale.timestamp).toISOString(),
         }))
       );
@@ -941,6 +993,19 @@ function POS({ currentUser, onLogout }) {
                     className="px-4 py-3 rounded-xl border border-gray-300 text-lg sm:col-span-2"
                   />
                   <input
+                    type="number"
+                    inputMode="numeric"
+                    min="1"
+                    placeholder="Guests (covers)"
+                    value={activeTab?.guest_count ?? ''}
+                    onChange={(e) =>
+                      db.active_tabs.update(activeTabId, {
+                        guest_count: e.target.value ? Number(e.target.value) : null,
+                      })
+                    }
+                    className="px-4 py-3 rounded-xl border border-gray-300 text-lg sm:col-span-2"
+                  />
+                  <input
                     type="text"
                     inputMode="numeric"
                     placeholder="Customer TIN"
@@ -1003,6 +1068,63 @@ function POS({ currentUser, onLogout }) {
                   </button>
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Nights prompt — shown when a room-category item is tapped */}
+      {roomPrompt && (
+        <div
+          className="fixed inset-0 z-40 flex items-center justify-center p-6"
+          onClick={() => setRoomPrompt(null)}
+        >
+          <div className="absolute inset-0 bg-black/40" />
+          <div onClick={(e) => e.stopPropagation()} className="relative bg-white rounded-3xl shadow-xl w-full max-w-xs p-5 space-y-4">
+            <div>
+              <h3 className="text-lg font-extrabold text-slate-900">{roomPrompt.item_name}</h3>
+              <p className="text-sm text-slate-500">{roomPrompt.unit_price.toLocaleString()} RWF / night</p>
+            </div>
+            <div className="flex items-center justify-center gap-4">
+              <button
+                onClick={() => setNightsInput((v) => String(Math.max(1, (Number(v) || 1) - 1)))}
+                className="w-12 h-12 rounded-full bg-slate-100 text-slate-700 text-2xl font-bold active:scale-95"
+              >
+                −
+              </button>
+              <input
+                type="number"
+                min="1"
+                value={nightsInput}
+                onChange={(e) => setNightsInput(e.target.value.replace(/\D/g, ''))}
+                className="w-16 text-center text-2xl font-bold border border-gray-300 rounded-xl py-2"
+              />
+              <button
+                onClick={() => setNightsInput((v) => String((Number(v) || 0) + 1))}
+                className="w-12 h-12 rounded-full bg-slate-100 text-slate-700 text-2xl font-bold active:scale-95"
+              >
+                +
+              </button>
+            </div>
+            <p className="text-center text-sm text-slate-500">
+              {Math.max(1, Number(nightsInput) || 1)} night{Math.max(1, Number(nightsInput) || 1) > 1 ? 's' : ''} ={' '}
+              <span className="font-bold text-slate-800">
+                {(roomPrompt.unit_price * Math.max(1, Number(nightsInput) || 1)).toLocaleString()} RWF
+              </span>
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                onClick={() => setRoomPrompt(null)}
+                className="h-12 rounded-xl bg-slate-100 text-slate-600 font-bold active:scale-95"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => addRoomLine(roomPrompt, nightsInput)}
+                className="h-12 rounded-xl bg-amber-500 text-white font-bold active:scale-95"
+              >
+                Add
+              </button>
             </div>
           </div>
         </div>
@@ -1074,6 +1196,31 @@ function POS({ currentUser, onLogout }) {
                 <span>Total</span>
                 <span>{cartTotal.toLocaleString()} RWF</span>
               </div>
+
+              {/* Even-split helper — divides the total so the waiter knows what
+                  each guest owes. Last share carries any rounding remainder. */}
+              <div className="flex items-center justify-between bg-slate-50 rounded-xl px-3 py-2">
+                <span className="text-sm font-semibold text-slate-500">Split</span>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setSplitWays((n) => Math.max(1, n - 1))}
+                    className="w-8 h-8 rounded-full bg-white shadow text-slate-700 font-bold active:scale-95"
+                  >
+                    −
+                  </button>
+                  <span className="w-6 text-center font-bold">{splitWays}</span>
+                  <button
+                    onClick={() => setSplitWays((n) => n + 1)}
+                    className="w-8 h-8 rounded-full bg-white shadow text-slate-700 font-bold active:scale-95"
+                  >
+                    +
+                  </button>
+                </div>
+                <span className="text-sm font-bold text-slate-800">
+                  {splitWays > 1 ? `${Math.ceil(cartTotal / splitWays).toLocaleString()} RWF each` : '—'}
+                </span>
+              </div>
+
               <div className="grid grid-cols-3 gap-2">
                 <button
                   onClick={printBill}

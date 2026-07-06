@@ -24,6 +24,7 @@ so re-running one by accident is harmless.
 | `0004_kitchen_tickets.sql` | Adds the `kitchen_tickets` table (realtime) for the kitchen display. |
 | `0005_discounts.sql` | Adds `discount_amount` to `hospitality_sales` for bill-level discounts. |
 | `0006_refunds.sql` | Adds `refund_of` to `hospitality_sales` for post-payment refunds. |
+| `0007_covers_and_rooms.sql` | Adds `guest_count` and room `check_in_date` / `check_out_date` to `hospitality_sales`. |
 
 After running `0001`, the app's PIN login and per-waiter accountability work
 end-to-end. Until then, the app falls back to a local-only default owner

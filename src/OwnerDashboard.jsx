@@ -607,7 +607,15 @@ function ReportsTab() {
         .map(([name, total]) => ({ name, total }))
         .sort((a, b) => b.total - a.total);
 
-      setReport({ revenue, profit, receipts, count: sales.length, byMethod, topItems, staff });
+      // Covers = guests served, one guest_count per receipt (not per line).
+      const coversByReceipt = {};
+      for (const r of sales) {
+        if (r.receipt_no && r.guest_count) coversByReceipt[r.receipt_no] = r.guest_count;
+      }
+      const covers = Object.values(coversByReceipt).reduce((s, n) => s + n, 0);
+      const perCover = covers > 0 ? revenue / covers : 0;
+
+      setReport({ revenue, profit, receipts, count: sales.length, byMethod, topItems, staff, covers, perCover });
       setLoading(false);
     })();
     return () => {
@@ -645,6 +653,12 @@ function ReportsTab() {
             <StatCard label="Cash" value={money(report.byMethod.cash ?? 0)} />
             <StatCard label="MoMo" value={money(report.byMethod.momo ?? 0)} />
           </div>
+          {report.covers > 0 && (
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <StatCard label="Covers" value={report.covers.toLocaleString()} sub="guests served" />
+              <StatCard label="Avg / Cover" value={money(report.perCover)} />
+            </div>
+          )}
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <div className="bg-white rounded-2xl shadow-md p-5">
