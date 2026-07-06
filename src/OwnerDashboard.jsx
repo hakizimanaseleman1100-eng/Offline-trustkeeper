@@ -9,6 +9,7 @@ const STAFF_ROLES = ['WAITER', 'KITCHEN', 'MANAGER', 'OWNER'];
 
 const NAV_LINKS = [
   { key: 'Dashboard', icon: '📊' },
+  { key: 'Sales', icon: '🧾' },
   { key: 'Inventory', icon: '📦' },
   { key: 'Expenses', icon: '💵' },
   { key: 'Reports', icon: '📈' },
@@ -686,7 +687,126 @@ function ReportsTab() {
   );
 }
 
-function OwnerDashboard({ onLogout }) {
+function SalesTab({ notify, currentUser }) {
+  const [receipts, setReceipts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(null);
+
+  const loadSales = async () => {
+    setLoading(true);
+    // Last 30 days of receipted sales. Group by receipt_no; rows that are
+    // themselves refunds (refund_of set) mark their target as refunded.
+    const { data, error } = await supabase
+      .from('hospitality_sales')
+      .select('*')
+      .eq('business_id', CURRENT_BUSINESS_ID)
+      .gte('timestamp', sinceISO(30))
+      .order('timestamp', { ascending: false });
+    if (error) {
+      console.error('Failed to load sales:', error.message);
+      setLoading(false);
+      return;
+    }
+    const rows = data ?? [];
+    const refundedReceipts = new Set(rows.filter((r) => r.refund_of).map((r) => r.refund_of));
+
+    const groups = {};
+    for (const r of rows) {
+      if (r.refund_of || !r.receipt_no) continue; // skip refund rows + un-receipted legacy sales
+      const g = (groups[r.receipt_no] ||= {
+        receipt_no: r.receipt_no,
+        timestamp: r.timestamp,
+        payment_method: r.payment_method,
+        staff_name: r.staff_name,
+        total: 0,
+        lines: [],
+        refunded: refundedReceipts.has(r.receipt_no),
+      });
+      g.total += r.total_price ?? 0;
+      g.lines.push(r);
+    }
+    setReceipts(Object.values(groups).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)));
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    loadSales();
+  }, []);
+
+  const refund = async (g) => {
+    if (!window.confirm(`Refund receipt ${g.receipt_no} (${Math.round(g.total).toLocaleString()} RWF)?`)) return;
+    setBusy(g.receipt_no);
+    // Insert reversing rows: same lines, negated. refund_of ties them back.
+    const reversals = g.lines.map((r) => ({
+      business_id: CURRENT_BUSINESS_ID,
+      item_id: r.item_id,
+      quantity: -(r.quantity ?? 1),
+      total_price: -(r.total_price ?? 0),
+      cost_price: r.cost_price,
+      tax_label: r.tax_label,
+      tax_rate: r.tax_rate,
+      payment_method: r.payment_method,
+      staff_id: currentUser?.id ?? null,
+      staff_name: currentUser?.name ?? null,
+      receipt_no: r.receipt_no,
+      refund_of: g.receipt_no,
+      timestamp: new Date().toISOString(),
+    }));
+    const { error } = await supabase.from('hospitality_sales').insert(reversals);
+    if (error) {
+      notify(`Refund failed: ${error.message}`);
+      setBusy(null);
+      return;
+    }
+    await supabase.from('audit_logs').insert({
+      business_id: CURRENT_BUSINESS_ID,
+      action_type: 'REFUND',
+      details: `Refunded receipt ${g.receipt_no} (${Math.round(g.total).toLocaleString()} RWF)`,
+      staff_id: currentUser?.id ?? null,
+      staff_name: currentUser?.name ?? null,
+      timestamp: new Date().toISOString(),
+    });
+    notify(`Refunded ${g.receipt_no}`);
+    setBusy(null);
+    loadSales();
+  };
+
+  if (loading) return <p className="text-slate-400">Loading…</p>;
+  if (receipts.length === 0) return <p className="text-slate-400 text-lg">No receipted sales in the last 30 days.</p>;
+
+  return (
+    <div className="bg-white rounded-2xl shadow-md divide-y divide-gray-100">
+      {receipts.map((g) => (
+        <div key={g.receipt_no} className="flex items-center justify-between px-5 py-4 gap-3">
+          <div className="min-w-0">
+            <p className="font-semibold text-slate-800">
+              {g.receipt_no}
+              {g.refunded && <span className="ml-2 text-xs font-bold uppercase text-red-500">Refunded</span>}
+            </p>
+            <p className="text-xs text-slate-400">
+              {new Date(g.timestamp).toLocaleString()} · {(g.payment_method ?? '—').toUpperCase()}
+              {g.staff_name ? ` · ${g.staff_name}` : ''}
+            </p>
+          </div>
+          <div className="flex items-center gap-3 shrink-0">
+            <span className={`font-semibold ${g.refunded ? 'text-slate-300 line-through' : 'text-slate-700'}`}>
+              {Math.round(g.total).toLocaleString()} RWF
+            </span>
+            <button
+              onClick={() => refund(g)}
+              disabled={g.refunded || busy === g.receipt_no}
+              className="px-3 py-1.5 rounded-lg bg-red-50 text-red-600 text-sm font-semibold active:scale-95 disabled:opacity-40"
+            >
+              {busy === g.receipt_no ? '…' : 'Refund'}
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function OwnerDashboard({ currentUser, onLogout }) {
   const [activeLink, setActiveLink] = useState('Dashboard');
   const [notice, setNotice] = useState('');
   const [cashFlow, setCashFlow] = useState({ salesTotal: 0, expensesTotal: 0, net: 0 });
@@ -778,6 +898,7 @@ function OwnerDashboard({ onLogout }) {
         )}
 
         {activeLink === 'Dashboard' && <DashboardHome cashFlow={cashFlow} loading={cashFlowLoading} />}
+        {activeLink === 'Sales' && <SalesTab notify={notify} currentUser={currentUser} />}
         {activeLink === 'Inventory' && <InventoryTab notify={notify} />}
         {activeLink === 'Expenses' && <ExpensesTab notify={notify} />}
         {activeLink === 'Team' && <TeamTab notify={notify} />}
@@ -790,11 +911,11 @@ function OwnerDashboard({ onLogout }) {
           <button
             key={key}
             onClick={() => setActiveLink(key)}
-            className={`flex flex-col items-center gap-0.5 px-3 py-1 rounded-lg text-xs font-semibold transition ${
+            className={`flex flex-col items-center gap-0.5 px-1.5 py-1 rounded-lg text-[10px] font-semibold transition ${
               activeLink === key ? 'text-amber-400' : 'text-slate-400'
             }`}
           >
-            <span className="text-2xl leading-none">{icon}</span>
+            <span className="text-xl leading-none">{icon}</span>
             {key}
           </button>
         ))}
