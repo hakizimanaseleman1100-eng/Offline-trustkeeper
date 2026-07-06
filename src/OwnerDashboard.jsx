@@ -22,6 +22,21 @@ function startOfTodayISO() {
   return d.toISOString();
 }
 
+// Start-of-day ISO for a rolling window: sinceISO(1) = today, sinceISO(7) =
+// midnight 6 days ago (i.e. a 7-day window including today).
+function sinceISO(days) {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - (days - 1));
+  return d.toISOString();
+}
+
+const REPORT_RANGES = [
+  { key: 'today', label: 'Today', days: 1 },
+  { key: '7d', label: '7 Days', days: 7 },
+  { key: '30d', label: '30 Days', days: 30 },
+];
+
 function DashboardHome({ cashFlow, loading }) {
   // Sales that were rung up on THIS device but haven't reached Supabase yet.
   // The dashboard's totals come from the server, so until these upload the
@@ -521,6 +536,156 @@ function TeamTab({ notify }) {
   );
 }
 
+function StatCard({ label, value, sub, tone = 'slate' }) {
+  const toneClass = { slate: 'text-slate-900', emerald: 'text-emerald-600', red: 'text-red-600' }[tone];
+  return (
+    <div className="bg-white rounded-2xl shadow-md p-5">
+      <p className="text-xs uppercase tracking-wide text-slate-400 mb-1">{label}</p>
+      <p className={`text-2xl font-extrabold ${toneClass}`}>{value}</p>
+      {sub && <p className="text-sm text-slate-400 mt-1">{sub}</p>}
+    </div>
+  );
+}
+
+function ReportsTab() {
+  const [range, setRange] = useState('today');
+  const [loading, setLoading] = useState(true);
+  const [report, setReport] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const days = REPORT_RANGES.find((r) => r.key === range).days;
+      const since = sinceISO(days);
+      const [salesRes, productsRes] = await Promise.all([
+        supabase
+          .from('hospitality_sales')
+          .select('*')
+          .eq('business_id', CURRENT_BUSINESS_ID)
+          .gte('timestamp', since),
+        supabase.from('products').select('id, item_name').eq('business_id', CURRENT_BUSINESS_ID),
+      ]);
+      if (cancelled) return;
+
+      if (salesRes.error) {
+        console.error('Report load failed:', salesRes.error.message);
+        setReport(null);
+        setLoading(false);
+        return;
+      }
+
+      const sales = salesRes.data ?? [];
+      const nameById = Object.fromEntries((productsRes.data ?? []).map((p) => [p.id, p.item_name]));
+
+      const revenue = sales.reduce((s, r) => s + (r.total_price ?? 0), 0);
+      const profit = sales.reduce((s, r) => s + ((r.total_price ?? 0) - (r.cost_price ?? 0) * (r.quantity ?? 1)), 0);
+      const receipts = new Set(sales.map((r) => r.receipt_no).filter(Boolean)).size;
+
+      const byMethod = sales.reduce((acc, r) => {
+        const m = r.payment_method ?? 'other';
+        acc[m] = (acc[m] ?? 0) + (r.total_price ?? 0);
+        return acc;
+      }, {});
+
+      const itemsMap = sales.reduce((acc, r) => {
+        const key = r.item_id;
+        acc[key] ||= { name: nameById[key] ?? 'Unknown item', qty: 0, revenue: 0 };
+        acc[key].qty += r.quantity ?? 1;
+        acc[key].revenue += r.total_price ?? 0;
+        return acc;
+      }, {});
+      const topItems = Object.values(itemsMap).sort((a, b) => b.revenue - a.revenue).slice(0, 10);
+
+      const staffMap = sales.reduce((acc, r) => {
+        const name = r.staff_name ?? 'Unattributed';
+        acc[name] = (acc[name] ?? 0) + (r.total_price ?? 0);
+        return acc;
+      }, {});
+      const staff = Object.entries(staffMap)
+        .map(([name, total]) => ({ name, total }))
+        .sort((a, b) => b.total - a.total);
+
+      setReport({ revenue, profit, receipts, count: sales.length, byMethod, topItems, staff });
+      setLoading(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [range]);
+
+  const money = (n) => `${Math.round(n).toLocaleString()} RWF`;
+
+  return (
+    <div className="space-y-6">
+      <div className="flex gap-2">
+        {REPORT_RANGES.map((r) => (
+          <button
+            key={r.key}
+            onClick={() => setRange(r.key)}
+            className={`px-4 py-2 rounded-full text-sm font-semibold transition active:scale-95 ${
+              range === r.key ? 'bg-amber-500 text-white' : 'bg-white text-slate-600 shadow-sm'
+            }`}
+          >
+            {r.label}
+          </button>
+        ))}
+      </div>
+
+      {loading ? (
+        <p className="text-slate-400">Loading…</p>
+      ) : !report ? (
+        <p className="text-slate-400">Could not load report.</p>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <StatCard label="Revenue" value={money(report.revenue)} sub={`${report.receipts} receipt${report.receipts === 1 ? '' : 's'}`} />
+            <StatCard label="Gross Profit" value={money(report.profit)} tone={report.profit >= 0 ? 'emerald' : 'red'} />
+            <StatCard label="Cash" value={money(report.byMethod.cash ?? 0)} />
+            <StatCard label="MoMo" value={money(report.byMethod.momo ?? 0)} />
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div className="bg-white rounded-2xl shadow-md p-5">
+              <p className="font-semibold text-slate-700 mb-3">Top Items</p>
+              {report.topItems.length === 0 ? (
+                <p className="text-slate-400 text-sm">No sales in this period.</p>
+              ) : (
+                <ul className="divide-y divide-gray-100">
+                  {report.topItems.map((it) => (
+                    <li key={it.name} className="flex justify-between py-2 text-sm">
+                      <span className="text-slate-700">
+                        {it.name} <span className="text-slate-400">× {it.qty}</span>
+                      </span>
+                      <span className="text-slate-500">{money(it.revenue)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <div className="bg-white rounded-2xl shadow-md p-5">
+              <p className="font-semibold text-slate-700 mb-3">By Waiter</p>
+              {report.staff.length === 0 ? (
+                <p className="text-slate-400 text-sm">No sales in this period.</p>
+              ) : (
+                <ul className="divide-y divide-gray-100">
+                  {report.staff.map((s) => (
+                    <li key={s.name} className="flex justify-between py-2 text-sm">
+                      <span className="text-slate-700">{s.name}</span>
+                      <span className="text-slate-500">{money(s.total)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function OwnerDashboard({ onLogout }) {
   const [activeLink, setActiveLink] = useState('Dashboard');
   const [notice, setNotice] = useState('');
@@ -616,9 +781,7 @@ function OwnerDashboard({ onLogout }) {
         {activeLink === 'Inventory' && <InventoryTab notify={notify} />}
         {activeLink === 'Expenses' && <ExpensesTab notify={notify} />}
         {activeLink === 'Team' && <TeamTab notify={notify} />}
-        {activeLink === 'Reports' && (
-          <p className="text-slate-500 text-lg">Reports view is coming soon.</p>
-        )}
+        {activeLink === 'Reports' && <ReportsTab />}
       </main>
 
       {/* Mobile bottom icon bar — icon + short label is easier to scan at a glance than a text list */}
