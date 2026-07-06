@@ -110,3 +110,13 @@ db.version(6).stores({
 db.version(7).stores({
   staff: 'id, business_id, pin_hash',
 });
+
+/*
+ * version(8): a tiny key/value store for device-local counters and settings.
+ * Used for the fiscal receipt sequence ('receipt_seq') and a stable per-device
+ * id ('device_id'). Kept separate from business data so it never syncs — these
+ * are properties of THIS device, not the business.
+ */
+db.version(8).stores({
+  meta: 'key',
+});

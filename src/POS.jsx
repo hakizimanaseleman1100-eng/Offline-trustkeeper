@@ -3,6 +3,7 @@ import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './db';
 import { supabase } from './supabaseClient';
 import { CURRENT_BUSINESS_ID } from './config';
+import { getDeviceId, nextReceiptNo } from './receipts';
 
 function POS({ currentUser, onLogout }) {
   const [activeTabId, setActiveTabId] = useState(null);
@@ -15,6 +16,10 @@ function POS({ currentUser, onLogout }) {
   const [customerPhone, setCustomerPhone] = useState('');
   const [cartOpen, setCartOpen] = useState(false);
   const [showBill, setShowBill] = useState(false);
+  // When MOMO is tapped we first ask for the transaction reference before
+  // closing the tab, so the owner can reconcile against the MTN dashboard.
+  const [momoPrompt, setMomoPrompt] = useState(false);
+  const [momoRef, setMomoRef] = useState('');
 
   const showToast = (message, duration = 2500) => {
     setToast(message);
@@ -113,6 +118,21 @@ function POS({ currentUser, onLogout }) {
     }, {})
   );
 
+  // Tax breakdown for the receipt. Rwandan EBM prices are tax-INCLUSIVE, so the
+  // VAT already sits inside total_price: tax = total * rate / (100 + rate).
+  // Grouped by tax label (A/B/C…) as EBM receipts require.
+  const taxSummary = Object.values(
+    cartItems.reduce((acc, row) => {
+      const rate = row.tax_rate ?? 0;
+      if (!rate) return acc;
+      const label = row.tax_label ?? '—';
+      const key = `${label}:${rate}`;
+      acc[key] ||= { label, rate, amount: 0 };
+      acc[key].amount += (row.total_price * rate) / (100 + rate);
+      return acc;
+    }, {})
+  );
+
   const createTab = async () => {
     const tabNumber = (await db.active_tabs.count()) + 1;
     const id = await db.active_tabs.add({
@@ -141,6 +161,8 @@ function POS({ currentUser, onLogout }) {
     setCustomerPhone('');
     setCartOpen(false);
     setShowBill(false);
+    setMomoPrompt(false);
+    setMomoRef('');
   };
 
   // Quick-access from a tab card on the Home screen — jump straight into the
@@ -152,11 +174,24 @@ function POS({ currentUser, onLogout }) {
     setCartOpen(true);
   };
 
+  // A receipt number is the fiscal reference for a bill. Assigned once, the
+  // first time a bill is shown or paid, and stored on the tab so re-opening or
+  // re-printing shows the same number (idempotent). Voided-before-billing tabs
+  // never consume a number.
+  const ensureReceiptNo = async (tabId) => {
+    const tab = await db.active_tabs.get(tabId);
+    if (tab?.receipt_no) return tab.receipt_no;
+    const receipt_no = await nextReceiptNo();
+    await db.active_tabs.update(tabId, { receipt_no });
+    return receipt_no;
+  };
+
   const openTabWithBill = (id) => {
     setActiveTabId(id);
     setSelectedCategory('All');
     setSearchQuery('');
     setShowBill(true);
+    ensureReceiptNo(id);
   };
 
   const logAudit = (actionType, details) =>
@@ -258,8 +293,10 @@ function POS({ currentUser, onLogout }) {
   const billText = () =>
     [
       activeTab?.name ?? 'Bill',
+      ...(activeTab?.receipt_no ? [`Receipt ${activeTab.receipt_no}`] : []),
       ...billItems.map((row) => `${row.name} x${row.quantity} — ${row.total_price.toLocaleString()} RWF`),
       `Total: ${cartTotal.toLocaleString()} RWF`,
+      ...taxSummary.map((t) => `VAT ${t.label} (${t.rate}%) incl.: ${Math.round(t.amount).toLocaleString()} RWF`),
     ].join('\n');
 
   // Prints in-place using a hidden, print-only section of the page (see the
@@ -309,9 +346,13 @@ function POS({ currentUser, onLogout }) {
     }
   };
 
-  const checkout = async (paymentMethod) => {
+  const checkout = async (paymentMethod, momoRef = null) => {
     if (cartItems.length === 0) return;
     try {
+      // Stamp the fiscal reference + issuing device on every line, so the
+      // permanent sale record carries the same receipt number the customer got.
+      const receipt_no = await ensureReceiptNo(activeTabId);
+      const device_id = await getDeviceId();
       await db.sales.bulkUpdate(
         cartItems.map((row) => ({
           key: row.id,
@@ -319,11 +360,14 @@ function POS({ currentUser, onLogout }) {
             payment_method: paymentMethod,
             customer_tin: customerTin || null,
             customer_phone: customerPhone || null,
+            momo_ref: momoRef || null,
+            receipt_no,
+            device_id,
           },
         }))
       );
       await db.active_tabs.update(activeTabId, { status: 'paid' });
-      showToast(`${activeTab?.name ?? 'Tab'} closed — ${paymentMethod.toUpperCase()}`);
+      showToast(`${activeTab?.name ?? 'Tab'} closed — ${receipt_no}`);
       closeTabView();
     } catch (err) {
       console.error('Failed to close tab:', err);
@@ -360,6 +404,9 @@ function POS({ currentUser, onLogout }) {
           customer_phone: sale.customer_phone ?? null,
           staff_id: sale.staff_id ?? null,
           staff_name: sale.staff_name ?? null,
+          receipt_no: sale.receipt_no ?? null,
+          device_id: sale.device_id ?? null,
+          momo_ref: sale.momo_ref ?? null,
           timestamp: new Date(sale.timestamp).toISOString(),
         }))
       );
@@ -599,7 +646,10 @@ function POS({ currentUser, onLogout }) {
             )}
           </button>
           <button
-            onClick={() => setShowBill(true)}
+            onClick={() => {
+              setShowBill(true);
+              ensureReceiptNo(activeTabId);
+            }}
             className="h-16 lg:h-20 flex flex-col items-center justify-center gap-0.5 text-slate-700 active:scale-95"
           >
             <span className="text-2xl lg:text-3xl">🧾</span>
@@ -733,22 +783,51 @@ function POS({ currentUser, onLogout }) {
                 </div>
               )}
 
-              <div className="grid grid-cols-2 gap-3 pt-1">
-                <button
-                  onClick={() => checkout('cash')}
-                  disabled={cartItems.length === 0}
-                  className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-green-600 text-white transition active:scale-95 disabled:opacity-40"
-                >
-                  PAY CASH
-                </button>
-                <button
-                  onClick={() => checkout('momo')}
-                  disabled={cartItems.length === 0}
-                  className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-yellow-400 text-slate-900 transition active:scale-95 disabled:opacity-40"
-                >
-                  MOMO
-                </button>
-              </div>
+              {momoPrompt ? (
+                /* MoMo two-step: capture the transaction reference, then close.
+                   The ref is optional — "Skip" still records the MoMo payment. */
+                <div className="space-y-3 pt-1">
+                  <input
+                    type="text"
+                    autoFocus
+                    placeholder="MoMo transaction ref (e.g. AE1234567)"
+                    value={momoRef}
+                    onChange={(e) => setMomoRef(e.target.value)}
+                    className="w-full px-4 py-3 rounded-xl border border-gray-300 text-lg"
+                  />
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      onClick={() => setMomoPrompt(false)}
+                      className="h-14 rounded-xl font-bold bg-slate-100 text-slate-600 active:scale-95"
+                    >
+                      ← Back
+                    </button>
+                    <button
+                      onClick={() => checkout('momo', momoRef)}
+                      className="h-14 rounded-xl font-bold bg-yellow-400 text-slate-900 active:scale-95"
+                    >
+                      {momoRef ? 'Confirm MoMo' : 'Skip & Close'}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-3 pt-1">
+                  <button
+                    onClick={() => checkout('cash')}
+                    disabled={cartItems.length === 0}
+                    className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-green-600 text-white transition active:scale-95 disabled:opacity-40"
+                  >
+                    PAY CASH
+                  </button>
+                  <button
+                    onClick={() => setMomoPrompt(true)}
+                    disabled={cartItems.length === 0}
+                    className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-yellow-400 text-slate-900 transition active:scale-95 disabled:opacity-40"
+                  >
+                    MOMO
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -766,11 +845,16 @@ function POS({ currentUser, onLogout }) {
             className="relative bg-white rounded-t-3xl lg:rounded-3xl shadow-xl max-h-[75vh] lg:max-h-[85vh] w-full lg:max-w-lg flex flex-col"
           >
             <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
-              <h3 className="text-xl font-extrabold text-slate-900">{activeTab?.name} — Bill</h3>
+              <div className="min-w-0">
+                <h3 className="text-xl font-extrabold text-slate-900 truncate">{activeTab?.name} — Bill</h3>
+                {activeTab?.receipt_no && (
+                  <p className="text-xs font-semibold text-slate-400">Receipt {activeTab.receipt_no}</p>
+                )}
+              </div>
               <button
                 onClick={() => setShowBill(false)}
                 aria-label="Close bill"
-                className="text-slate-400 text-2xl leading-none w-8 h-8"
+                className="text-slate-400 text-2xl leading-none w-8 h-8 shrink-0"
               >
                 ×
               </button>
@@ -793,6 +877,12 @@ function POS({ currentUser, onLogout }) {
             </div>
 
             <div className="p-4 border-t border-gray-100 space-y-3">
+              {taxSummary.map((t) => (
+                <div key={`${t.label}-${t.rate}`} className="flex items-center justify-between text-sm text-slate-500 px-1">
+                  <span>VAT {t.label} ({t.rate}%) incl.</span>
+                  <span>{Math.round(t.amount).toLocaleString()} RWF</span>
+                </div>
+              ))}
               <div className="flex items-center justify-between text-xl font-bold text-slate-900 px-1">
                 <span>Total</span>
                 <span>{cartTotal.toLocaleString()} RWF</span>
@@ -835,7 +925,8 @@ function POS({ currentUser, onLogout }) {
         with everything else when the page is printed. */}
     {activeTabId !== null && (
       <div className="hidden print:block p-6 font-mono text-black">
-        <h2 className="text-lg font-bold mb-3">{activeTab?.name ?? 'Bill'}</h2>
+        <h2 className="text-lg font-bold">{activeTab?.name ?? 'Bill'}</h2>
+        {activeTab?.receipt_no && <p className="text-sm mb-3">Receipt {activeTab.receipt_no}</p>}
         {billItems.map((row) => (
           <div key={row.item_id} className="flex justify-between text-sm py-0.5">
             <span>
@@ -849,6 +940,12 @@ function POS({ currentUser, onLogout }) {
           <span>Total</span>
           <span>{cartTotal.toLocaleString()} RWF</span>
         </div>
+        {taxSummary.map((t) => (
+          <div key={`${t.label}-${t.rate}`} className="flex justify-between text-xs mt-0.5">
+            <span>VAT {t.label} ({t.rate}%) incl.</span>
+            <span>{Math.round(t.amount).toLocaleString()} RWF</span>
+          </div>
+        ))}
       </div>
     )}
     </>
