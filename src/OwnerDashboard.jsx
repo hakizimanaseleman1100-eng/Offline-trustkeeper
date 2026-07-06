@@ -1,6 +1,9 @@
 import { useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
 import { CURRENT_BUSINESS_ID } from './config';
+import { hashPin } from './auth';
+
+const STAFF_ROLES = ['WAITER', 'MANAGER', 'OWNER'];
 
 const NAV_LINKS = [
   { key: 'Dashboard', icon: '📊' },
@@ -278,6 +281,146 @@ function ExpensesTab({ notify }) {
   );
 }
 
+function TeamTab({ notify }) {
+  const [staff, setStaff] = useState([]);
+  const [name, setName] = useState('');
+  const [role, setRole] = useState('WAITER');
+  const [pin, setPin] = useState('');
+
+  const loadStaff = async () => {
+    const { data, error } = await supabase
+      .from('staff')
+      .select('*')
+      .eq('business_id', CURRENT_BUSINESS_ID)
+      .order('name');
+    if (error) {
+      console.error('Failed to load staff:', error.message);
+      return;
+    }
+    setStaff(data ?? []);
+  };
+
+  useEffect(() => {
+    loadStaff();
+  }, []);
+
+  const handleAddStaff = async (e) => {
+    e.preventDefault();
+    if (!/^\d{4}$/.test(pin)) {
+      notify('PIN must be exactly 4 digits');
+      return;
+    }
+    const pin_hash = await hashPin(pin);
+    // Friendly pre-check so a duplicate PIN reads as a clear message rather
+    // than a raw unique-index violation. The DB index is still the source of
+    // truth if two owners add at once.
+    if (staff.some((s) => s.active !== false && s.pin_hash === pin_hash)) {
+      notify('That PIN is already in use — pick another');
+      return;
+    }
+    const { error } = await supabase.from('staff').insert({
+      business_id: CURRENT_BUSINESS_ID,
+      name,
+      role,
+      pin_hash,
+      active: true,
+    });
+    if (error) {
+      notify(`Could not add staff: ${error.message}`);
+      return;
+    }
+    setName('');
+    setRole('WAITER');
+    setPin('');
+    notify(`Added ${name}`);
+    loadStaff();
+  };
+
+  const setActive = async (member, active) => {
+    const { error } = await supabase.from('staff').update({ active }).eq('id', member.id);
+    if (error) {
+      notify(active ? `Could not re-activate: ${error.message}` : `Could not deactivate: ${error.message}`);
+      return;
+    }
+    notify(`${member.name} ${active ? 're-activated' : 'deactivated'}`);
+    loadStaff();
+  };
+
+  return (
+    <div className="space-y-8">
+      <form
+        onSubmit={handleAddStaff}
+        className="bg-white rounded-2xl shadow-md p-6 grid grid-cols-1 sm:grid-cols-4 gap-4"
+      >
+        <input
+          required
+          placeholder="Staff name"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          className="px-4 py-2 rounded-lg border border-gray-300 sm:col-span-2"
+        />
+        <select
+          value={role}
+          onChange={(e) => setRole(e.target.value)}
+          className="px-4 py-2 rounded-lg border border-gray-300"
+        >
+          {STAFF_ROLES.map((r) => (
+            <option key={r} value={r}>
+              {r.charAt(0) + r.slice(1).toLowerCase()}
+            </option>
+          ))}
+        </select>
+        <input
+          required
+          inputMode="numeric"
+          maxLength={4}
+          placeholder="4-digit PIN"
+          value={pin}
+          onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))}
+          className="px-4 py-2 rounded-lg border border-gray-300 tracking-widest"
+        />
+        <button
+          type="submit"
+          className="sm:col-span-4 py-2 rounded-lg bg-amber-500 text-white font-semibold active:scale-95"
+        >
+          Add Staff Member
+        </button>
+      </form>
+
+      <div className="bg-white rounded-2xl shadow-md divide-y divide-gray-100">
+        {staff.length === 0 ? (
+          <p className="px-5 py-6 text-slate-400">No staff yet.</p>
+        ) : (
+          staff.map((member) => (
+            <div key={member.id} className="flex items-center justify-between px-5 py-4 gap-3">
+              <div className="min-w-0">
+                <p
+                  className={`font-semibold truncate ${
+                    member.active === false ? 'text-slate-400 line-through' : 'text-slate-800'
+                  }`}
+                >
+                  {member.name}
+                </p>
+                <p className="text-xs uppercase tracking-wide text-slate-400">{member.role}</p>
+              </div>
+              <button
+                onClick={() => setActive(member, member.active === false)}
+                className={`shrink-0 px-3 py-1.5 rounded-lg text-sm font-semibold active:scale-95 ${
+                  member.active === false
+                    ? 'bg-emerald-50 text-emerald-600'
+                    : 'bg-red-50 text-red-600'
+                }`}
+              >
+                {member.active === false ? 'Re-activate' : 'Deactivate'}
+              </button>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 function OwnerDashboard({ onLogout }) {
   const [activeLink, setActiveLink] = useState('Dashboard');
   const [notice, setNotice] = useState('');
@@ -372,8 +515,9 @@ function OwnerDashboard({ onLogout }) {
         {activeLink === 'Dashboard' && <DashboardHome cashFlow={cashFlow} loading={cashFlowLoading} />}
         {activeLink === 'Inventory' && <InventoryTab notify={notify} />}
         {activeLink === 'Expenses' && <ExpensesTab notify={notify} />}
-        {(activeLink === 'Reports' || activeLink === 'Team') && (
-          <p className="text-slate-500 text-lg">{activeLink} view is coming soon.</p>
+        {activeLink === 'Team' && <TeamTab notify={notify} />}
+        {activeLink === 'Reports' && (
+          <p className="text-slate-500 text-lg">Reports view is coming soon.</p>
         )}
       </main>
 

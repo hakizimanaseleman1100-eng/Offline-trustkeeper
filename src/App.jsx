@@ -3,7 +3,9 @@ import { db } from './db';
 import { supabase } from './supabaseClient';
 import POS from './POS';
 import OwnerDashboard from './OwnerDashboard';
+import PinLogin from './PinLogin';
 import { CURRENT_BUSINESS_ID } from './config';
+import { hashPin, DEFAULT_OWNER_ID, DEFAULT_OWNER_PIN } from './auth';
 
 // Down-syncs the product catalog from Supabase into the local Dexie mirror.
 // Inventory is fully server-owned now — this replaces the local copy wholesale
@@ -22,46 +24,64 @@ async function syncInventory() {
   }
 }
 
+// Mirrors the staff list locally so PIN login works offline. If no staff exist
+// anywhere (server empty AND nothing local — i.e. a fresh first run), seeds a
+// local-only default owner so the app is still usable; the owner then creates
+// real accounts from the Team tab, which sync down and replace this default.
+async function syncStaff() {
+  try {
+    const { data, error } = await supabase
+      .from('staff')
+      .select('*')
+      .eq('business_id', CURRENT_BUSINESS_ID);
+    if (error) throw error;
+    // Only replace the local mirror when the fetch actually succeeded.
+    await db.staff.clear();
+    if (data?.length) await db.staff.bulkAdd(data);
+  } catch (err) {
+    // Offline (or the staff table doesn't exist yet): keep whatever's local.
+    console.error('Staff down-sync skipped:', err.message);
+  }
+
+  if ((await db.staff.count()) === 0) {
+    await db.staff.put({
+      id: DEFAULT_OWNER_ID,
+      business_id: CURRENT_BUSINESS_ID,
+      name: 'Owner',
+      pin_hash: await hashPin(DEFAULT_OWNER_PIN),
+      role: 'OWNER',
+      active: true,
+    });
+  }
+}
+
 function App() {
   const [currentUser, setCurrentUser] = useState(null);
+  const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    if (navigator.onLine) {
-      syncInventory();
-    }
+    (async () => {
+      if (navigator.onLine) await syncInventory();
+      await syncStaff();
+      setReady(true);
+    })();
   }, []);
 
   const logout = () => setCurrentUser(null);
 
+  if (!ready) {
+    return <div className="min-h-screen bg-slate-900" />;
+  }
+
   if (!currentUser) {
-    return (
-      <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center gap-6 font-sans px-6 py-12">
-        <h1 className="text-4xl font-extrabold text-white tracking-tight mb-4 text-center">
-          Sovereign Hospitality OS
-        </h1>
-        <div className="flex flex-wrap justify-center gap-6 w-full max-w-md">
-          <button
-            onClick={() => setCurrentUser({ role: 'WAITER' })}
-            className="h-32 w-full sm:w-56 rounded-2xl text-2xl font-bold bg-amber-500 text-white shadow-lg transition active:scale-95"
-          >
-            Login as Waiter
-          </button>
-          <button
-            onClick={() => setCurrentUser({ role: 'OWNER' })}
-            className="h-32 w-full sm:w-56 rounded-2xl text-2xl font-bold bg-purple-600 text-white shadow-lg transition active:scale-95"
-          >
-            Login as Owner
-          </button>
-        </div>
-      </div>
-    );
+    return <PinLogin onSuccess={setCurrentUser} />;
   }
 
-  if (currentUser.role === 'OWNER') {
-    return <OwnerDashboard onLogout={logout} />;
+  if (currentUser.role === 'OWNER' || currentUser.role === 'MANAGER') {
+    return <OwnerDashboard currentUser={currentUser} onLogout={logout} />;
   }
 
-  return <POS onLogout={logout} />;
+  return <POS currentUser={currentUser} onLogout={logout} />;
 }
 
 export default App;

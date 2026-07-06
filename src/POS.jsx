@@ -4,7 +4,7 @@ import { db } from './db';
 import { supabase } from './supabaseClient';
 import { CURRENT_BUSINESS_ID } from './config';
 
-function POS({ onLogout }) {
+function POS({ currentUser, onLogout }) {
   const [activeTabId, setActiveTabId] = useState(null);
   const [selectedCategory, setSelectedCategory] = useState('All');
   const [searchQuery, setSearchQuery] = useState('');
@@ -163,6 +163,8 @@ function POS({ onLogout }) {
     db.audit_logs.add({
       action_type: actionType,
       details,
+      staff_id: currentUser?.id ?? null,
+      staff_name: currentUser?.name ?? null,
       timestamp: Date.now(),
       synced_status: 0,
     });
@@ -236,6 +238,10 @@ function POS({ onLogout }) {
       cost_price: item.cost_price,
       tax_label: item.tax_label,
       tax_rate: item.tax_rate,
+      // Whoever added the line owns it — snapshotted so reports/accountability
+      // survive the staff member later being renamed or deactivated.
+      staff_id: currentUser?.id ?? null,
+      staff_name: currentUser?.name ?? null,
       timestamp: Date.now(),
       synced_status: 0,
     });
@@ -352,6 +358,8 @@ function POS({ onLogout }) {
           tax_rate: sale.tax_rate,
           customer_tin: sale.customer_tin ?? null,
           customer_phone: sale.customer_phone ?? null,
+          staff_id: sale.staff_id ?? null,
+          staff_name: sale.staff_name ?? null,
           timestamp: new Date(sale.timestamp).toISOString(),
         }))
       );
@@ -368,6 +376,8 @@ function POS({ onLogout }) {
             business_id: CURRENT_BUSINESS_ID,
             action_type: log.action_type,
             details: log.details,
+            staff_id: log.staff_id ?? null,
+            staff_name: log.staff_name ?? null,
             timestamp: new Date(log.timestamp).toISOString(),
           }))
         );
@@ -392,7 +402,12 @@ function POS({ onLogout }) {
     <div className="min-h-screen bg-gray-50 font-sans pb-20 print:hidden">
       {/* Header */}
       <header className="bg-slate-900 text-white px-3 sm:px-6 lg:px-10 py-2 sm:py-3 lg:py-4 flex flex-wrap gap-2 justify-between items-center shadow-lg">
-        <h1 className="text-lg sm:text-2xl lg:text-3xl font-extrabold tracking-tight">Sovereign POS</h1>
+        <div className="min-w-0">
+          <h1 className="text-lg sm:text-2xl lg:text-3xl font-extrabold tracking-tight">Sovereign POS</h1>
+          {currentUser?.name && (
+            <p className="text-[10px] lg:text-xs text-slate-400 truncate">Signed in as {currentUser.name}</p>
+          )}
+        </div>
         <div className="flex items-center gap-2 sm:gap-4 lg:gap-6">
           <div className="text-right">
             <div className="text-[10px] lg:text-xs uppercase tracking-widest text-slate-400">Open Tabs</div>
