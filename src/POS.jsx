@@ -33,6 +33,7 @@ function POS({ currentUser, onLogout }) {
   const [momoPrompt, setMomoPrompt] = useState(false);
   const [momoRef, setMomoRef] = useState('');
   const [lastSyncAt, setLastSyncAt] = useState(null);
+  const [showDiscount, setShowDiscount] = useState(false);
 
   const showToast = (message, duration = 2500) => {
     setToast(message);
@@ -106,7 +107,17 @@ function POS({ currentUser, onLogout }) {
     [activeTabId],
     []
   );
-  const cartTotal = cartItems.reduce((sum, row) => sum + row.total_price, 0);
+  // Subtotal is the gross of all lines; the bill-level discount (stored on the
+  // tab as { mode: 'amount'|'percent', value }) comes off it to give the net
+  // total actually charged.
+  const cartSubtotal = cartItems.reduce((sum, row) => sum + row.total_price, 0);
+  const discount = activeTab?.discount ?? null;
+  const discountAmount = !discount
+    ? 0
+    : discount.mode === 'percent'
+      ? Math.round((cartSubtotal * Math.min(Math.max(discount.value, 0), 100)) / 100)
+      : Math.min(Math.max(discount.value, 0), cartSubtotal);
+  const cartTotal = cartSubtotal - discountAmount;
   const cartItemCount = cartItems.reduce((sum, row) => sum + (row.quantity ?? 1), 0);
   const currentRound = activeTab?.current_round ?? 1;
   const roundsMap = cartItems.reduce((acc, row) => {
@@ -133,7 +144,9 @@ function POS({ currentUser, onLogout }) {
 
   // Tax breakdown for the receipt. Rwandan EBM prices are tax-INCLUSIVE, so the
   // VAT already sits inside total_price: tax = total * rate / (100 + rate).
-  // Grouped by tax label (A/B/C…) as EBM receipts require.
+  // Grouped by tax label (A/B/C…) as EBM receipts require. A bill-level
+  // discount lowers the taxable base, so scale each line by net/subtotal.
+  const discountFactor = cartSubtotal > 0 ? cartTotal / cartSubtotal : 1;
   const taxSummary = Object.values(
     cartItems.reduce((acc, row) => {
       const rate = row.tax_rate ?? 0;
@@ -141,7 +154,7 @@ function POS({ currentUser, onLogout }) {
       const label = row.tax_label ?? '—';
       const key = `${label}:${rate}`;
       acc[key] ||= { label, rate, amount: 0 };
-      acc[key].amount += (row.total_price * rate) / (100 + rate);
+      acc[key].amount += (row.total_price * discountFactor * rate) / (100 + rate);
       return acc;
     }, {})
   );
@@ -176,6 +189,19 @@ function POS({ currentUser, onLogout }) {
     setShowBill(false);
     setMomoPrompt(false);
     setMomoRef('');
+    setShowDiscount(false);
+  };
+
+  // Persist the bill-level discount on the tab (or clear it). Audit-logged so
+  // a comp/markdown is always traceable to who applied it.
+  const setTabDiscount = async (nextDiscount) => {
+    await db.active_tabs.update(activeTabId, { discount: nextDiscount });
+    if (nextDiscount?.value) {
+      logAudit(
+        'DISCOUNT',
+        `Discount ${nextDiscount.mode === 'percent' ? nextDiscount.value + '%' : nextDiscount.value + ' RWF'} on ${activeTab?.name ?? ''}`
+      );
+    }
   };
 
   // Quick-access from a tab card on the Home screen — jump straight into the
@@ -333,6 +359,12 @@ function POS({ currentUser, onLogout }) {
       activeTab?.name ?? 'Bill',
       ...(activeTab?.receipt_no ? [`Receipt ${activeTab.receipt_no}`] : []),
       ...billItems.map((row) => `${row.name} x${row.quantity} — ${row.total_price.toLocaleString()} RWF`),
+      ...(discountAmount > 0
+        ? [
+            `Subtotal: ${cartSubtotal.toLocaleString()} RWF`,
+            `Discount${discount?.mode === 'percent' ? ` (${discount.value}%)` : ''}: -${discountAmount.toLocaleString()} RWF`,
+          ]
+        : []),
       `Total: ${cartTotal.toLocaleString()} RWF`,
       ...taxSummary.map((t) => `VAT ${t.label} (${t.rate}%) incl.: ${Math.round(t.amount).toLocaleString()} RWF`),
     ].join('\n');
@@ -391,18 +423,35 @@ function POS({ currentUser, onLogout }) {
       // permanent sale record carries the same receipt number the customer got.
       const receipt_no = await ensureReceiptNo(activeTabId);
       const device_id = await getDeviceId();
+
+      // Spread any bill-level discount across the lines proportionally to each
+      // line's price, so the stored total_price is NET and the lines still sum
+      // to the discounted total. The last line absorbs any rounding remainder.
+      let discountLeft = discountAmount;
       await db.sales.bulkUpdate(
-        cartItems.map((row) => ({
-          key: row.id,
-          changes: {
-            payment_method: paymentMethod,
-            customer_tin: customerTin || null,
-            customer_phone: customerPhone || null,
-            momo_ref: momoRef || null,
-            receipt_no,
-            device_id,
-          },
-        }))
+        cartItems.map((row, i) => {
+          const isLast = i === cartItems.length - 1;
+          const share =
+            discountAmount === 0
+              ? 0
+              : isLast
+                ? discountLeft
+                : Math.round((discountAmount * row.total_price) / cartSubtotal);
+          discountLeft -= share;
+          return {
+            key: row.id,
+            changes: {
+              payment_method: paymentMethod,
+              customer_tin: customerTin || null,
+              customer_phone: customerPhone || null,
+              momo_ref: momoRef || null,
+              receipt_no,
+              device_id,
+              discount_amount: share,
+              total_price: row.total_price - share,
+            },
+          };
+        })
       );
       await db.active_tabs.update(activeTabId, { status: 'paid' });
       showToast(`${activeTab?.name ?? 'Tab'} closed — ${receipt_no}`);
@@ -453,6 +502,7 @@ function POS({ currentUser, onLogout }) {
           receipt_no: sale.receipt_no ?? null,
           device_id: sale.device_id ?? null,
           momo_ref: sale.momo_ref ?? null,
+          discount_amount: sale.discount_amount ?? 0,
           timestamp: new Date(sale.timestamp).toISOString(),
         }))
       );
@@ -829,7 +879,57 @@ function POS({ currentUser, onLogout }) {
                   </span>
                   <span className="text-[10px] font-semibold text-slate-500">Details</span>
                 </button>
+                <button
+                  onClick={() => setShowDiscount((open) => !open)}
+                  aria-label="Discount"
+                  className="flex flex-col items-center gap-0.5 active:scale-95"
+                >
+                  <span
+                    className={`w-11 h-11 rounded-full flex items-center justify-center text-lg ${
+                      discountAmount > 0 || showDiscount ? 'bg-amber-500 text-white' : 'bg-slate-100 text-slate-600'
+                    }`}
+                  >
+                    🏷️
+                  </span>
+                  <span className="text-[10px] font-semibold text-slate-500">Discount</span>
+                </button>
               </div>
+
+              {showDiscount && (
+                <div className="space-y-2">
+                  <div className="flex gap-2">
+                    {[5, 10, 15].map((pct) => (
+                      <button
+                        key={pct}
+                        onClick={() => setTabDiscount({ mode: 'percent', value: pct })}
+                        className={`flex-1 h-10 rounded-xl font-semibold text-sm active:scale-95 ${
+                          discount?.mode === 'percent' && discount.value === pct
+                            ? 'bg-amber-500 text-white'
+                            : 'bg-slate-100 text-slate-600'
+                        }`}
+                      >
+                        {pct}%
+                      </button>
+                    ))}
+                    <button
+                      onClick={() => setTabDiscount(null)}
+                      className="flex-1 h-10 rounded-xl font-semibold text-sm bg-slate-100 text-slate-600 active:scale-95"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    placeholder="Or a fixed amount off (RWF)"
+                    value={discount?.mode === 'amount' ? discount.value : ''}
+                    onChange={(e) =>
+                      setTabDiscount(e.target.value ? { mode: 'amount', value: Number(e.target.value) } : null)
+                    }
+                    className="w-full px-4 py-2 rounded-xl border border-gray-300 text-base"
+                  />
+                </div>
+              )}
 
               {showCustomerDetails && (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -952,6 +1052,18 @@ function POS({ currentUser, onLogout }) {
             </div>
 
             <div className="p-4 border-t border-gray-100 space-y-3">
+              {discountAmount > 0 && (
+                <>
+                  <div className="flex items-center justify-between text-sm text-slate-500 px-1">
+                    <span>Subtotal</span>
+                    <span>{cartSubtotal.toLocaleString()} RWF</span>
+                  </div>
+                  <div className="flex items-center justify-between text-sm text-amber-600 font-semibold px-1">
+                    <span>Discount{discount?.mode === 'percent' ? ` (${discount.value}%)` : ''}</span>
+                    <span>−{discountAmount.toLocaleString()} RWF</span>
+                  </div>
+                </>
+              )}
               {taxSummary.map((t) => (
                 <div key={`${t.label}-${t.rate}`} className="flex items-center justify-between text-sm text-slate-500 px-1">
                   <span>VAT {t.label} ({t.rate}%) incl.</span>
@@ -1011,7 +1123,19 @@ function POS({ currentUser, onLogout }) {
             <span>{row.total_price.toLocaleString()} RWF</span>
           </div>
         ))}
-        <div className="flex justify-between border-t border-black mt-2 pt-2 font-bold">
+        {discountAmount > 0 && (
+          <>
+            <div className="flex justify-between text-sm border-t border-black mt-2 pt-2">
+              <span>Subtotal</span>
+              <span>{cartSubtotal.toLocaleString()} RWF</span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span>Discount{discount?.mode === 'percent' ? ` (${discount.value}%)` : ''}</span>
+              <span>−{discountAmount.toLocaleString()} RWF</span>
+            </div>
+          </>
+        )}
+        <div className={`flex justify-between font-bold ${discountAmount > 0 ? 'mt-1' : 'border-t border-black mt-2 pt-2'}`}>
           <span>Total</span>
           <span>{cartTotal.toLocaleString()} RWF</span>
         </div>
