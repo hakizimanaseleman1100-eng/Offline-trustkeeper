@@ -20,6 +20,7 @@ so re-running one by accident is harmless.
 |------|--------------|
 | `0001_staff_and_identity.sql` | Adds the `staff` table (PIN login) and stamps `staff_id` / `staff_name` onto `hospitality_sales` and `audit_logs`. |
 | `0002_receipts_and_momo.sql` | Adds `receipt_no`, `device_id`, and `momo_ref` to `hospitality_sales`. |
+| `0003_product_active.sql` | Adds a soft-delete `active` flag to `products`. |
 
 After running `0001`, the app's PIN login and per-waiter accountability work
 end-to-end. Until then, the app falls back to a local-only default owner

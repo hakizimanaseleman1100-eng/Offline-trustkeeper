@@ -1,4 +1,6 @@
 import { useState, useEffect } from 'react';
+import { useLiveQuery } from 'dexie-react-hooks';
+import { db } from './db';
 import { supabase } from './supabaseClient';
 import { CURRENT_BUSINESS_ID } from './config';
 import { hashPin } from './auth';
@@ -21,8 +23,26 @@ function startOfTodayISO() {
 }
 
 function DashboardHome({ cashFlow, loading }) {
+  // Sales that were rung up on THIS device but haven't reached Supabase yet.
+  // The dashboard's totals come from the server, so until these upload the
+  // figures below can be understated — worth flagging to the owner.
+  const pendingSales = useLiveQuery(async () => {
+    const paidTabIds = new Set(
+      (await db.active_tabs.where('status').equals('paid').toArray()).map((t) => t.id)
+    );
+    const rows = await db.sales.where('synced_status').equals(0).toArray();
+    return rows.filter((s) => paidTabIds.has(s.tab_id));
+  }, [], []);
+  const pendingTotal = pendingSales.reduce((sum, s) => sum + (s.total_price ?? 0), 0);
+
   return (
     <div className="max-w-sm">
+      {pendingSales.length > 0 && (
+        <div className="mb-4 px-4 py-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-sm">
+          <span className="font-semibold">{pendingSales.length} sale{pendingSales.length > 1 ? 's' : ''} on this device</span>{' '}
+          ({pendingTotal.toLocaleString()} RWF) not yet uploaded — today's totals may be understated until synced.
+        </div>
+      )}
       <p className="text-slate-500 font-semibold mb-3">Net Cash Flow — Today</p>
       <div className="bg-white rounded-2xl shadow-md p-6">
         {loading ? (
@@ -61,6 +81,8 @@ function InventoryTab({ notify }) {
   const [productCategory, setProductCategory] = useState('');
   const [taxLabel, setTaxLabel] = useState('B');
   const [taxRate, setTaxRate] = useState('18');
+  // Inline editing: `edit` holds the id being edited and a draft of its fields.
+  const [edit, setEdit] = useState(null);
 
   const loadProducts = async () => {
     const { data, error } = await supabase.from('products').select('*').order('item_name');
@@ -68,7 +90,9 @@ function InventoryTab({ notify }) {
       console.error('Failed to load products:', error.message);
       return;
     }
-    setProducts(data ?? []);
+    // Hide soft-deleted products (active === false). Rows predating migration
+    // 0003 have no `active` field and are treated as active.
+    setProducts((data ?? []).filter((p) => p.active !== false));
   };
 
   useEffect(() => {
@@ -99,6 +123,50 @@ function InventoryTab({ notify }) {
     notify(`Added ${itemName}`);
     loadProducts();
   };
+
+  const startEdit = (p) => setEdit({ id: p.id, ...p });
+
+  const saveEdit = async () => {
+    const { error } = await supabase
+      .from('products')
+      .update({
+        item_name: edit.item_name,
+        unit_price: Number(edit.unit_price),
+        cost_price: Number(edit.cost_price),
+        category: edit.category,
+        tax_label: edit.tax_label,
+        tax_rate: Number(edit.tax_rate),
+      })
+      .eq('id', edit.id);
+    if (error) {
+      notify(`Could not save: ${error.message}`);
+      return;
+    }
+    setEdit(null);
+    notify('Product updated');
+    loadProducts();
+  };
+
+  // Soft delete — keeps the row for historical sales, just hides it from POS.
+  const deleteProduct = async (p) => {
+    if (!window.confirm(`Remove "${p.item_name}" from the menu?`)) return;
+    const { error } = await supabase.from('products').update({ active: false }).eq('id', p.id);
+    if (error) {
+      notify(`Could not remove: ${error.message}`);
+      return;
+    }
+    notify(`Removed ${p.item_name}`);
+    loadProducts();
+  };
+
+  const editCell = (field, props = {}) => (
+    <input
+      value={edit[field] ?? ''}
+      onChange={(e) => setEdit({ ...edit, [field]: e.target.value })}
+      className="w-full px-2 py-1 rounded border border-gray-300"
+      {...props}
+    />
+  );
 
   return (
     <div className="space-y-8">
@@ -169,20 +237,52 @@ function InventoryTab({ notify }) {
                 <th className="px-5 py-3">Price</th>
                 <th className="px-5 py-3">Cost</th>
                 <th className="px-5 py-3">Tax</th>
+                <th className="px-5 py-3 text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
-              {products.map((p) => (
-                <tr key={p.id}>
-                  <td className="px-5 py-3 font-semibold text-slate-800 whitespace-nowrap">{p.item_name}</td>
-                  <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.category}</td>
-                  <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.unit_price?.toLocaleString()} RWF</td>
-                  <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.cost_price?.toLocaleString()} RWF</td>
-                  <td className="px-5 py-3 text-slate-500 whitespace-nowrap">
-                    {p.tax_label} ({p.tax_rate}%)
-                  </td>
-                </tr>
-              ))}
+              {products.map((p) =>
+                edit?.id === p.id ? (
+                  <tr key={p.id} className="bg-amber-50">
+                    <td className="px-5 py-3">{editCell('item_name')}</td>
+                    <td className="px-5 py-3">{editCell('category')}</td>
+                    <td className="px-5 py-3">{editCell('unit_price', { type: 'number' })}</td>
+                    <td className="px-5 py-3">{editCell('cost_price', { type: 'number' })}</td>
+                    <td className="px-5 py-3">
+                      <div className="flex gap-1">
+                        {editCell('tax_label')}
+                        {editCell('tax_rate', { type: 'number' })}
+                      </div>
+                    </td>
+                    <td className="px-5 py-3 text-right whitespace-nowrap">
+                      <button onClick={saveEdit} className="px-3 py-1 rounded-lg bg-emerald-600 text-white text-sm font-semibold active:scale-95">
+                        Save
+                      </button>
+                      <button onClick={() => setEdit(null)} className="ml-2 px-3 py-1 rounded-lg bg-slate-100 text-slate-600 text-sm font-semibold active:scale-95">
+                        Cancel
+                      </button>
+                    </td>
+                  </tr>
+                ) : (
+                  <tr key={p.id}>
+                    <td className="px-5 py-3 font-semibold text-slate-800 whitespace-nowrap">{p.item_name}</td>
+                    <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.category}</td>
+                    <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.unit_price?.toLocaleString()} RWF</td>
+                    <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.cost_price?.toLocaleString()} RWF</td>
+                    <td className="px-5 py-3 text-slate-500 whitespace-nowrap">
+                      {p.tax_label} ({p.tax_rate}%)
+                    </td>
+                    <td className="px-5 py-3 text-right whitespace-nowrap">
+                      <button onClick={() => startEdit(p)} className="px-3 py-1 rounded-lg bg-slate-100 text-slate-700 text-sm font-semibold active:scale-95">
+                        Edit
+                      </button>
+                      <button onClick={() => deleteProduct(p)} className="ml-2 px-3 py-1 rounded-lg bg-red-50 text-red-600 text-sm font-semibold active:scale-95">
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                )
+              )}
             </tbody>
           </table>
         </div>

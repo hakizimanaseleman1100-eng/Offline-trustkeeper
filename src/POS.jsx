@@ -1,9 +1,21 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './db';
 import { supabase } from './supabaseClient';
 import { CURRENT_BUSINESS_ID } from './config';
 import { getDeviceId, nextReceiptNo } from './receipts';
+
+// "5m ago" style label for the last successful sync.
+function relativeTime(ms) {
+  if (!ms) return null;
+  const secs = Math.round((Date.now() - ms) / 1000);
+  if (secs < 60) return 'just now';
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
 
 function POS({ currentUser, onLogout }) {
   const [activeTabId, setActiveTabId] = useState(null);
@@ -20,6 +32,7 @@ function POS({ currentUser, onLogout }) {
   // closing the tab, so the owner can reconcile against the MTN dashboard.
   const [momoPrompt, setMomoPrompt] = useState(false);
   const [momoRef, setMomoRef] = useState('');
+  const [lastSyncAt, setLastSyncAt] = useState(null);
 
   const showToast = (message, duration = 2500) => {
     setToast(message);
@@ -369,13 +382,21 @@ function POS({ currentUser, onLogout }) {
       await db.active_tabs.update(activeTabId, { status: 'paid' });
       showToast(`${activeTab?.name ?? 'Tab'} closed — ${receipt_no}`);
       closeTabView();
+      // Push the just-closed sale straight away if we're online; harmless if
+      // offline (it stays queued for the next sync).
+      syncDataRef.current?.({ silent: true });
     } catch (err) {
       console.error('Failed to close tab:', err);
       showToast('Error: could not close tab');
     }
   };
 
-  const syncData = async () => {
+  // silent=true for automatic (online-event) runs so they don't spam toasts.
+  const syncData = async ({ silent = false } = {}) => {
+    if (!navigator.onLine) {
+      if (!silent) showToast('Offline — will sync when connected');
+      return;
+    }
     setSyncing(true);
     try {
       const paidTabIds = new Set(
@@ -386,7 +407,7 @@ function POS({ currentUser, onLogout }) {
       );
 
       if (unsynced.length === 0) {
-        showToast('Sync Complete: 0 records uploaded');
+        if (!silent) showToast('Sync Complete: 0 records uploaded');
         return;
       }
 
@@ -435,14 +456,29 @@ function POS({ currentUser, onLogout }) {
         );
       }
 
+      await db.meta.put({ key: 'last_sync_at', value: Date.now() });
+      setLastSyncAt(Date.now());
       showToast(`Sync Complete: ${unsynced.length} records uploaded`);
     } catch (err) {
       console.error('Sync failed:', err.message, err.details, err.hint, err.code);
-      showToast('Sync failed — will retry later');
+      if (!silent) showToast('Sync failed — will retry later');
     } finally {
       setSyncing(false);
     }
   };
+
+  // Keep a ref to the latest syncData so the mount-only effect below always
+  // calls the current closure without re-subscribing every render.
+  const syncDataRef = useRef(syncData);
+  syncDataRef.current = syncData;
+
+  useEffect(() => {
+    db.meta.get('last_sync_at').then((row) => row?.value && setLastSyncAt(row.value));
+    const autoSync = () => syncDataRef.current({ silent: true });
+    window.addEventListener('online', autoSync);
+    if (navigator.onLine) autoSync(); // opportunistic catch-up on open
+    return () => window.removeEventListener('online', autoSync);
+  }, []);
 
   return (
     <>
@@ -461,7 +497,7 @@ function POS({ currentUser, onLogout }) {
             <div className="text-base sm:text-xl lg:text-2xl font-bold">{openTabs.length}</div>
           </div>
           <button
-            onClick={syncData}
+            onClick={() => syncData()}
             disabled={syncing}
             aria-label="Sync to Cloud"
             className="relative px-2.5 sm:px-4 lg:px-5 py-1.5 lg:py-2.5 rounded-xl bg-emerald-600 font-semibold text-xs sm:text-sm lg:text-base transition active:scale-95 disabled:opacity-50"
@@ -484,6 +520,20 @@ function POS({ currentUser, onLogout }) {
           </button>
         </div>
       </header>
+
+      {/* Sync status strip — only shows when there's something to say, so it
+          stays out of the way. Reassures staff their sales are safely uploaded
+          (and warns the owner when they aren't yet). */}
+      {(unsyncedCount > 0 || lastSyncAt) && (
+        <div className="bg-slate-800 text-slate-300 text-[11px] lg:text-xs px-3 sm:px-6 lg:px-10 py-1 flex justify-between items-center gap-3">
+          <span className={unsyncedCount > 0 ? 'text-amber-300 font-semibold' : ''}>
+            {unsyncedCount > 0
+              ? `${unsyncedCount} sale${unsyncedCount > 1 ? 's' : ''} pending upload`
+              : 'All sales uploaded'}
+          </span>
+          {lastSyncAt && <span>Last synced {relativeTime(lastSyncAt)}</span>}
+        </div>
+      )}
 
       <main className="p-3 sm:p-5 lg:p-8 space-y-4 lg:space-y-6 max-w-7xl mx-auto">
         {activeTabId === null ? (

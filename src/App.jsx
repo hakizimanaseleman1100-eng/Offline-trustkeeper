@@ -17,8 +17,12 @@ async function syncInventory() {
       .select('*')
       .eq('business_id', CURRENT_BUSINESS_ID);
     if (error) throw error;
+    // Hide soft-deleted products from the POS. Filtered client-side (rather
+    // than .eq('active', true)) so it still works before migration 0003 adds
+    // the column — rows without the field are treated as active.
+    const activeProducts = data.filter((p) => p.active !== false);
     await db.inventory.clear();
-    await db.inventory.bulkAdd(data);
+    await db.inventory.bulkAdd(activeProducts);
   } catch (err) {
     console.error('Inventory down-sync failed:', err.message);
   }
