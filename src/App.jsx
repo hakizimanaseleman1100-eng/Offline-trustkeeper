@@ -3,6 +3,7 @@ import { db } from './db';
 import { supabase } from './supabaseClient';
 import POS from './POS';
 import OwnerDashboard from './OwnerDashboard';
+import KitchenDisplay from './KitchenDisplay';
 import PinLogin from './PinLogin';
 import { CURRENT_BUSINESS_ID } from './config';
 import { hashPin, DEFAULT_OWNER_ID, DEFAULT_OWNER_PIN } from './auth';
@@ -83,6 +84,10 @@ function App() {
 
   if (currentUser.role === 'OWNER' || currentUser.role === 'MANAGER') {
     return <OwnerDashboard currentUser={currentUser} onLogout={logout} />;
+  }
+
+  if (currentUser.role === 'KITCHEN') {
+    return <KitchenDisplay currentUser={currentUser} onLogout={logout} />;
   }
 
   return <POS currentUser={currentUser} onLogout={logout} />;

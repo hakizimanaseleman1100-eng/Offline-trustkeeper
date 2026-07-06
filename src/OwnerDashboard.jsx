@@ -5,7 +5,7 @@ import { supabase } from './supabaseClient';
 import { CURRENT_BUSINESS_ID } from './config';
 import { hashPin } from './auth';
 
-const STAFF_ROLES = ['WAITER', 'MANAGER', 'OWNER'];
+const STAFF_ROLES = ['WAITER', 'KITCHEN', 'MANAGER', 'OWNER'];
 
 const NAV_LINKS = [
   { key: 'Dashboard', icon: '📊' },

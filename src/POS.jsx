@@ -297,8 +297,33 @@ function POS({ currentUser, onLogout }) {
 
   const sendRound = async () => {
     const currentRound = activeTab?.current_round ?? 1;
+    const roundLines = (roundsMap[currentRound] ?? []).map((row) => ({
+      name: row.name,
+      quantity: row.quantity ?? 1,
+    }));
+
+    // Push a live ticket to the kitchen/bar display. Best-effort: if we're
+    // offline the round is still marked sent locally; the kitchen just won't
+    // see it until someone re-fires. (A small venue runs front + kitchen on
+    // the same wifi, so this is normally instant.)
+    if (roundLines.length > 0) {
+      try {
+        const { error } = await supabase.from('kitchen_tickets').insert({
+          business_id: CURRENT_BUSINESS_ID,
+          tab_id: activeTabId,
+          tab_name: activeTab?.name ?? null,
+          round: currentRound,
+          items: roundLines,
+          staff_name: currentUser?.name ?? null,
+        });
+        if (error) throw error;
+      } catch (err) {
+        console.error('Kitchen ticket not sent:', err.message);
+      }
+    }
+
     await db.active_tabs.update(activeTabId, { current_round: currentRound + 1 });
-    showToast(`Round ${currentRound} sent`);
+    showToast(`Round ${currentRound} sent to kitchen/bar`);
     closeTabView();
   };
 
