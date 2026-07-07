@@ -199,6 +199,19 @@ function POS({ currentUser, onLogout }) {
     setSplitWays(1);
   };
 
+  // Backing out of a tab. If nothing was ever added, the tab was just a false
+  // start (waiter tapped New Tab then changed their mind), so discard it
+  // instead of leaving an empty tab cluttering the home screen.
+  const leaveTab = async () => {
+    const id = activeTabId;
+    closeTabView();
+    const tab = await db.active_tabs.get(id);
+    if (tab && tab.status === 'open') {
+      const itemCount = await db.sales.where('tab_id').equals(id).count();
+      if (itemCount === 0) await db.active_tabs.delete(id);
+    }
+  };
+
   // Persist the bill-level discount on the tab (or clear it). Audit-logged so
   // a comp/markdown is always traceable to who applied it.
   const setTabDiscount = async (nextDiscount) => {
@@ -720,7 +733,7 @@ function POS({ currentUser, onLogout }) {
           <div className="space-y-3 lg:space-y-4">
             <div className="flex items-center justify-between gap-3">
               <button
-                onClick={closeTabView}
+                onClick={leaveTab}
                 aria-label="Back to tabs"
                 className="w-9 h-9 lg:w-11 lg:h-11 shrink-0 rounded-full bg-white shadow-md text-slate-600 text-lg lg:text-xl flex items-center justify-center active:scale-95"
               >
