@@ -97,6 +97,7 @@ function InventoryTab({ notify }) {
   const [productCategory, setProductCategory] = useState('');
   const [taxLabel, setTaxLabel] = useState('B');
   const [taxRate, setTaxRate] = useState('18');
+  const [stock, setStock] = useState('');
   // Inline editing: `edit` holds the id being edited and a draft of its fields.
   const [edit, setEdit] = useState(null);
 
@@ -125,6 +126,8 @@ function InventoryTab({ notify }) {
       category: productCategory,
       tax_label: taxLabel,
       tax_rate: Number(taxRate),
+      // Blank stock = not tracked (null); the item is then always sellable.
+      stock_quantity: stock === '' ? null : Number(stock),
     });
     if (error) {
       notify(`Failed to add product: ${error.message}`);
@@ -136,6 +139,7 @@ function InventoryTab({ notify }) {
     setProductCategory('');
     setTaxLabel('B');
     setTaxRate('18');
+    setStock('');
     notify(`Added ${itemName}`);
     loadProducts();
   };
@@ -152,6 +156,8 @@ function InventoryTab({ notify }) {
         category: edit.category,
         tax_label: edit.tax_label,
         tax_rate: Number(edit.tax_rate),
+        stock_quantity:
+          edit.stock_quantity === '' || edit.stock_quantity === null ? null : Number(edit.stock_quantity),
       })
       .eq('id', edit.id);
     if (error) {
@@ -235,6 +241,13 @@ function InventoryTab({ notify }) {
           onChange={(e) => setTaxRate(e.target.value)}
           className="px-4 py-2 rounded-lg border border-gray-300"
         />
+        <input
+          type="number"
+          placeholder="Stock (optional)"
+          value={stock}
+          onChange={(e) => setStock(e.target.value)}
+          className="px-4 py-2 rounded-lg border border-gray-300"
+        />
         <button
           type="submit"
           className="col-span-1 sm:col-span-2 lg:col-span-3 py-2 rounded-lg bg-amber-500 text-white font-semibold active:scale-95"
@@ -253,6 +266,7 @@ function InventoryTab({ notify }) {
                 <th className="px-5 py-3">Price</th>
                 <th className="px-5 py-3">Cost</th>
                 <th className="px-5 py-3">Tax</th>
+                <th className="px-5 py-3">Stock</th>
                 <th className="px-5 py-3 text-right">Actions</th>
               </tr>
             </thead>
@@ -270,6 +284,7 @@ function InventoryTab({ notify }) {
                         {editCell('tax_rate', { type: 'number' })}
                       </div>
                     </td>
+                    <td className="px-5 py-3">{editCell('stock_quantity', { type: 'number' })}</td>
                     <td className="px-5 py-3 text-right whitespace-nowrap">
                       <button onClick={saveEdit} className="px-3 py-1 rounded-lg bg-emerald-600 text-white text-sm font-semibold active:scale-95">
                         Save
@@ -287,6 +302,15 @@ function InventoryTab({ notify }) {
                     <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.cost_price?.toLocaleString()} RWF</td>
                     <td className="px-5 py-3 text-slate-500 whitespace-nowrap">
                       {p.tax_label} ({p.tax_rate}%)
+                    </td>
+                    <td className="px-5 py-3 whitespace-nowrap">
+                      {p.stock_quantity == null ? (
+                        <span className="text-slate-300">—</span>
+                      ) : (
+                        <span className={p.stock_quantity <= 0 ? 'text-red-600 font-semibold' : p.stock_quantity <= 5 ? 'text-amber-600 font-semibold' : 'text-slate-500'}>
+                          {p.stock_quantity}
+                        </span>
+                      )}
                     </td>
                     <td className="px-5 py-3 text-right whitespace-nowrap">
                       <button onClick={() => startEdit(p)} className="px-3 py-1 rounded-lg bg-slate-100 text-slate-700 text-sm font-semibold active:scale-95">
@@ -771,6 +795,18 @@ function SalesTab({ notify, currentUser }) {
       notify(`Refund failed: ${error.message}`);
       setBusy(null);
       return;
+    }
+    // Put the refunded units back into stock. Reversal quantities are negative,
+    // and the RPC subtracts, so a negative qty adds the stock back.
+    const stockDeltas = Object.values(
+      reversals.reduce((m, r) => {
+        (m[r.item_id] ||= { id: r.item_id, qty: 0 }).qty += r.quantity;
+        return m;
+      }, {})
+    );
+    if (stockDeltas.length) {
+      const { error: stockErr } = await supabase.rpc('apply_stock_deltas', { p_deltas: stockDeltas });
+      if (stockErr) console.error('Stock restore failed:', stockErr.message);
     }
     await supabase.from('audit_logs').insert({
       business_id: CURRENT_BUSINESS_ID,

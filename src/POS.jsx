@@ -516,6 +516,23 @@ function POS({ currentUser, onLogout }) {
         })
       );
       await db.active_tabs.update(activeTabId, { status: 'paid' });
+
+      // Decrement the local stock mirror right away so the waiter sees the new
+      // count immediately. The authoritative server decrement happens at sync
+      // (see syncData); the next inventory down-sync reconciles the two.
+      const soldByItem = new Map();
+      for (const row of cartItems) {
+        soldByItem.set(row.item_id, (soldByItem.get(row.item_id) ?? 0) + (row.quantity ?? 1));
+      }
+      await Promise.all(
+        [...soldByItem.entries()].map(async ([id, qty]) => {
+          const inv = await db.inventory.get(id);
+          if (inv && inv.stock_quantity != null) {
+            await db.inventory.update(id, { stock_quantity: inv.stock_quantity - qty });
+          }
+        })
+      );
+
       showToast(`${activeTab?.name ?? 'Tab'} closed — ${receipt_no}`);
       closeTabView();
       // Push the just-closed sale straight away if we're online; harmless if
@@ -576,6 +593,21 @@ function POS({ currentUser, onLogout }) {
       await db.sales.bulkUpdate(
         unsynced.map((sale) => ({ key: sale.id, changes: { synced_status: 1 } }))
       );
+
+      // Authoritative stock decrement for the sales we just uploaded. Batched
+      // by product into one atomic RPC call (rooms/untracked products with
+      // null stock are skipped server-side). Best-effort — a rare miss leaves
+      // the count slightly high, which the owner can correct in Inventory.
+      const stockDeltas = Object.values(
+        unsynced.reduce((m, sale) => {
+          (m[sale.item_id] ||= { id: sale.item_id, qty: 0 }).qty += sale.quantity ?? 1;
+          return m;
+        }, {})
+      );
+      if (stockDeltas.length) {
+        const { error: stockErr } = await supabase.rpc('apply_stock_deltas', { p_deltas: stockDeltas });
+        if (stockErr) console.error('Stock update failed:', stockErr.message);
+      }
 
       const unsyncedLogs = await db.audit_logs.where('synced_status').equals(0).toArray();
       if (unsyncedLogs.length > 0) {
@@ -798,18 +830,33 @@ function POS({ currentUser, onLogout }) {
                   <p className="text-slate-400 text-lg">No items match.</p>
                 ) : (
                   <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-7 gap-2 sm:gap-3 lg:gap-4">
-                    {items.map((item) => (
-                      <button
-                        key={item.id}
-                        onClick={() => addItemToTab(item)}
-                        className="p-2.5 sm:p-3 lg:p-4 rounded-xl text-sm sm:text-base lg:text-lg font-bold bg-white shadow-md text-left transition active:scale-95 border-4 border-transparent"
-                      >
-                        <span className="block text-slate-900 leading-tight">{item.item_name}</span>
-                        <span className="block text-xs sm:text-sm lg:text-base font-semibold text-slate-500 mt-1">
-                          {item.unit_price.toLocaleString()} RWF
-                        </span>
-                      </button>
-                    ))}
+                    {items.map((item) => {
+                      const tracked = item.stock_quantity != null;
+                      const out = tracked && item.stock_quantity <= 0;
+                      return (
+                        <button
+                          key={item.id}
+                          onClick={() => addItemToTab(item)}
+                          className={`p-2.5 sm:p-3 lg:p-4 rounded-xl text-sm sm:text-base lg:text-lg font-bold bg-white shadow-md text-left transition active:scale-95 border-4 border-transparent ${
+                            out ? 'opacity-60' : ''
+                          }`}
+                        >
+                          <span className="block text-slate-900 leading-tight">{item.item_name}</span>
+                          <span className="block text-xs sm:text-sm lg:text-base font-semibold text-slate-500 mt-1">
+                            {item.unit_price.toLocaleString()} RWF
+                          </span>
+                          {tracked && (
+                            <span
+                              className={`block text-[10px] sm:text-xs font-bold mt-0.5 ${
+                                out ? 'text-red-600' : item.stock_quantity <= 5 ? 'text-amber-600' : 'text-emerald-600'
+                              }`}
+                            >
+                              {out ? 'Out of stock' : `${item.stock_quantity} left`}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
               </>
