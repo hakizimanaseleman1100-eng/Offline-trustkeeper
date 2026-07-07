@@ -17,6 +17,17 @@ const NAV_LINKS = [
 ];
 const EXPENSE_CATEGORIES = ['Utilities', 'Supplies', 'Maintenance', 'Salaries', 'Other'];
 
+// Rwanda RRA/EBM VAT tax categories. VAT is a single 18% standard rate, so the
+// label fixes the rate — the owner picks the label and the rate follows.
+//   A = Exempt, B = Standard (18%), C = Zero-rated, D = Non-VAT.
+const TAX_CATEGORIES = [
+  { label: 'A', rate: 0, desc: 'Exempt' },
+  { label: 'B', rate: 18, desc: 'Standard' },
+  { label: 'C', rate: 0, desc: 'Zero-rated' },
+  { label: 'D', rate: 0, desc: 'Non-VAT' },
+];
+const taxRateFor = (label) => TAX_CATEGORIES.find((t) => t.label === label)?.rate ?? 0;
+
 function startOfTodayISO() {
   const d = new Date();
   d.setHours(0, 0, 0, 0);
@@ -96,7 +107,6 @@ function InventoryTab({ notify }) {
   const [costPrice, setCostPrice] = useState('');
   const [productCategory, setProductCategory] = useState('');
   const [taxLabel, setTaxLabel] = useState('B');
-  const [taxRate, setTaxRate] = useState('18');
   const [stock, setStock] = useState('');
   // Inline editing: `edit` holds the id being edited and a draft of its fields.
   const [edit, setEdit] = useState(null);
@@ -125,7 +135,7 @@ function InventoryTab({ notify }) {
       cost_price: Number(costPrice),
       category: productCategory,
       tax_label: taxLabel,
-      tax_rate: Number(taxRate),
+      tax_rate: taxRateFor(taxLabel),
       // Blank stock = not tracked (null); the item is then always sellable.
       stock_quantity: stock === '' ? null : Number(stock),
     });
@@ -138,7 +148,6 @@ function InventoryTab({ notify }) {
     setCostPrice('');
     setProductCategory('');
     setTaxLabel('B');
-    setTaxRate('18');
     setStock('');
     notify(`Added ${itemName}`);
     loadProducts();
@@ -155,7 +164,7 @@ function InventoryTab({ notify }) {
         cost_price: Number(edit.cost_price),
         category: edit.category,
         tax_label: edit.tax_label,
-        tax_rate: Number(edit.tax_rate),
+        tax_rate: taxRateFor(edit.tax_label),
         stock_quantity:
           edit.stock_quantity === '' || edit.stock_quantity === null ? null : Number(edit.stock_quantity),
       })
@@ -226,24 +235,20 @@ function InventoryTab({ notify }) {
           onChange={(e) => setProductCategory(e.target.value)}
           className="px-4 py-2 rounded-lg border border-gray-300"
         />
-        <input
-          required
-          placeholder="Tax Label"
+        <select
           value={taxLabel}
           onChange={(e) => setTaxLabel(e.target.value)}
           className="px-4 py-2 rounded-lg border border-gray-300"
-        />
-        <input
-          required
-          type="number"
-          placeholder="Tax Rate"
-          value={taxRate}
-          onChange={(e) => setTaxRate(e.target.value)}
-          className="px-4 py-2 rounded-lg border border-gray-300"
-        />
+        >
+          {TAX_CATEGORIES.map((t) => (
+            <option key={t.label} value={t.label}>
+              Tax {t.label} — {t.desc} ({t.rate}%)
+            </option>
+          ))}
+        </select>
         <input
           type="number"
-          placeholder="Stock (optional)"
+          placeholder="Stock qty (blank = untracked)"
           value={stock}
           onChange={(e) => setStock(e.target.value)}
           className="px-4 py-2 rounded-lg border border-gray-300"
@@ -279,10 +284,17 @@ function InventoryTab({ notify }) {
                     <td className="px-5 py-3">{editCell('unit_price', { type: 'number' })}</td>
                     <td className="px-5 py-3">{editCell('cost_price', { type: 'number' })}</td>
                     <td className="px-5 py-3">
-                      <div className="flex gap-1">
-                        {editCell('tax_label')}
-                        {editCell('tax_rate', { type: 'number' })}
-                      </div>
+                      <select
+                        value={edit.tax_label ?? 'B'}
+                        onChange={(e) => setEdit({ ...edit, tax_label: e.target.value })}
+                        className="w-full px-2 py-1 rounded border border-gray-300"
+                      >
+                        {TAX_CATEGORIES.map((t) => (
+                          <option key={t.label} value={t.label}>
+                            {t.label} ({t.rate}%)
+                          </option>
+                        ))}
+                      </select>
                     </td>
                     <td className="px-5 py-3">{editCell('stock_quantity', { type: 'number' })}</td>
                     <td className="px-5 py-3 text-right whitespace-nowrap">
