@@ -10,6 +10,7 @@ const STAFF_ROLES = ['WAITER', 'KITCHEN', 'MANAGER', 'OWNER'];
 const NAV_LINKS = [
   { key: 'Dashboard', icon: '📊' },
   { key: 'Sales', icon: '🧾' },
+  { key: 'Stations', icon: '🏪' },
   { key: 'Inventory', icon: '📦' },
   { key: 'Expenses', icon: '💵' },
   { key: 'Reports', icon: '📈' },
@@ -102,13 +103,17 @@ function DashboardHome({ cashFlow, loading }) {
 
 function InventoryTab({ notify }) {
   const [products, setProducts] = useState([]);
+  const [stations, setStations] = useState([]);
+  const [selectedStation, setSelectedStation] = useState('');
+  const [stockMap, setStockMap] = useState({}); // product_id(string) -> quantity at selectedStation
+  const [stockDraft, setStockDraft] = useState({}); // product_id(string) -> input value
   const [itemName, setItemName] = useState('');
   const [sellingPrice, setSellingPrice] = useState('');
   const [costPrice, setCostPrice] = useState('');
   const [productCategory, setProductCategory] = useState('');
   const [taxLabel, setTaxLabel] = useState('B');
-  const [stock, setStock] = useState('');
-  // Inline editing: `edit` holds the id being edited and a draft of its fields.
+  const [initialStock, setInitialStock] = useState('');
+  // Inline editing of catalog fields (name/price/cost/category/tax).
   const [edit, setEdit] = useState(null);
 
   const loadProducts = async () => {
@@ -117,40 +122,91 @@ function InventoryTab({ notify }) {
       console.error('Failed to load products:', error.message);
       return;
     }
-    // Hide soft-deleted products (active === false). Rows predating migration
-    // 0003 have no `active` field and are treated as active.
     setProducts((data ?? []).filter((p) => p.active !== false));
+  };
+
+  const loadStations = async () => {
+    const { data } = await supabase
+      .from('stations')
+      .select('*')
+      .eq('business_id', CURRENT_BUSINESS_ID)
+      .eq('active', true)
+      .order('name');
+    setStations(data ?? []);
+    setSelectedStation((cur) => cur || data?.[0]?.id || '');
+  };
+
+  const loadStock = async (stationId) => {
+    if (!stationId) {
+      setStockMap({});
+      return;
+    }
+    const { data } = await supabase.from('station_stock').select('*').eq('station_id', stationId);
+    setStockMap(Object.fromEntries((data ?? []).map((r) => [String(r.product_id), r.quantity])));
+    setStockDraft({});
   };
 
   useEffect(() => {
     loadProducts();
+    loadStations();
   }, []);
+  useEffect(() => {
+    loadStock(selectedStation);
+  }, [selectedStation]);
+
+  // One place that adjusts a station's stock (and logs the movement).
+  const applyStock = async (productId, delta, reason) => {
+    const { error } = await supabase.rpc('apply_station_stock', {
+      p_moves: [
+        {
+          station_id: selectedStation,
+          product_id: String(productId),
+          business_id: CURRENT_BUSINESS_ID,
+          delta,
+          reason,
+          staff_name: 'Owner',
+        },
+      ],
+    });
+    if (error) {
+      notify(`Stock update failed: ${error.message}`);
+      return false;
+    }
+    return true;
+  };
 
   const handleAddProduct = async (e) => {
     e.preventDefault();
-    const { error } = await supabase.from('products').insert({
-      business_id: CURRENT_BUSINESS_ID,
-      item_name: itemName,
-      unit_price: Number(sellingPrice),
-      cost_price: Number(costPrice),
-      category: productCategory,
-      tax_label: taxLabel,
-      tax_rate: taxRateFor(taxLabel),
-      // Blank stock = not tracked (null); the item is then always sellable.
-      stock_quantity: stock === '' ? null : Number(stock),
-    });
+    const { data, error } = await supabase
+      .from('products')
+      .insert({
+        business_id: CURRENT_BUSINESS_ID,
+        item_name: itemName,
+        unit_price: Number(sellingPrice),
+        cost_price: Number(costPrice),
+        category: productCategory,
+        tax_label: taxLabel,
+        tax_rate: taxRateFor(taxLabel),
+      })
+      .select('id')
+      .single();
     if (error) {
       notify(`Failed to add product: ${error.message}`);
       return;
+    }
+    // Issue the opening stock to the selected station, if given.
+    if (initialStock !== '' && selectedStation) {
+      await applyStock(data.id, Number(initialStock), 'issue');
     }
     setItemName('');
     setSellingPrice('');
     setCostPrice('');
     setProductCategory('');
     setTaxLabel('B');
-    setStock('');
+    setInitialStock('');
     notify(`Added ${itemName}`);
     loadProducts();
+    loadStock(selectedStation);
   };
 
   const startEdit = (p) => setEdit({ id: p.id, ...p });
@@ -165,8 +221,6 @@ function InventoryTab({ notify }) {
         category: edit.category,
         tax_label: edit.tax_label,
         tax_rate: taxRateFor(edit.tax_label),
-        stock_quantity:
-          edit.stock_quantity === '' || edit.stock_quantity === null ? null : Number(edit.stock_quantity),
       })
       .eq('id', edit.id);
     if (error) {
@@ -178,7 +232,22 @@ function InventoryTab({ notify }) {
     loadProducts();
   };
 
-  // Soft delete — keeps the row for historical sales, just hides it from POS.
+  // Set a product's stock AT the selected station to an absolute count; we
+  // apply the difference as a movement (issue if adding, adjust if reducing).
+  const setStockFor = async (p) => {
+    const key = String(p.id);
+    const target = Number(stockDraft[key]);
+    if (Number.isNaN(target)) return;
+    const current = stockMap[key] ?? 0;
+    const delta = target - current;
+    if (delta === 0) return;
+    const ok = await applyStock(p.id, delta, delta > 0 ? 'issue' : 'adjust');
+    if (ok) {
+      notify(`${p.item_name}: stock set to ${target}`);
+      loadStock(selectedStation);
+    }
+  };
+
   const deleteProduct = async (p) => {
     if (!window.confirm(`Remove "${p.item_name}" from the menu?`)) return;
     const { error } = await supabase.from('products').update({ active: false }).eq('id', p.id);
@@ -199,47 +268,39 @@ function InventoryTab({ notify }) {
     />
   );
 
+  const noStations = stations.length === 0;
+
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
+      {/* Station picker — stock is managed per station */}
+      <div className="flex items-center gap-3 flex-wrap">
+        <span className="font-semibold text-slate-600">Stock at station:</span>
+        {noStations ? (
+          <span className="text-slate-400 text-sm">Add a station in the Stations tab first.</span>
+        ) : (
+          <select
+            value={selectedStation}
+            onChange={(e) => setSelectedStation(e.target.value)}
+            className="px-4 py-2 rounded-lg border border-gray-300 bg-white"
+          >
+            {stations.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.name}
+              </option>
+            ))}
+          </select>
+        )}
+      </div>
+
       <form
         onSubmit={handleAddProduct}
         className="bg-white rounded-2xl shadow-md p-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"
       >
-        <input
-          required
-          placeholder="Item Name"
-          value={itemName}
-          onChange={(e) => setItemName(e.target.value)}
-          className="px-4 py-2 rounded-lg border border-gray-300"
-        />
-        <input
-          required
-          type="number"
-          placeholder="Selling Price"
-          value={sellingPrice}
-          onChange={(e) => setSellingPrice(e.target.value)}
-          className="px-4 py-2 rounded-lg border border-gray-300"
-        />
-        <input
-          required
-          type="number"
-          placeholder="Cost Price"
-          value={costPrice}
-          onChange={(e) => setCostPrice(e.target.value)}
-          className="px-4 py-2 rounded-lg border border-gray-300"
-        />
-        <input
-          required
-          placeholder="Category"
-          value={productCategory}
-          onChange={(e) => setProductCategory(e.target.value)}
-          className="px-4 py-2 rounded-lg border border-gray-300"
-        />
-        <select
-          value={taxLabel}
-          onChange={(e) => setTaxLabel(e.target.value)}
-          className="px-4 py-2 rounded-lg border border-gray-300"
-        >
+        <input required placeholder="Item Name" value={itemName} onChange={(e) => setItemName(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
+        <input required type="number" placeholder="Selling Price" value={sellingPrice} onChange={(e) => setSellingPrice(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
+        <input required type="number" placeholder="Cost Price" value={costPrice} onChange={(e) => setCostPrice(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
+        <input required placeholder="Category" value={productCategory} onChange={(e) => setProductCategory(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
+        <select value={taxLabel} onChange={(e) => setTaxLabel(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300">
           {TAX_CATEGORIES.map((t) => (
             <option key={t.label} value={t.label}>
               Tax {t.label} — {t.desc} ({t.rate}%)
@@ -248,15 +309,13 @@ function InventoryTab({ notify }) {
         </select>
         <input
           type="number"
-          placeholder="Stock qty (blank = untracked)"
-          value={stock}
-          onChange={(e) => setStock(e.target.value)}
-          className="px-4 py-2 rounded-lg border border-gray-300"
+          placeholder={selectedStation ? 'Opening stock (blank = untracked)' : 'Select a station to stock'}
+          value={initialStock}
+          disabled={!selectedStation}
+          onChange={(e) => setInitialStock(e.target.value)}
+          className="px-4 py-2 rounded-lg border border-gray-300 disabled:bg-slate-100"
         />
-        <button
-          type="submit"
-          className="col-span-1 sm:col-span-2 lg:col-span-3 py-2 rounded-lg bg-amber-500 text-white font-semibold active:scale-95"
-        >
+        <button type="submit" className="col-span-1 sm:col-span-2 lg:col-span-3 py-2 rounded-lg bg-amber-500 text-white font-semibold active:scale-95">
           Add Product
         </button>
       </form>
@@ -271,24 +330,23 @@ function InventoryTab({ notify }) {
                 <th className="px-5 py-3">Price</th>
                 <th className="px-5 py-3">Cost</th>
                 <th className="px-5 py-3">Tax</th>
-                <th className="px-5 py-3">Stock</th>
+                <th className="px-5 py-3">Stock{selectedStation ? '' : ' (pick station)'}</th>
                 <th className="px-5 py-3 text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
-              {products.map((p) =>
-                edit?.id === p.id ? (
+              {products.map((p) => {
+                const key = String(p.id);
+                const qty = stockMap[key];
+                const tracked = qty !== undefined;
+                return edit?.id === p.id ? (
                   <tr key={p.id} className="bg-amber-50">
                     <td className="px-5 py-3">{editCell('item_name')}</td>
                     <td className="px-5 py-3">{editCell('category')}</td>
                     <td className="px-5 py-3">{editCell('unit_price', { type: 'number' })}</td>
                     <td className="px-5 py-3">{editCell('cost_price', { type: 'number' })}</td>
                     <td className="px-5 py-3">
-                      <select
-                        value={edit.tax_label ?? 'B'}
-                        onChange={(e) => setEdit({ ...edit, tax_label: e.target.value })}
-                        className="w-full px-2 py-1 rounded border border-gray-300"
-                      >
+                      <select value={edit.tax_label ?? 'B'} onChange={(e) => setEdit({ ...edit, tax_label: e.target.value })} className="w-full px-2 py-1 rounded border border-gray-300">
                         {TAX_CATEGORIES.map((t) => (
                           <option key={t.label} value={t.label}>
                             {t.label} ({t.rate}%)
@@ -296,14 +354,10 @@ function InventoryTab({ notify }) {
                         ))}
                       </select>
                     </td>
-                    <td className="px-5 py-3">{editCell('stock_quantity', { type: 'number' })}</td>
+                    <td className="px-5 py-3 text-slate-400">—</td>
                     <td className="px-5 py-3 text-right whitespace-nowrap">
-                      <button onClick={saveEdit} className="px-3 py-1 rounded-lg bg-emerald-600 text-white text-sm font-semibold active:scale-95">
-                        Save
-                      </button>
-                      <button onClick={() => setEdit(null)} className="ml-2 px-3 py-1 rounded-lg bg-slate-100 text-slate-600 text-sm font-semibold active:scale-95">
-                        Cancel
-                      </button>
+                      <button onClick={saveEdit} className="px-3 py-1 rounded-lg bg-emerald-600 text-white text-sm font-semibold active:scale-95">Save</button>
+                      <button onClick={() => setEdit(null)} className="ml-2 px-3 py-1 rounded-lg bg-slate-100 text-slate-600 text-sm font-semibold active:scale-95">Cancel</button>
                     </td>
                   </tr>
                 ) : (
@@ -312,29 +366,32 @@ function InventoryTab({ notify }) {
                     <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.category}</td>
                     <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.unit_price?.toLocaleString()} RWF</td>
                     <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.cost_price?.toLocaleString()} RWF</td>
-                    <td className="px-5 py-3 text-slate-500 whitespace-nowrap">
-                      {p.tax_label} ({p.tax_rate}%)
-                    </td>
+                    <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.tax_label} ({p.tax_rate}%)</td>
                     <td className="px-5 py-3 whitespace-nowrap">
-                      {p.stock_quantity == null ? (
-                        <span className="text-slate-300">—</span>
+                      {selectedStation ? (
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="number"
+                            value={stockDraft[key] ?? (tracked ? qty : '')}
+                            placeholder="—"
+                            onChange={(e) => setStockDraft({ ...stockDraft, [key]: e.target.value })}
+                            className={`w-16 px-2 py-1 rounded border border-gray-300 ${tracked && qty <= 0 ? 'text-red-600' : tracked && qty <= 5 ? 'text-amber-600' : ''}`}
+                          />
+                          <button onClick={() => setStockFor(p)} className="px-2 py-1 rounded bg-slate-100 text-slate-700 text-xs font-semibold active:scale-95">
+                            Set
+                          </button>
+                        </div>
                       ) : (
-                        <span className={p.stock_quantity <= 0 ? 'text-red-600 font-semibold' : p.stock_quantity <= 5 ? 'text-amber-600 font-semibold' : 'text-slate-500'}>
-                          {p.stock_quantity}
-                        </span>
+                        <span className="text-slate-300">—</span>
                       )}
                     </td>
                     <td className="px-5 py-3 text-right whitespace-nowrap">
-                      <button onClick={() => startEdit(p)} className="px-3 py-1 rounded-lg bg-slate-100 text-slate-700 text-sm font-semibold active:scale-95">
-                        Edit
-                      </button>
-                      <button onClick={() => deleteProduct(p)} className="ml-2 px-3 py-1 rounded-lg bg-red-50 text-red-600 text-sm font-semibold active:scale-95">
-                        Delete
-                      </button>
+                      <button onClick={() => startEdit(p)} className="px-3 py-1 rounded-lg bg-slate-100 text-slate-700 text-sm font-semibold active:scale-95">Edit</button>
+                      <button onClick={() => deleteProduct(p)} className="ml-2 px-3 py-1 rounded-lg bg-red-50 text-red-600 text-sm font-semibold active:scale-95">Delete</button>
                     </td>
                   </tr>
-                )
-              )}
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -435,26 +492,39 @@ function ExpensesTab({ notify }) {
 
 function TeamTab({ notify }) {
   const [staff, setStaff] = useState([]);
+  const [stations, setStations] = useState([]);
   const [name, setName] = useState('');
   const [role, setRole] = useState('WAITER');
   const [pin, setPin] = useState('');
+  const [stationId, setStationId] = useState('');
+
+  const stationName = (id) => stations.find((s) => s.id === id)?.name;
 
   const loadStaff = async () => {
-    const { data, error } = await supabase
-      .from('staff')
-      .select('*')
-      .eq('business_id', CURRENT_BUSINESS_ID)
-      .order('name');
-    if (error) {
-      console.error('Failed to load staff:', error.message);
+    const [staffRes, stationsRes] = await Promise.all([
+      supabase.from('staff').select('*').eq('business_id', CURRENT_BUSINESS_ID).order('name'),
+      supabase.from('stations').select('*').eq('business_id', CURRENT_BUSINESS_ID).eq('active', true).order('name'),
+    ]);
+    if (staffRes.error) {
+      console.error('Failed to load staff:', staffRes.error.message);
       return;
     }
-    setStaff(data ?? []);
+    setStaff(staffRes.data ?? []);
+    setStations(stationsRes.data ?? []);
   };
 
   useEffect(() => {
     loadStaff();
   }, []);
+
+  const assignStation = async (member, station_id) => {
+    const { error } = await supabase.from('staff').update({ station_id: station_id || null }).eq('id', member.id);
+    if (error) {
+      notify(`Could not assign station: ${error.message}`);
+      return;
+    }
+    loadStaff();
+  };
 
   const handleAddStaff = async (e) => {
     e.preventDefault();
@@ -476,6 +546,7 @@ function TeamTab({ notify }) {
       role,
       pin_hash,
       active: true,
+      station_id: stationId || null,
     });
     if (error) {
       notify(`Could not add staff: ${error.message}`);
@@ -484,6 +555,7 @@ function TeamTab({ notify }) {
     setName('');
     setRole('WAITER');
     setPin('');
+    setStationId('');
     notify(`Added ${name}`);
     loadStaff();
   };
@@ -522,6 +594,18 @@ function TeamTab({ notify }) {
             </option>
           ))}
         </select>
+        <select
+          value={stationId}
+          onChange={(e) => setStationId(e.target.value)}
+          className="px-4 py-2 rounded-lg border border-gray-300"
+        >
+          <option value="">No station</option>
+          {stations.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name}
+            </option>
+          ))}
+        </select>
         <input
           required
           inputMode="numeric"
@@ -553,18 +637,33 @@ function TeamTab({ notify }) {
                 >
                   {member.name}
                 </p>
-                <p className="text-xs uppercase tracking-wide text-slate-400">{member.role}</p>
+                <p className="text-xs uppercase tracking-wide text-slate-400">
+                  {member.role}
+                  {stationName(member.station_id) ? ` · ${stationName(member.station_id)}` : ''}
+                </p>
               </div>
-              <button
-                onClick={() => setActive(member, member.active === false)}
-                className={`shrink-0 px-3 py-1.5 rounded-lg text-sm font-semibold active:scale-95 ${
-                  member.active === false
-                    ? 'bg-emerald-50 text-emerald-600'
-                    : 'bg-red-50 text-red-600'
-                }`}
-              >
-                {member.active === false ? 'Re-activate' : 'Deactivate'}
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                <select
+                  value={member.station_id ?? ''}
+                  onChange={(e) => assignStation(member, e.target.value)}
+                  className="px-2 py-1.5 rounded-lg border border-gray-300 text-sm max-w-[8rem]"
+                >
+                  <option value="">No station</option>
+                  {stations.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  onClick={() => setActive(member, member.active === false)}
+                  className={`px-3 py-1.5 rounded-lg text-sm font-semibold active:scale-95 ${
+                    member.active === false ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600'
+                  }`}
+                >
+                  {member.active === false ? 'Re-activate' : 'Deactivate'}
+                </button>
+              </div>
             </div>
           ))
         )}
@@ -868,6 +967,132 @@ function SalesTab({ notify, currentUser }) {
   );
 }
 
+function StationsTab({ notify }) {
+  const [stations, setStations] = useState([]);
+  const [name, setName] = useState('');
+  const [editingId, setEditingId] = useState(null);
+  const [editName, setEditName] = useState('');
+
+  const loadStations = async () => {
+    const { data, error } = await supabase
+      .from('stations')
+      .select('*')
+      .eq('business_id', CURRENT_BUSINESS_ID)
+      .order('name');
+    if (error) {
+      console.error('Failed to load stations:', error.message);
+      return;
+    }
+    setStations(data ?? []);
+  };
+
+  useEffect(() => {
+    loadStations();
+  }, []);
+
+  const addStation = async (e) => {
+    e.preventDefault();
+    const { error } = await supabase
+      .from('stations')
+      .insert({ business_id: CURRENT_BUSINESS_ID, name: name.trim() });
+    if (error) {
+      notify(`Could not add station: ${error.message}`);
+      return;
+    }
+    setName('');
+    notify(`Added ${name.trim()}`);
+    loadStations();
+  };
+
+  const saveRename = async (station) => {
+    const { error } = await supabase.from('stations').update({ name: editName.trim() }).eq('id', station.id);
+    if (error) {
+      notify(`Could not rename: ${error.message}`);
+      return;
+    }
+    setEditingId(null);
+    loadStations();
+  };
+
+  const setActive = async (station, active) => {
+    const { error } = await supabase.from('stations').update({ active }).eq('id', station.id);
+    if (error) {
+      notify(`Could not update: ${error.message}`);
+      return;
+    }
+    notify(`${station.name} ${active ? 're-activated' : 'deactivated'}`);
+    loadStations();
+  };
+
+  return (
+    <div className="space-y-8">
+      <form onSubmit={addStation} className="bg-white rounded-2xl shadow-md p-6 flex flex-col sm:flex-row gap-3">
+        <input
+          required
+          placeholder="Station name (e.g. Main Bar, Pool Bar, Reception)"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          className="flex-1 px-4 py-2 rounded-lg border border-gray-300"
+        />
+        <button type="submit" className="px-6 py-2 rounded-lg bg-amber-500 text-white font-semibold active:scale-95">
+          Add Station
+        </button>
+      </form>
+
+      <div className="bg-white rounded-2xl shadow-md divide-y divide-gray-100">
+        {stations.length === 0 ? (
+          <p className="px-5 py-6 text-slate-400">No stations yet. Add your selling points above.</p>
+        ) : (
+          stations.map((s) => (
+            <div key={s.id} className="flex items-center justify-between px-5 py-4 gap-3">
+              {editingId === s.id ? (
+                <input
+                  value={editName}
+                  onChange={(e) => setEditName(e.target.value)}
+                  className="flex-1 px-3 py-1.5 rounded-lg border border-gray-300"
+                />
+              ) : (
+                <span className={`font-semibold ${s.active === false ? 'text-slate-400 line-through' : 'text-slate-800'}`}>
+                  {s.name}
+                </span>
+              )}
+              <div className="flex items-center gap-2 shrink-0">
+                {editingId === s.id ? (
+                  <>
+                    <button onClick={() => saveRename(s)} className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-sm font-semibold active:scale-95">
+                      Save
+                    </button>
+                    <button onClick={() => setEditingId(null)} className="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600 text-sm font-semibold active:scale-95">
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => { setEditingId(s.id); setEditName(s.name); }}
+                      className="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-700 text-sm font-semibold active:scale-95"
+                    >
+                      Rename
+                    </button>
+                    <button
+                      onClick={() => setActive(s, s.active === false)}
+                      className={`px-3 py-1.5 rounded-lg text-sm font-semibold active:scale-95 ${
+                        s.active === false ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600'
+                      }`}
+                    >
+                      {s.active === false ? 'Re-activate' : 'Deactivate'}
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 function OwnerDashboard({ currentUser, onLogout }) {
   const [activeLink, setActiveLink] = useState('Dashboard');
   const [notice, setNotice] = useState('');
@@ -961,6 +1186,7 @@ function OwnerDashboard({ currentUser, onLogout }) {
 
         {activeLink === 'Dashboard' && <DashboardHome cashFlow={cashFlow} loading={cashFlowLoading} />}
         {activeLink === 'Sales' && <SalesTab notify={notify} currentUser={currentUser} />}
+        {activeLink === 'Stations' && <StationsTab notify={notify} />}
         {activeLink === 'Inventory' && <InventoryTab notify={notify} />}
         {activeLink === 'Expenses' && <ExpensesTab notify={notify} />}
         {activeLink === 'Team' && <TeamTab notify={notify} />}
@@ -968,12 +1194,12 @@ function OwnerDashboard({ currentUser, onLogout }) {
       </main>
 
       {/* Mobile bottom icon bar — icon + short label is easier to scan at a glance than a text list */}
-      <nav className="md:hidden fixed bottom-0 inset-x-0 bg-slate-900 border-t border-slate-800 flex justify-around py-2 z-10">
+      <nav className="md:hidden fixed bottom-0 inset-x-0 bg-slate-900 border-t border-slate-800 flex justify-around py-2 z-10 overflow-x-auto">
         {NAV_LINKS.map(({ key, icon }) => (
           <button
             key={key}
             onClick={() => setActiveLink(key)}
-            className={`flex flex-col items-center gap-0.5 px-1.5 py-1 rounded-lg text-[10px] font-semibold transition ${
+            className={`flex flex-col items-center gap-0.5 px-1.5 py-1 rounded-lg text-[10px] font-semibold transition shrink-0 ${
               activeLink === key ? 'text-amber-400' : 'text-slate-400'
             }`}
           >
