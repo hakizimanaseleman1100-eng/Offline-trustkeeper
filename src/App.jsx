@@ -64,13 +64,41 @@ async function syncStaff() {
   }
 }
 
+// Mirrors stations and per-station stock so the POS can show/deduct the right
+// station's stock offline. Business-scoped, so it runs before login. Replaces
+// the local copies wholesale on a successful fetch; leaves them alone offline.
+async function syncStations() {
+  try {
+    const [stationsRes, stockRes] = await Promise.all([
+      supabase.from('stations').select('*').eq('business_id', CURRENT_BUSINESS_ID),
+      supabase.from('station_stock').select('*').eq('business_id', CURRENT_BUSINESS_ID),
+    ]);
+    if (stationsRes.error) throw stationsRes.error;
+    if (stockRes.error) throw stockRes.error;
+    await db.stations.clear();
+    if (stationsRes.data?.length) await db.stations.bulkAdd(stationsRes.data);
+    await db.station_stock.clear();
+    if (stockRes.data?.length) {
+      // Normalise product_id to string to match how the POS looks it up.
+      await db.station_stock.bulkAdd(
+        stockRes.data.map((r) => ({ ...r, product_id: String(r.product_id) }))
+      );
+    }
+  } catch (err) {
+    console.error('Stations down-sync skipped:', err.message);
+  }
+}
+
 function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
     (async () => {
-      if (navigator.onLine) await syncInventory();
+      if (navigator.onLine) {
+        await syncInventory();
+        await syncStations();
+      }
       await syncStaff();
       setReady(true);
     })();

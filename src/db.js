@@ -120,3 +120,16 @@ db.version(7).stores({
 db.version(8).stores({
   meta: 'key',
 });
+
+/*
+ * version(9): local mirrors for multi-station support.
+ * - stations: the venue's selling points (for names + station picker).
+ * - station_stock: per-station on-hand, keyed by a compound [station_id+
+ *   product_id] so a station's stock is one .where('station_id') lookup and a
+ *   single line updates by [station_id, product_id]. product_id is stored as a
+ *   string to stay type-agnostic against products.id.
+ */
+db.version(9).stores({
+  stations: 'id, business_id',
+  station_stock: '[station_id+product_id], station_id, product_id',
+});
