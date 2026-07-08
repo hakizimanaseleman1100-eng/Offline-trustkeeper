@@ -899,6 +899,8 @@ function SalesTab({ notify, currentUser }) {
       staff_name: currentUser?.name ?? null,
       receipt_no: r.receipt_no,
       refund_of: g.receipt_no,
+      station_id: r.station_id ?? null,
+      station_name: r.station_name ?? null,
       timestamp: new Date().toISOString(),
     }));
     const { error } = await supabase.from('hospitality_sales').insert(reversals);
@@ -907,17 +909,25 @@ function SalesTab({ notify, currentUser }) {
       setBusy(null);
       return;
     }
-    // Put the refunded units back into stock. Reversal quantities are negative,
-    // and the RPC subtracts, so a negative qty adds the stock back.
-    const stockDeltas = Object.values(
-      reversals.reduce((m, r) => {
-        (m[r.item_id] ||= { id: r.item_id, qty: 0 }).qty += r.quantity;
+    // Put the refunded units back into the station they were sold from.
+    const moves = Object.values(
+      g.lines.reduce((m, r) => {
+        if (!r.station_id) return m;
+        const k = `${r.station_id}|${r.item_id}`;
+        (m[k] ||= {
+          station_id: r.station_id,
+          product_id: String(r.item_id),
+          business_id: CURRENT_BUSINESS_ID,
+          delta: 0,
+          reason: 'refund',
+          staff_name: currentUser?.name ?? null,
+        }).delta += r.quantity ?? 1;
         return m;
       }, {})
     );
-    if (stockDeltas.length) {
-      const { error: stockErr } = await supabase.rpc('apply_stock_deltas', { p_deltas: stockDeltas });
-      if (stockErr) console.error('Stock restore failed:', stockErr.message);
+    if (moves.length) {
+      const { error: stockErr } = await supabase.rpc('apply_station_stock', { p_moves: moves });
+      if (stockErr) console.error('Station stock restore failed:', stockErr.message);
     }
     await supabase.from('audit_logs').insert({
       business_id: CURRENT_BUSINESS_ID,
@@ -967,6 +977,140 @@ function SalesTab({ notify, currentUser }) {
   );
 }
 
+// End-of-day reconciliation for one station: today's takings + stock movement
+// so the storeman can be held to account. Display-only (nothing persisted) —
+// the physical-count column is a live calculator for the count.
+function ReconcilePanel({ station }) {
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
+  const [totals, setTotals] = useState({ cash: 0, momo: 0, net: 0, receipts: 0 });
+  const [counts, setCounts] = useState({}); // product_id -> physical count input
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const since = startOfTodayISO();
+      const [salesRes, stockRes, movesRes, productsRes] = await Promise.all([
+        supabase.from('hospitality_sales').select('*').eq('station_id', station.id).gte('timestamp', since),
+        supabase.from('station_stock').select('*').eq('station_id', station.id),
+        supabase.from('stock_movements').select('*').eq('station_id', station.id).gte('created_at', since),
+        supabase.from('products').select('id, item_name').eq('business_id', CURRENT_BUSINESS_ID),
+      ]);
+      if (cancelled) return;
+
+      const sales = salesRes.data ?? [];
+      const nameById = Object.fromEntries((productsRes.data ?? []).map((p) => [String(p.id), p.item_name]));
+
+      let cash = 0, momo = 0;
+      for (const s of sales) {
+        if (s.payment_method === 'cash') cash += s.total_price ?? 0;
+        else if (s.payment_method === 'momo') momo += s.total_price ?? 0;
+      }
+      const receipts = new Set(sales.filter((s) => !s.refund_of).map((s) => s.receipt_no).filter(Boolean)).size;
+
+      const sold = {}; // net units sold (sales positive, refunds negative)
+      for (const s of sales) {
+        const k = String(s.item_id);
+        sold[k] = (sold[k] ?? 0) + (s.quantity ?? 0);
+      }
+      const issued = {}; // issued to station today
+      for (const m of movesRes.data ?? []) {
+        if (m.reason === 'issue') {
+          const k = String(m.product_id);
+          issued[k] = (issued[k] ?? 0) + Number(m.delta);
+        }
+      }
+      const onHand = Object.fromEntries((stockRes.data ?? []).map((r) => [String(r.product_id), r.quantity]));
+
+      const ids = new Set([...Object.keys(onHand), ...Object.keys(sold), ...Object.keys(issued)]);
+      const list = [...ids]
+        .map((id) => ({
+          id,
+          name: nameById[id] ?? 'Unknown item',
+          issued: issued[id] ?? 0,
+          sold: sold[id] ?? 0,
+          onHand: onHand[id],
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      setRows(list);
+      setTotals({ cash, momo, net: cash + momo, receipts });
+      setLoading(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [station.id]);
+
+  const money = (n) => `${Math.round(n).toLocaleString()} RWF`;
+
+  if (loading) return <p className="px-5 py-4 text-slate-400">Loading…</p>;
+
+  return (
+    <div className="px-5 py-4 bg-slate-50 space-y-4">
+      <div className="grid grid-cols-3 gap-3">
+        <div className="bg-white rounded-xl p-3">
+          <p className="text-[11px] uppercase tracking-wide text-slate-400">Cash</p>
+          <p className="font-bold text-slate-800">{money(totals.cash)}</p>
+        </div>
+        <div className="bg-white rounded-xl p-3">
+          <p className="text-[11px] uppercase tracking-wide text-slate-400">MoMo</p>
+          <p className="font-bold text-slate-800">{money(totals.momo)}</p>
+        </div>
+        <div className="bg-white rounded-xl p-3">
+          <p className="text-[11px] uppercase tracking-wide text-slate-400">Total ({totals.receipts})</p>
+          <p className="font-bold text-emerald-600">{money(totals.net)}</p>
+        </div>
+      </div>
+
+      {rows.length === 0 ? (
+        <p className="text-slate-400 text-sm">No stock or sales at this station today.</p>
+      ) : (
+        <div className="overflow-x-auto bg-white rounded-xl">
+          <table className="w-full text-left text-sm">
+            <thead className="text-slate-500 uppercase text-xs">
+              <tr>
+                <th className="px-3 py-2">Item</th>
+                <th className="px-3 py-2">Issued</th>
+                <th className="px-3 py-2">Sold</th>
+                <th className="px-3 py-2">On hand</th>
+                <th className="px-3 py-2">Counted</th>
+                <th className="px-3 py-2">Variance</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {rows.map((r) => {
+                const counted = counts[r.id];
+                const variance = counted === undefined || counted === '' ? null : Number(counted) - (r.onHand ?? 0);
+                return (
+                  <tr key={r.id}>
+                    <td className="px-3 py-2 font-semibold text-slate-700 whitespace-nowrap">{r.name}</td>
+                    <td className="px-3 py-2 text-slate-500">{r.issued || '—'}</td>
+                    <td className="px-3 py-2 text-slate-500">{r.sold || '—'}</td>
+                    <td className="px-3 py-2 text-slate-500">{r.onHand ?? '—'}</td>
+                    <td className="px-3 py-2">
+                      <input
+                        type="number"
+                        value={counts[r.id] ?? ''}
+                        onChange={(e) => setCounts({ ...counts, [r.id]: e.target.value })}
+                        className="w-16 px-2 py-1 rounded border border-gray-300"
+                      />
+                    </td>
+                    <td className={`px-3 py-2 font-semibold ${variance == null ? 'text-slate-300' : variance === 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+                      {variance == null ? '—' : variance > 0 ? `+${variance}` : variance}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function StationsTab({ notify }) {
   const [stations, setStations] = useState([]);
   const [name, setName] = useState('');
@@ -985,6 +1129,8 @@ function StationsTab({ notify }) {
     }
     setStations(data ?? []);
   };
+
+  const [reconcileId, setReconcileId] = useState(null);
 
   useEffect(() => {
     loadStations();
@@ -1044,47 +1190,58 @@ function StationsTab({ notify }) {
           <p className="px-5 py-6 text-slate-400">No stations yet. Add your selling points above.</p>
         ) : (
           stations.map((s) => (
-            <div key={s.id} className="flex items-center justify-between px-5 py-4 gap-3">
-              {editingId === s.id ? (
-                <input
-                  value={editName}
-                  onChange={(e) => setEditName(e.target.value)}
-                  className="flex-1 px-3 py-1.5 rounded-lg border border-gray-300"
-                />
-              ) : (
-                <span className={`font-semibold ${s.active === false ? 'text-slate-400 line-through' : 'text-slate-800'}`}>
-                  {s.name}
-                </span>
-              )}
-              <div className="flex items-center gap-2 shrink-0">
+            <div key={s.id}>
+              <div className="flex items-center justify-between px-5 py-4 gap-3">
                 {editingId === s.id ? (
-                  <>
-                    <button onClick={() => saveRename(s)} className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-sm font-semibold active:scale-95">
-                      Save
-                    </button>
-                    <button onClick={() => setEditingId(null)} className="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600 text-sm font-semibold active:scale-95">
-                      Cancel
-                    </button>
-                  </>
+                  <input
+                    value={editName}
+                    onChange={(e) => setEditName(e.target.value)}
+                    className="flex-1 px-3 py-1.5 rounded-lg border border-gray-300"
+                  />
                 ) : (
-                  <>
-                    <button
-                      onClick={() => { setEditingId(s.id); setEditName(s.name); }}
-                      className="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-700 text-sm font-semibold active:scale-95"
-                    >
-                      Rename
-                    </button>
-                    <button
-                      onClick={() => setActive(s, s.active === false)}
-                      className={`px-3 py-1.5 rounded-lg text-sm font-semibold active:scale-95 ${
-                        s.active === false ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600'
-                      }`}
-                    >
-                      {s.active === false ? 'Re-activate' : 'Deactivate'}
-                    </button>
-                  </>
+                  <span className={`font-semibold ${s.active === false ? 'text-slate-400 line-through' : 'text-slate-800'}`}>
+                    {s.name}
+                  </span>
                 )}
+                <div className="flex items-center gap-2 shrink-0">
+                  {editingId === s.id ? (
+                    <>
+                      <button onClick={() => saveRename(s)} className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-sm font-semibold active:scale-95">
+                        Save
+                      </button>
+                      <button onClick={() => setEditingId(null)} className="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600 text-sm font-semibold active:scale-95">
+                        Cancel
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => setReconcileId(reconcileId === s.id ? null : s.id)}
+                        className={`px-3 py-1.5 rounded-lg text-sm font-semibold active:scale-95 ${
+                          reconcileId === s.id ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700'
+                        }`}
+                      >
+                        Reconcile
+                      </button>
+                      <button
+                        onClick={() => { setEditingId(s.id); setEditName(s.name); }}
+                        className="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-700 text-sm font-semibold active:scale-95"
+                      >
+                        Rename
+                      </button>
+                      <button
+                        onClick={() => setActive(s, s.active === false)}
+                        className={`px-3 py-1.5 rounded-lg text-sm font-semibold active:scale-95 ${
+                          s.active === false ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600'
+                        }`}
+                      >
+                        {s.active === false ? 'Re-activate' : 'Deactivate'}
+                      </button>
+                    </>
+                  )}
+                </div>
               </div>
+              {reconcileId === s.id && <ReconcilePanel station={s} />}
             </div>
           ))
         )}

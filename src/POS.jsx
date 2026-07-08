@@ -34,6 +34,9 @@ function POS({ currentUser, onLogout }) {
   const [momoRef, setMomoRef] = useState('');
   const [lastSyncAt, setLastSyncAt] = useState(null);
   const [showDiscount, setShowDiscount] = useState(false);
+  // The station this session sells from. Normally the logged-in staff's
+  // assigned station; if unassigned, the waiter picks one (kept on the device).
+  const [sessionStation, setSessionStation] = useState(null);
   // Room item awaiting a nights count before it's added to the tab.
   const [roomPrompt, setRoomPrompt] = useState(null);
   const [nightsInput, setNightsInput] = useState('1');
@@ -83,6 +86,24 @@ function POS({ currentUser, onLogout }) {
   const activeTab = useLiveQuery(
     () => (activeTabId ? db.active_tabs.get(activeTabId) : null),
     [activeTabId]
+  );
+
+  // Which station this device is selling from. Staff assignment wins; otherwise
+  // a device-remembered choice (sessionStation). Null = no station set up yet,
+  // in which case stock isn't tracked and everything is sellable.
+  const stations = useLiveQuery(() => db.stations.toArray(), [], []);
+  const stationId = currentUser?.station_id ?? sessionStation;
+  const stationName = stations.find((s) => s.id === stationId)?.name ?? null;
+
+  // On-hand at this station: product_id(string) -> quantity.
+  const stationStock = useLiveQuery(
+    async () => {
+      if (!stationId) return {};
+      const rows = await db.station_stock.where('station_id').equals(stationId).toArray();
+      return Object.fromEntries(rows.map((r) => [String(r.product_id), r.quantity]));
+    },
+    [stationId],
+    {}
   );
 
   // Categories come from whatever is actually in inventory — no hardcoded list.
@@ -511,27 +532,31 @@ function POS({ currentUser, onLogout }) {
               discount_amount: share,
               total_price: row.total_price - share,
               guest_count: activeTab?.guest_count ?? null,
+              // Tag the sale to its station so reconciliation is per storeman.
+              station_id: stationId ?? null,
+              station_name: stationName,
             },
           };
         })
       );
       await db.active_tabs.update(activeTabId, { status: 'paid' });
 
-      // Decrement the local stock mirror right away so the waiter sees the new
-      // count immediately. The authoritative server decrement happens at sync
-      // (see syncData); the next inventory down-sync reconciles the two.
-      const soldByItem = new Map();
-      for (const row of cartItems) {
-        soldByItem.set(row.item_id, (soldByItem.get(row.item_id) ?? 0) + (row.quantity ?? 1));
+      // Decrement THIS station's local stock right away so the waiter sees the
+      // new count immediately. The authoritative server decrement happens at
+      // sync; the next stations down-sync reconciles the two. Only lines
+      // tracked at this station (a station_stock row exists) are touched.
+      if (stationId) {
+        const soldByItem = new Map();
+        for (const row of cartItems) {
+          soldByItem.set(String(row.item_id), (soldByItem.get(String(row.item_id)) ?? 0) + (row.quantity ?? 1));
+        }
+        await Promise.all(
+          [...soldByItem.entries()].map(async ([pid, qty]) => {
+            const row = await db.station_stock.get([stationId, pid]);
+            if (row) await db.station_stock.update([stationId, pid], { quantity: row.quantity - qty });
+          })
+        );
       }
-      await Promise.all(
-        [...soldByItem.entries()].map(async ([id, qty]) => {
-          const inv = await db.inventory.get(id);
-          if (inv && inv.stock_quantity != null) {
-            await db.inventory.update(id, { stock_quantity: inv.stock_quantity - qty });
-          }
-        })
-      );
 
       showToast(`${activeTab?.name ?? 'Tab'} closed — ${receipt_no}`);
       closeTabView();
@@ -585,6 +610,8 @@ function POS({ currentUser, onLogout }) {
           guest_count: sale.guest_count ?? null,
           check_in_date: sale.check_in_date ?? null,
           check_out_date: sale.check_out_date ?? null,
+          station_id: sale.station_id ?? null,
+          station_name: sale.station_name ?? null,
           timestamp: new Date(sale.timestamp).toISOString(),
         }))
       );
@@ -594,19 +621,35 @@ function POS({ currentUser, onLogout }) {
         unsynced.map((sale) => ({ key: sale.id, changes: { synced_status: 1 } }))
       );
 
-      // Authoritative stock decrement for the sales we just uploaded. Batched
-      // by product into one atomic RPC call (rooms/untracked products with
-      // null stock are skipped server-side). Best-effort — a rare miss leaves
-      // the count slightly high, which the owner can correct in Inventory.
-      const stockDeltas = Object.values(
-        unsynced.reduce((m, sale) => {
-          (m[sale.item_id] ||= { id: sale.item_id, qty: 0 }).qty += sale.quantity ?? 1;
-          return m;
-        }, {})
-      );
-      if (stockDeltas.length) {
-        const { error: stockErr } = await supabase.rpc('apply_stock_deltas', { p_deltas: stockDeltas });
-        if (stockErr) console.error('Stock update failed:', stockErr.message);
+      // Authoritative per-station stock decrement for the sales just uploaded.
+      // One atomic RPC call carrying { station_id, product_id, delta:-qty }.
+      // Only lines tracked at their station (a station_stock row exists) are
+      // sent, so untracked items/rooms don't create spurious negative rows.
+      const moves = [];
+      const byStationItem = {};
+      for (const sale of unsynced) {
+        if (!sale.station_id) continue;
+        const k = `${sale.station_id}|${sale.item_id}`;
+        if (!byStationItem[k]) {
+          byStationItem[k] = { station_id: sale.station_id, product_id: String(sale.item_id), qty: 0 };
+        }
+        byStationItem[k].qty += sale.quantity ?? 1;
+      }
+      for (const v of Object.values(byStationItem)) {
+        const tracked = await db.station_stock.get([v.station_id, v.product_id]);
+        if (!tracked) continue;
+        moves.push({
+          station_id: v.station_id,
+          product_id: v.product_id,
+          business_id: CURRENT_BUSINESS_ID,
+          delta: -v.qty,
+          reason: 'sale',
+          staff_name: currentUser?.name ?? null,
+        });
+      }
+      if (moves.length) {
+        const { error: stockErr } = await supabase.rpc('apply_station_stock', { p_moves: moves });
+        if (stockErr) console.error('Station stock update failed:', stockErr.message);
       }
 
       const unsyncedLogs = await db.audit_logs.where('synced_status').equals(0).toArray();
@@ -646,11 +689,47 @@ function POS({ currentUser, onLogout }) {
 
   useEffect(() => {
     db.meta.get('last_sync_at').then((row) => row?.value && setLastSyncAt(row.value));
+    db.meta.get('session_station').then((row) => row?.value && setSessionStation(row.value));
     const autoSync = () => syncDataRef.current({ silent: true });
     window.addEventListener('online', autoSync);
     if (navigator.onLine) autoSync(); // opportunistic catch-up on open
     return () => window.removeEventListener('online', autoSync);
   }, []);
+
+  const pickStation = async (id) => {
+    await db.meta.put({ key: 'session_station', value: id });
+    setSessionStation(id);
+  };
+
+  // If stations exist but this session has none (unassigned staff), make the
+  // waiter choose their station first — nobody sells without being accountable
+  // to a station.
+  if (stations.length > 0 && !stationId) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center gap-6 font-sans px-6 py-12">
+        <div className="text-center">
+          <h1 className="text-2xl font-extrabold text-white">Choose your station</h1>
+          <p className="text-slate-400 mt-1">Sales and stock are tracked per station.</p>
+        </div>
+        <div className="w-full max-w-xs space-y-3">
+          {stations
+            .filter((s) => s.active !== false)
+            .map((s) => (
+              <button
+                key={s.id}
+                onClick={() => pickStation(s.id)}
+                className="w-full h-16 rounded-2xl bg-white text-slate-800 text-lg font-bold shadow-md active:scale-95"
+              >
+                {s.name}
+              </button>
+            ))}
+        </div>
+        <button onClick={onLogout} className="text-slate-400 text-sm font-semibold underline">
+          Log out
+        </button>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -660,7 +739,10 @@ function POS({ currentUser, onLogout }) {
         <div className="min-w-0">
           <h1 className="text-lg sm:text-2xl lg:text-3xl font-extrabold tracking-tight">Sovereign POS</h1>
           {currentUser?.name && (
-            <p className="text-[10px] lg:text-xs text-slate-400 truncate">Signed in as {currentUser.name}</p>
+            <p className="text-[10px] lg:text-xs text-slate-400 truncate">
+              {currentUser.name}
+              {stationName ? ` · ${stationName}` : ''}
+            </p>
           )}
         </div>
         <div className="flex items-center gap-2 sm:gap-4 lg:gap-6">
@@ -831,8 +913,11 @@ function POS({ currentUser, onLogout }) {
                 ) : (
                   <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-7 gap-2 sm:gap-3 lg:gap-4">
                     {items.map((item) => {
-                      const tracked = item.stock_quantity != null;
-                      const out = tracked && item.stock_quantity <= 0;
+                      // Stock is per station. undefined = not tracked at this
+                      // station (always sellable, e.g. rooms/services).
+                      const qty = stationStock[String(item.id)];
+                      const tracked = qty !== undefined;
+                      const out = tracked && qty <= 0;
                       return (
                         <button
                           key={item.id}
@@ -848,10 +933,10 @@ function POS({ currentUser, onLogout }) {
                           {tracked && (
                             <span
                               className={`block text-[10px] sm:text-xs font-bold mt-0.5 ${
-                                out ? 'text-red-600' : item.stock_quantity <= 5 ? 'text-amber-600' : 'text-emerald-600'
+                                out ? 'text-red-600' : qty <= 5 ? 'text-amber-600' : 'text-emerald-600'
                               }`}
                             >
-                              {out ? 'Out of stock' : `${item.stock_quantity} left`}
+                              {out ? 'Out of stock' : `${qty} left`}
                             </span>
                           )}
                         </button>
