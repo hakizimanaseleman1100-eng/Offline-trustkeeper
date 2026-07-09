@@ -16,6 +16,13 @@ const NAV_LINKS = [
   { key: 'Reports', icon: '📈' },
   { key: 'Team', icon: '👥' },
 ];
+
+// On phones the bottom bar shows only these four most-used views; the rest go
+// behind a "More" menu so the bar doesn't get crowded. The desktop sidebar
+// always lists everything.
+const MOBILE_PRIMARY = ['Dashboard', 'Sales', 'Stations', 'Reports'];
+const primaryLinks = NAV_LINKS.filter((l) => MOBILE_PRIMARY.includes(l.key));
+const overflowLinks = NAV_LINKS.filter((l) => !MOBILE_PRIMARY.includes(l.key));
 const EXPENSE_CATEGORIES = ['Utilities', 'Supplies', 'Maintenance', 'Salaries', 'Other'];
 
 // Rwanda RRA/EBM VAT tax categories. VAT is a single 18% standard rate, so the
@@ -1252,6 +1259,7 @@ function StationsTab({ notify }) {
 
 function OwnerDashboard({ currentUser, onLogout }) {
   const [activeLink, setActiveLink] = useState('Dashboard');
+  const [moreOpen, setMoreOpen] = useState(false);
   const [notice, setNotice] = useState('');
   const [cashFlow, setCashFlow] = useState({ salesTotal: 0, expensesTotal: 0, net: 0 });
   const [cashFlowLoading, setCashFlowLoading] = useState(true);
@@ -1350,13 +1358,36 @@ function OwnerDashboard({ currentUser, onLogout }) {
         {activeLink === 'Reports' && <ReportsTab />}
       </main>
 
-      {/* Mobile bottom icon bar — icon + short label is easier to scan at a glance than a text list */}
-      <nav className="md:hidden fixed bottom-0 inset-x-0 bg-slate-900 border-t border-slate-800 flex justify-around py-2 z-10 overflow-x-auto">
-        {NAV_LINKS.map(({ key, icon }) => (
+      {/* Mobile "More" sheet — the overflow views live here so the bottom bar
+          stays to four. */}
+      {moreOpen && (
+        <div className="md:hidden fixed inset-0 z-20 flex flex-col justify-end" onClick={() => setMoreOpen(false)}>
+          <div className="absolute inset-0 bg-black/40" />
+          <div onClick={(e) => e.stopPropagation()} className="relative bg-white rounded-t-3xl shadow-xl pb-4">
+            <div className="w-10 h-1.5 bg-gray-200 rounded-full mx-auto mt-3 mb-1" />
+            {overflowLinks.map(({ key, icon }) => (
+              <button
+                key={key}
+                onClick={() => { setActiveLink(key); setMoreOpen(false); }}
+                className={`w-full flex items-center gap-3 px-6 py-4 text-lg font-semibold ${
+                  activeLink === key ? 'text-amber-600' : 'text-slate-700'
+                }`}
+              >
+                <span className="text-2xl">{icon}</span>
+                {key}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Mobile bottom bar — four most-used views plus a More menu */}
+      <nav className="md:hidden fixed bottom-0 inset-x-0 bg-slate-900 border-t border-slate-800 flex justify-around py-2 z-10">
+        {primaryLinks.map(({ key, icon }) => (
           <button
             key={key}
-            onClick={() => setActiveLink(key)}
-            className={`flex flex-col items-center gap-0.5 px-1.5 py-1 rounded-lg text-[10px] font-semibold transition shrink-0 ${
+            onClick={() => { setActiveLink(key); setMoreOpen(false); }}
+            className={`flex flex-col items-center gap-0.5 px-2 py-1 rounded-lg text-[11px] font-semibold transition ${
               activeLink === key ? 'text-amber-400' : 'text-slate-400'
             }`}
           >
@@ -1364,6 +1395,15 @@ function OwnerDashboard({ currentUser, onLogout }) {
             {key}
           </button>
         ))}
+        <button
+          onClick={() => setMoreOpen((o) => !o)}
+          className={`flex flex-col items-center gap-0.5 px-2 py-1 rounded-lg text-[11px] font-semibold transition ${
+            moreOpen || overflowLinks.some((l) => l.key === activeLink) ? 'text-amber-400' : 'text-slate-400'
+          }`}
+        >
+          <span className="text-xl leading-none">☰</span>
+          More
+        </button>
       </nav>
     </div>
   );
