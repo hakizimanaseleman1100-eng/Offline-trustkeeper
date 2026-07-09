@@ -5,7 +5,8 @@ import POS from './POS';
 import OwnerDashboard from './OwnerDashboard';
 import KitchenDisplay from './KitchenDisplay';
 import PinLogin from './PinLogin';
-import { CURRENT_BUSINESS_ID } from './config';
+import BusinessAuth from './BusinessAuth';
+import { getBusinessId, currentSession, resolveBusinessId, ensureBusiness, signOutBusiness } from './session';
 import { hashPin, DEFAULT_OWNER_ID, DEFAULT_OWNER_PIN } from './auth';
 
 // Down-syncs the product catalog from Supabase into the local Dexie mirror.
@@ -16,7 +17,7 @@ async function syncInventory() {
     const { data, error } = await supabase
       .from('products')
       .select('*')
-      .eq('business_id', CURRENT_BUSINESS_ID);
+      .eq('business_id', getBusinessId());
     if (error) throw error;
     // Hide soft-deleted products from the POS. Filtered client-side (rather
     // than .eq('active', true)) so it still works before migration 0003 adds
@@ -39,7 +40,7 @@ async function syncStaff() {
     const { data, error } = await supabase
       .from('staff')
       .select('*')
-      .eq('business_id', CURRENT_BUSINESS_ID);
+      .eq('business_id', getBusinessId());
     if (error) throw error;
     // Only replace the local mirror when the fetch actually succeeded.
     await db.staff.clear();
@@ -55,7 +56,7 @@ async function syncStaff() {
   if (!hasOwner) {
     await db.staff.put({
       id: DEFAULT_OWNER_ID,
-      business_id: CURRENT_BUSINESS_ID,
+      business_id: getBusinessId(),
       name: 'Owner',
       pin_hash: await hashPin(DEFAULT_OWNER_PIN),
       role: 'OWNER',
@@ -70,8 +71,8 @@ async function syncStaff() {
 async function syncStations() {
   try {
     const [stationsRes, stockRes] = await Promise.all([
-      supabase.from('stations').select('*').eq('business_id', CURRENT_BUSINESS_ID),
-      supabase.from('station_stock').select('*').eq('business_id', CURRENT_BUSINESS_ID),
+      supabase.from('stations').select('*').eq('business_id', getBusinessId()),
+      supabase.from('station_stock').select('*').eq('business_id', getBusinessId()),
     ]);
     if (stationsRes.error) throw stationsRes.error;
     if (stockRes.error) throw stockRes.error;
@@ -91,27 +92,69 @@ async function syncStations() {
 
 function App() {
   const [currentUser, setCurrentUser] = useState(null);
-  const [ready, setReady] = useState(false);
+  const [checking, setChecking] = useState(true); // resolving the venue session
+  const [authed, setAuthed] = useState(false); // venue account signed in (or cached offline)
+  const [ready, setReady] = useState(false); // local mirrors loaded
+
+  // Down-syncs everything for the resolved business, then reveals the app.
+  const bootstrap = async () => {
+    if (navigator.onLine) {
+      await syncInventory();
+      await syncStations();
+    }
+    await syncStaff();
+    setReady(true);
+  };
 
   useEffect(() => {
     (async () => {
-      if (navigator.onLine) {
-        await syncInventory();
-        await syncStations();
+      const session = await currentSession();
+      if (session) {
+        // Attach to a business: existing profile, or create/adopt one.
+        const bid = (await resolveBusinessId()) || (await ensureBusiness('My Venue'));
+        void bid;
+        setAuthed(true);
+        await bootstrap();
+      } else if (localStorage.getItem('business_id')) {
+        // Returning device without a live session (e.g. offline) — keep working
+        // with the last venue rather than forcing a re-login.
+        setAuthed(true);
+        await bootstrap();
       }
-      await syncStaff();
-      setReady(true);
+      setChecking(false);
     })();
   }, []);
 
-  const logout = () => setCurrentUser(null);
+  // Called by BusinessAuth once the venue is signed in and its business resolved.
+  const onVenueReady = async () => {
+    setAuthed(true);
+    await bootstrap();
+    setChecking(false);
+  };
+
+  const logout = () => setCurrentUser(null); // staff sign-out → PIN pad
+
+  const signOutVenue = async () => {
+    await signOutBusiness();
+    setCurrentUser(null);
+    setReady(false);
+    setAuthed(false);
+  };
+
+  if (checking) {
+    return <div className="min-h-screen bg-slate-900" />;
+  }
+
+  if (!authed) {
+    return <BusinessAuth onReady={onVenueReady} />;
+  }
 
   if (!ready) {
     return <div className="min-h-screen bg-slate-900" />;
   }
 
   if (!currentUser) {
-    return <PinLogin onSuccess={setCurrentUser} />;
+    return <PinLogin onSuccess={setCurrentUser} onSignOutVenue={signOutVenue} />;
   }
 
   if (currentUser.role === 'OWNER' || currentUser.role === 'MANAGER') {

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './db';
 import { supabase } from './supabaseClient';
-import { CURRENT_BUSINESS_ID } from './config';
+import { getBusinessId } from './session';
 import { getDeviceId, nextReceiptNo } from './receipts';
 
 // "5m ago" style label for the last successful sync.
@@ -417,7 +417,7 @@ function POS({ currentUser, onLogout }) {
     if (roundLines.length > 0) {
       try {
         const { error } = await supabase.from('kitchen_tickets').insert({
-          business_id: CURRENT_BUSINESS_ID,
+          business_id: getBusinessId(),
           tab_id: activeTabId,
           tab_name: activeTab?.name ?? null,
           round: currentRound,
@@ -591,7 +591,7 @@ function POS({ currentUser, onLogout }) {
 
       const { error } = await supabase.from('hospitality_sales').insert(
         unsynced.map((sale) => ({
-          business_id: CURRENT_BUSINESS_ID,
+          business_id: getBusinessId(),
           item_id: sale.item_id,
           quantity: sale.quantity ?? 1,
           total_price: sale.total_price,
@@ -641,7 +641,7 @@ function POS({ currentUser, onLogout }) {
         moves.push({
           station_id: v.station_id,
           product_id: v.product_id,
-          business_id: CURRENT_BUSINESS_ID,
+          business_id: getBusinessId(),
           delta: -v.qty,
           reason: 'sale',
           staff_name: currentUser?.name ?? null,
@@ -656,7 +656,7 @@ function POS({ currentUser, onLogout }) {
       if (unsyncedLogs.length > 0) {
         const { error: auditError } = await supabase.from('audit_logs').insert(
           unsyncedLogs.map((log) => ({
-            business_id: CURRENT_BUSINESS_ID,
+            business_id: getBusinessId(),
             action_type: log.action_type,
             details: log.details,
             staff_id: log.staff_id ?? null,

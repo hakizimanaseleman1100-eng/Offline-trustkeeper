@@ -28,6 +28,7 @@ so re-running one by accident is harmless.
 | `0008_rls_policies.sql` | Grants the anon key access to `staff` and `kitchen_tickets` (fixes 401 errors). |
 | `0009_stock.sql` | Adds `products.stock_quantity` + the `apply_stock_deltas` RPC that sales/refunds call to adjust stock atomically. |
 | `0010_stations.sql` | Multi-station: `stations`, `station_stock`, `stock_movements`, `staff.station_id`, sale `station_id`/`station_name`, and the `apply_station_stock` RPC. Per-station stock supersedes the global `products.stock_quantity` from 0009. |
+| `0011_tenancy.sql` | SaaS tenancy: `businesses`, `profiles`, `auth_business_id()`, and `create_business()` (first account adopts existing `biz_123` data). Also turn OFF email confirmation in Supabase Auth settings. |
 
 After running `0001`, the app's PIN login and per-waiter accountability work
 end-to-end. Until then, the app falls back to a local-only default owner

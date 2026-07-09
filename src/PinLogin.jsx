@@ -4,7 +4,7 @@ import { hashPin } from './auth';
 
 // Full-screen PIN pad. Auto-verifies once 4 digits are entered — no separate
 // "enter" tap. On success it hands the matched staff row back to the parent.
-function PinLogin({ onSuccess }) {
+function PinLogin({ onSuccess, onSignOutVenue }) {
   const [pin, setPin] = useState('');
   const [error, setError] = useState('');
   const [checking, setChecking] = useState(false);
@@ -85,6 +85,12 @@ function PinLogin({ onSuccess }) {
           ⌫
         </button>
       </div>
+
+      {onSignOutVenue && (
+        <button onClick={onSignOutVenue} className="text-slate-500 text-xs font-semibold underline mt-2">
+          Sign out of venue
+        </button>
+      )}
     </div>
   );
 }

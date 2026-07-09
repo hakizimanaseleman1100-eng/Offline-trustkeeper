@@ -31,7 +31,7 @@ minutes, daily use is low-friction, no technical steps.
 |---|---|---|
 | Auth model | **Business account (email+password via Supabase Auth) + staff PIN within it.** The device logs in once as the venue; staff switch by PIN. | Keeps the fast shared-device PIN UX while giving real per-tenant isolation. Per-staff cloud accounts would break the counter-service flow. |
 | Tenancy style | **Row-level in one shared schema**, isolated by `business_id` + RLS. | Already the shape; no per-tenant migrations; cheapest to run/scale. |
-| Billing provider | **Local-first (Flutterwave / Paystack / MoMo)** over Stripe. | Market is Rwanda, MoMo-heavy; card-only Stripe is a poor fit. *Your call.* |
+| Billing provider | **MoMo (MTN Mobile Money)** — decided. | Market is Rwanda, MoMo-heavy; venues already pay/collect via MoMo. Stage 3 integrates a MoMo subscription charge (likely via a provider like Flutterwave/Paystack that exposes MoMo, or MTN's own API). |
 | Migration workflow | **Supabase CLI in CI** (stop pasting SQL by hand). | Reliable schema changes are table-stakes for SaaS. |
 
 ---

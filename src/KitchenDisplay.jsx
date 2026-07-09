@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
-import { CURRENT_BUSINESS_ID } from './config';
+import { getBusinessId } from './session';
 
 // Live kitchen/bar board. Shows "new" tickets sent from the POS and lets
 // kitchen staff tap Done to clear them. Reached by logging in with a
@@ -15,7 +15,7 @@ function KitchenDisplay({ currentUser, onLogout }) {
       const { data } = await supabase
         .from('kitchen_tickets')
         .select('*')
-        .eq('business_id', CURRENT_BUSINESS_ID)
+        .eq('business_id', getBusinessId())
         .eq('status', 'new')
         .order('created_at');
       if (active) setTickets(data ?? []);
@@ -27,7 +27,7 @@ function KitchenDisplay({ currentUser, onLogout }) {
       .channel('kitchen_tickets')
       .on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'kitchen_tickets', filter: `business_id=eq.${CURRENT_BUSINESS_ID}` },
+        { event: '*', schema: 'public', table: 'kitchen_tickets', filter: `business_id=eq.${getBusinessId()}` },
         () => load()
       )
       .subscribe();

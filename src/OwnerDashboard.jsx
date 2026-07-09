@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './db';
 import { supabase } from './supabaseClient';
-import { CURRENT_BUSINESS_ID } from './config';
+import { getBusinessId } from './session';
 import { hashPin } from './auth';
 
 const STAFF_ROLES = ['WAITER', 'KITCHEN', 'MANAGER', 'OWNER'];
@@ -136,7 +136,7 @@ function InventoryTab({ notify }) {
     const { data } = await supabase
       .from('stations')
       .select('*')
-      .eq('business_id', CURRENT_BUSINESS_ID)
+      .eq('business_id', getBusinessId())
       .eq('active', true)
       .order('name');
     setStations(data ?? []);
@@ -168,7 +168,7 @@ function InventoryTab({ notify }) {
         {
           station_id: selectedStation,
           product_id: String(productId),
-          business_id: CURRENT_BUSINESS_ID,
+          business_id: getBusinessId(),
           delta,
           reason,
           staff_name: 'Owner',
@@ -187,7 +187,7 @@ function InventoryTab({ notify }) {
     const { data, error } = await supabase
       .from('products')
       .insert({
-        business_id: CURRENT_BUSINESS_ID,
+        business_id: getBusinessId(),
         item_name: itemName,
         unit_price: Number(sellingPrice),
         cost_price: Number(costPrice),
@@ -419,7 +419,7 @@ function ExpensesTab({ notify }) {
   const handleAddExpense = async (e) => {
     e.preventDefault();
     const { error } = await supabase.from('expenses').insert({
-      business_id: CURRENT_BUSINESS_ID,
+      business_id: getBusinessId(),
       amount: Number(amount),
       category: expenseCategory,
       description,
@@ -509,8 +509,8 @@ function TeamTab({ notify }) {
 
   const loadStaff = async () => {
     const [staffRes, stationsRes] = await Promise.all([
-      supabase.from('staff').select('*').eq('business_id', CURRENT_BUSINESS_ID).order('name'),
-      supabase.from('stations').select('*').eq('business_id', CURRENT_BUSINESS_ID).eq('active', true).order('name'),
+      supabase.from('staff').select('*').eq('business_id', getBusinessId()).order('name'),
+      supabase.from('stations').select('*').eq('business_id', getBusinessId()).eq('active', true).order('name'),
     ]);
     if (staffRes.error) {
       console.error('Failed to load staff:', staffRes.error.message);
@@ -548,7 +548,7 @@ function TeamTab({ notify }) {
       return;
     }
     const { error } = await supabase.from('staff').insert({
-      business_id: CURRENT_BUSINESS_ID,
+      business_id: getBusinessId(),
       name,
       role,
       pin_hash,
@@ -705,9 +705,9 @@ function ReportsTab() {
         supabase
           .from('hospitality_sales')
           .select('*')
-          .eq('business_id', CURRENT_BUSINESS_ID)
+          .eq('business_id', getBusinessId())
           .gte('timestamp', since),
-        supabase.from('products').select('id, item_name').eq('business_id', CURRENT_BUSINESS_ID),
+        supabase.from('products').select('id, item_name').eq('business_id', getBusinessId()),
       ]);
       if (cancelled) return;
 
@@ -855,7 +855,7 @@ function SalesTab({ notify, currentUser }) {
     const { data, error } = await supabase
       .from('hospitality_sales')
       .select('*')
-      .eq('business_id', CURRENT_BUSINESS_ID)
+      .eq('business_id', getBusinessId())
       .gte('timestamp', sinceISO(30))
       .order('timestamp', { ascending: false });
     if (error) {
@@ -894,7 +894,7 @@ function SalesTab({ notify, currentUser }) {
     setBusy(g.receipt_no);
     // Insert reversing rows: same lines, negated. refund_of ties them back.
     const reversals = g.lines.map((r) => ({
-      business_id: CURRENT_BUSINESS_ID,
+      business_id: getBusinessId(),
       item_id: r.item_id,
       quantity: -(r.quantity ?? 1),
       total_price: -(r.total_price ?? 0),
@@ -924,7 +924,7 @@ function SalesTab({ notify, currentUser }) {
         (m[k] ||= {
           station_id: r.station_id,
           product_id: String(r.item_id),
-          business_id: CURRENT_BUSINESS_ID,
+          business_id: getBusinessId(),
           delta: 0,
           reason: 'refund',
           staff_name: currentUser?.name ?? null,
@@ -937,7 +937,7 @@ function SalesTab({ notify, currentUser }) {
       if (stockErr) console.error('Station stock restore failed:', stockErr.message);
     }
     await supabase.from('audit_logs').insert({
-      business_id: CURRENT_BUSINESS_ID,
+      business_id: getBusinessId(),
       action_type: 'REFUND',
       details: `Refunded receipt ${g.receipt_no} (${Math.round(g.total).toLocaleString()} RWF)`,
       staff_id: currentUser?.id ?? null,
@@ -1002,7 +1002,7 @@ function ReconcilePanel({ station }) {
         supabase.from('hospitality_sales').select('*').eq('station_id', station.id).gte('timestamp', since),
         supabase.from('station_stock').select('*').eq('station_id', station.id),
         supabase.from('stock_movements').select('*').eq('station_id', station.id).gte('created_at', since),
-        supabase.from('products').select('id, item_name').eq('business_id', CURRENT_BUSINESS_ID),
+        supabase.from('products').select('id, item_name').eq('business_id', getBusinessId()),
       ]);
       if (cancelled) return;
 
@@ -1128,7 +1128,7 @@ function StationsTab({ notify }) {
     const { data, error } = await supabase
       .from('stations')
       .select('*')
-      .eq('business_id', CURRENT_BUSINESS_ID)
+      .eq('business_id', getBusinessId())
       .order('name');
     if (error) {
       console.error('Failed to load stations:', error.message);
@@ -1147,7 +1147,7 @@ function StationsTab({ notify }) {
     e.preventDefault();
     const { error } = await supabase
       .from('stations')
-      .insert({ business_id: CURRENT_BUSINESS_ID, name: name.trim() });
+      .insert({ business_id: getBusinessId(), name: name.trim() });
     if (error) {
       notify(`Could not add station: ${error.message}`);
       return;
