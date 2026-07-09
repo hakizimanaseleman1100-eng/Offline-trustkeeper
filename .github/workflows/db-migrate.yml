@@ -1,0 +1,26 @@
+name: Apply DB migrations
+
+# Applies any new supabase/migrations/*.sql to the Supabase database, so you
+# never paste SQL into the dashboard again. Runs when migrations change on main
+# (and can be run manually from the Actions tab). Migrations are idempotent, so
+# a first run that re-applies existing ones is harmless; already-applied ones
+# are then recorded and skipped next time.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'supabase/migrations/**'
+  workflow_dispatch:
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      - name: Push migrations
+        run: supabase db push --db-url "$SUPABASE_DB_URL"
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}

@@ -1,18 +1,27 @@
 # Database migrations
 
 The Supabase schema for this project lives here as plain SQL, applied in order.
-There is no automated runner — each file is meant to be pasted into the
-**Supabase SQL editor** and run once, oldest first.
 
-## How to apply a migration
+## Applying migrations — automatic (preferred)
 
-1. Open your project at <https://supabase.com/dashboard>.
-2. Go to **SQL Editor → New query**.
-3. Paste the contents of the next un-applied file from `migrations/`.
-4. Click **Run**.
+A GitHub Action (`.github/workflows/db-migrate.yml`) runs `supabase db push`
+whenever a file under `migrations/` changes on `main`. **Just commit the new
+`.sql` file and push — it applies itself.** No more pasting into the dashboard.
 
-Every migration is written to be **idempotent** (guarded with `IF NOT EXISTS`),
-so re-running one by accident is harmless.
+**One-time setup:** add a repository secret so the Action can reach the database.
+1. Supabase → **Project Settings → Database → Connection string → URI**, and copy
+   it (it includes your DB password).
+2. GitHub → repo **Settings → Secrets and variables → Actions → New repository
+   secret** → name `SUPABASE_DB_URL`, value = that URI.
+
+You can also trigger it by hand from the repo's **Actions** tab → *Apply DB
+migrations* → *Run workflow*.
+
+## Applying migrations — manual fallback
+
+If you ever need to apply one by hand: Supabase → **SQL Editor → New query** →
+paste the file → **Run**. Every migration is **idempotent** (guarded with
+`IF NOT EXISTS` etc.), so re-running one is harmless.
 
 ## Applied order
 
