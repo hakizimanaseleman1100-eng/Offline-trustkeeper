@@ -41,6 +41,7 @@ paste the file → **Run**. Every migration is **idempotent** (guarded with
 | `0010_stations.sql` | Multi-station: `stations`, `station_stock`, `stock_movements`, `staff.station_id`, sale `station_id`/`station_name`, and the `apply_station_stock` RPC. Per-station stock supersedes the global `products.stock_quantity` from 0009. |
 | `0011_tenancy.sql` | SaaS tenancy: `businesses`, `profiles`, `auth_business_id()`, and `create_business()` (first account adopts existing `biz_123` data). Also turn OFF email confirmation in Supabase Auth settings. |
 | `0012_authenticated_access.sql` | Lets the signed-in (`authenticated`) venue read/write the original tables (products/sales/expenses/etc.) — fixes empty inventory & reports after 0011. |
+| `0013_tenant_isolation.sql` | **Stage 1c:** strict per-tenant RLS (`business_id = auth_business_id()`) on every table, removes public/anon table access, and hardens `apply_station_stock` against cross-tenant writes. |
 
 After running `0001`, the app's PIN login and per-waiter accountability work
 end-to-end. Until then, the app falls back to a local-only default owner
