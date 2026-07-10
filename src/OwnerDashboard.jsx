@@ -10,17 +10,19 @@ const STAFF_ROLES = ['WAITER', 'KITCHEN', 'MANAGER', 'OWNER'];
 const NAV_LINKS = [
   { key: 'Dashboard', icon: '📊' },
   { key: 'Sales', icon: '🧾' },
+  { key: 'Reconcile', icon: '🧮' },
+  { key: 'Reports', icon: '📈' },
   { key: 'Stations', icon: '🏪' },
   { key: 'Inventory', icon: '📦' },
   { key: 'Expenses', icon: '💵' },
-  { key: 'Reports', icon: '📈' },
   { key: 'Team', icon: '👥' },
 ];
 
 // On phones the bottom bar shows only these four most-used views; the rest go
 // behind a "More" menu so the bar doesn't get crowded. The desktop sidebar
-// always lists everything.
-const MOBILE_PRIMARY = ['Dashboard', 'Sales', 'Stations', 'Reports'];
+// always lists everything. Reconcile (the daily end-of-day count) is primary;
+// Stations (setup) moves to More.
+const MOBILE_PRIMARY = ['Dashboard', 'Sales', 'Reconcile', 'Reports'];
 const primaryLinks = NAV_LINKS.filter((l) => MOBILE_PRIMARY.includes(l.key));
 const overflowLinks = NAV_LINKS.filter((l) => !MOBILE_PRIMARY.includes(l.key));
 const EXPENSE_CATEGORIES = ['Utilities', 'Supplies', 'Maintenance', 'Salaries', 'Other'];
@@ -1058,7 +1060,7 @@ function ReconcilePanel({ station }) {
 
   const money = (n) => Math.round(n).toLocaleString();
 
-  if (loading) return <p className="px-5 py-4 text-slate-400">Loading…</p>;
+  if (loading) return <p className="text-slate-400">Loading…</p>;
 
   // Live totals derived from the (editable) closing counts.
   const computed = rows.map((r) => {
@@ -1082,8 +1084,8 @@ function ReconcilePanel({ station }) {
   );
 
   return (
-    <div className="px-3 sm:px-5 py-4 bg-slate-50 space-y-4">
-      <div className="overflow-x-auto bg-white rounded-xl">
+    <div className="space-y-4">
+      <div className="overflow-x-auto bg-white rounded-xl shadow-md">
         <table className="w-full text-left text-sm whitespace-nowrap">
           <thead className="bg-slate-100 text-slate-600 text-[11px]">
             <tr>
@@ -1124,7 +1126,7 @@ function ReconcilePanel({ station }) {
       </div>
 
       {/* VERSEMENT — end-of-day reconciliation */}
-      <div className="bg-white rounded-xl p-4 max-w-md">
+      <div className="bg-white rounded-xl shadow-md p-4 max-w-md">
         <p className="font-extrabold text-slate-800 mb-3">VERSEMENT <span className="text-slate-400 font-normal text-sm">— end of day</span></p>
         <div className="space-y-2 text-sm">
           <div className="flex justify-between items-center">
@@ -1163,6 +1165,54 @@ function ReconcilePanel({ station }) {
   );
 }
 
+// Dedicated daily reconciliation view — picks a station (auto for single-station
+// venues) and shows its stock sheet + VERSEMENT. This is the storeman's main
+// end-of-day screen, so it's a top-level tab rather than buried under Stations.
+function ReconcileTab() {
+  const [stations, setStations] = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      const { data } = await supabase
+        .from('stations')
+        .select('*')
+        .eq('business_id', getBusinessId())
+        .eq('active', true)
+        .order('name');
+      setStations(data ?? []);
+      setSelectedId((cur) => cur || data?.[0]?.id || null);
+    })();
+  }, []);
+
+  if (stations.length === 0) {
+    return <p className="text-slate-500 text-lg">No stations yet — add one in the Stations tab to reconcile.</p>;
+  }
+
+  const selected = stations.find((s) => s.id === selectedId) ?? stations[0];
+
+  return (
+    <div className="space-y-4">
+      {stations.length > 1 && (
+        <div className="flex gap-2 flex-wrap">
+          {stations.map((s) => (
+            <button
+              key={s.id}
+              onClick={() => setSelectedId(s.id)}
+              className={`px-4 py-2 rounded-full text-sm font-semibold transition active:scale-95 ${
+                selected.id === s.id ? 'bg-amber-500 text-white' : 'bg-white text-slate-600 shadow-sm'
+              }`}
+            >
+              {s.name}
+            </button>
+          ))}
+        </div>
+      )}
+      <ReconcilePanel key={selected.id} station={selected} />
+    </div>
+  );
+}
+
 function StationsTab({ notify }) {
   const [stations, setStations] = useState([]);
   const [name, setName] = useState('');
@@ -1181,8 +1231,6 @@ function StationsTab({ notify }) {
     }
     setStations(data ?? []);
   };
-
-  const [reconcileId, setReconcileId] = useState(null);
 
   useEffect(() => {
     loadStations();
@@ -1268,14 +1316,6 @@ function StationsTab({ notify }) {
                   ) : (
                     <>
                       <button
-                        onClick={() => setReconcileId(reconcileId === s.id ? null : s.id)}
-                        className={`px-3 py-1.5 rounded-lg text-sm font-semibold active:scale-95 ${
-                          reconcileId === s.id ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700'
-                        }`}
-                      >
-                        Reconcile
-                      </button>
-                      <button
                         onClick={() => { setEditingId(s.id); setEditName(s.name); }}
                         className="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-700 text-sm font-semibold active:scale-95"
                       >
@@ -1293,7 +1333,6 @@ function StationsTab({ notify }) {
                   )}
                 </div>
               </div>
-              {reconcileId === s.id && <ReconcilePanel station={s} />}
             </div>
           ))
         )}
@@ -1396,6 +1435,7 @@ function OwnerDashboard({ currentUser, onLogout }) {
 
         {activeLink === 'Dashboard' && <DashboardHome cashFlow={cashFlow} loading={cashFlowLoading} />}
         {activeLink === 'Sales' && <SalesTab notify={notify} currentUser={currentUser} />}
+        {activeLink === 'Reconcile' && <ReconcileTab />}
         {activeLink === 'Stations' && <StationsTab notify={notify} />}
         {activeLink === 'Inventory' && <InventoryTab notify={notify} />}
         {activeLink === 'Expenses' && <ExpensesTab notify={notify} />}
