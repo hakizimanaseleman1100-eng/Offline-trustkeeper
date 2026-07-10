@@ -984,65 +984,71 @@ function SalesTab({ notify, currentUser }) {
   );
 }
 
-// End-of-day reconciliation for one station: today's takings + stock movement
-// so the storeman can be held to account. Display-only (nothing persisted) —
-// the physical-count column is a live calculator for the count.
+// End-of-day reconciliation for one station, laid out like the stock sheet
+// Rwandan bars already use: N° · IBICURUZWA · STOCK YATANGIRANYE · IBYINJIYE ·
+// TOTAL · STOCK IRAYE · IBYACURUJWE · IBICIRO · AYACURUJWE, then the VERSEMENT
+// footer. STOCK IRAYE (closing) is a live physical count; sold and revenue
+// derive from it, so the storeman is accountable for stock and cash.
 function ReconcilePanel({ station }) {
   const [loading, setLoading] = useState(true);
-  const [rows, setRows] = useState([]);
-  const [totals, setTotals] = useState({ cash: 0, momo: 0, net: 0, receipts: 0 });
-  const [counts, setCounts] = useState({}); // product_id -> physical count input
+  const [rows, setRows] = useState([]); // {id, name, price, opening, received, onHand}
+  const [closing, setClosing] = useState({}); // product_id -> physical count (string)
+  const [cash, setCash] = useState('');
+  const [momo, setMomo] = useState('');
+  const [expenses, setExpenses] = useState('');
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       setLoading(true);
       const since = startOfTodayISO();
-      const [salesRes, stockRes, movesRes, productsRes] = await Promise.all([
-        supabase.from('hospitality_sales').select('*').eq('station_id', station.id).gte('timestamp', since),
+      const [productsRes, stockRes, movesRes, salesRes, expRes] = await Promise.all([
+        supabase.from('products').select('id, item_name, unit_price, active').eq('business_id', getBusinessId()).order('item_name'),
         supabase.from('station_stock').select('*').eq('station_id', station.id),
         supabase.from('stock_movements').select('*').eq('station_id', station.id).gte('created_at', since),
-        supabase.from('products').select('id, item_name').eq('business_id', getBusinessId()),
+        supabase.from('hospitality_sales').select('payment_method, total_price').eq('station_id', station.id).gte('timestamp', since),
+        supabase.from('expenses').select('amount').eq('business_id', getBusinessId()).gte('created_at', since),
       ]);
       if (cancelled) return;
 
-      const sales = salesRes.data ?? [];
-      const nameById = Object.fromEntries((productsRes.data ?? []).map((p) => [String(p.id), p.item_name]));
-
-      let cash = 0, momo = 0;
-      for (const s of sales) {
-        if (s.payment_method === 'cash') cash += s.total_price ?? 0;
-        else if (s.payment_method === 'momo') momo += s.total_price ?? 0;
-      }
-      const receipts = new Set(sales.filter((s) => !s.refund_of).map((s) => s.receipt_no).filter(Boolean)).size;
-
-      const sold = {}; // net units sold (sales positive, refunds negative)
-      for (const s of sales) {
-        const k = String(s.item_id);
-        sold[k] = (sold[k] ?? 0) + (s.quantity ?? 0);
-      }
-      const issued = {}; // issued to station today
+      const onHand = Object.fromEntries((stockRes.data ?? []).map((r) => [String(r.product_id), Number(r.quantity)]));
+      // Movements today: total change (to reconstruct opening) and issues (IBYINJIYE).
+      const deltaSum = {};
+      const issued = {};
       for (const m of movesRes.data ?? []) {
-        if (m.reason === 'issue') {
-          const k = String(m.product_id);
-          issued[k] = (issued[k] ?? 0) + Number(m.delta);
-        }
+        const k = String(m.product_id);
+        deltaSum[k] = (deltaSum[k] ?? 0) + Number(m.delta);
+        if (m.reason === 'issue') issued[k] = (issued[k] ?? 0) + Number(m.delta);
       }
-      const onHand = Object.fromEntries((stockRes.data ?? []).map((r) => [String(r.product_id), r.quantity]));
 
-      const ids = new Set([...Object.keys(onHand), ...Object.keys(sold), ...Object.keys(issued)]);
-      const list = [...ids]
-        .map((id) => ({
-          id,
-          name: nameById[id] ?? 'Unknown item',
-          issued: issued[id] ?? 0,
-          sold: sold[id] ?? 0,
-          onHand: onHand[id],
-        }))
-        .sort((a, b) => a.name.localeCompare(b.name));
+      const list = (productsRes.data ?? [])
+        .filter((p) => p.active !== false)
+        .map((p) => {
+          const id = String(p.id);
+          const oh = onHand[id] ?? 0;
+          return {
+            id,
+            name: p.item_name,
+            price: Number(p.unit_price ?? 0),
+            received: issued[id] ?? 0,
+            onHand: oh,
+            opening: oh - (deltaSum[id] ?? 0), // start-of-day = now minus today's movement
+          };
+        });
+
+      let cashSum = 0, momoSum = 0;
+      for (const s of salesRes.data ?? []) {
+        if (s.payment_method === 'cash') cashSum += s.total_price ?? 0;
+        else if (s.payment_method === 'momo') momoSum += s.total_price ?? 0;
+      }
+      const expSum = (expRes.data ?? []).reduce((a, e) => a + (e.amount ?? 0), 0);
 
       setRows(list);
-      setTotals({ cash, momo, net: cash + momo, receipts });
+      // Closing defaults to system on-hand; the storeman overwrites with the count.
+      setClosing(Object.fromEntries(list.map((r) => [r.id, String(r.onHand)])));
+      setCash(String(Math.round(cashSum)));
+      setMomo(String(Math.round(momoSum)));
+      setExpenses(String(Math.round(expSum)));
       setLoading(false);
     })();
     return () => {
@@ -1050,70 +1056,109 @@ function ReconcilePanel({ station }) {
     };
   }, [station.id]);
 
-  const money = (n) => `${Math.round(n).toLocaleString()} RWF`;
+  const money = (n) => Math.round(n).toLocaleString();
 
   if (loading) return <p className="px-5 py-4 text-slate-400">Loading…</p>;
 
+  // Live totals derived from the (editable) closing counts.
+  const computed = rows.map((r) => {
+    const closingVal = Number(closing[r.id] ?? r.onHand) || 0;
+    const total = r.opening + r.received;
+    const sold = Math.max(0, total - closingVal);
+    return { ...r, total, closingVal, sold, revenue: sold * r.price };
+  });
+  const totalSales = computed.reduce((a, r) => a + r.revenue, 0);
+  const totalCollected = (Number(cash) || 0) + (Number(momo) || 0);
+  const difference = totalCollected - totalSales;
+  const profit = totalSales - (Number(expenses) || 0);
+
+  const numInput = (value, onChange, extra = '') => (
+    <input
+      type="number"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className={`w-24 px-2 py-1 rounded border border-gray-300 text-right ${extra}`}
+    />
+  );
+
   return (
-    <div className="px-5 py-4 bg-slate-50 space-y-4">
-      <div className="grid grid-cols-3 gap-3">
-        <div className="bg-white rounded-xl p-3">
-          <p className="text-[11px] uppercase tracking-wide text-slate-400">Cash</p>
-          <p className="font-bold text-slate-800">{money(totals.cash)}</p>
-        </div>
-        <div className="bg-white rounded-xl p-3">
-          <p className="text-[11px] uppercase tracking-wide text-slate-400">MoMo</p>
-          <p className="font-bold text-slate-800">{money(totals.momo)}</p>
-        </div>
-        <div className="bg-white rounded-xl p-3">
-          <p className="text-[11px] uppercase tracking-wide text-slate-400">Total ({totals.receipts})</p>
-          <p className="font-bold text-emerald-600">{money(totals.net)}</p>
-        </div>
+    <div className="px-3 sm:px-5 py-4 bg-slate-50 space-y-4">
+      <div className="overflow-x-auto bg-white rounded-xl">
+        <table className="w-full text-left text-sm whitespace-nowrap">
+          <thead className="bg-slate-100 text-slate-600 text-[11px]">
+            <tr>
+              <th className="px-2 py-2">N°</th>
+              <th className="px-2 py-2">IBICURUZWA<div className="font-normal text-slate-400 normal-case">Item</div></th>
+              <th className="px-2 py-2 text-right">STOCK YATANGIRANYE<div className="font-normal text-slate-400 normal-case">Opening</div></th>
+              <th className="px-2 py-2 text-right">IBYINJIYE<div className="font-normal text-slate-400 normal-case">In</div></th>
+              <th className="px-2 py-2 text-right">TOTAL</th>
+              <th className="px-2 py-2 text-right">STOCK IRAYE<div className="font-normal text-slate-400 normal-case">Closing count</div></th>
+              <th className="px-2 py-2 text-right">IBYACURUJWE<div className="font-normal text-slate-400 normal-case">Sold</div></th>
+              <th className="px-2 py-2 text-right">IBICIRO<div className="font-normal text-slate-400 normal-case">Price</div></th>
+              <th className="px-2 py-2 text-right">AYACURUJWE<div className="font-normal text-slate-400 normal-case">Revenue</div></th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-100">
+            {computed.map((r, i) => (
+              <tr key={r.id}>
+                <td className="px-2 py-1.5 text-slate-400">{i + 1}</td>
+                <td className="px-2 py-1.5 font-semibold text-slate-700">{r.name}</td>
+                <td className="px-2 py-1.5 text-right text-slate-500">{r.opening || ''}</td>
+                <td className="px-2 py-1.5 text-right text-slate-500">{r.received || ''}</td>
+                <td className="px-2 py-1.5 text-right text-slate-500">{r.total || ''}</td>
+                <td className="px-2 py-1.5 text-right">
+                  <input
+                    type="number"
+                    value={closing[r.id] ?? ''}
+                    onChange={(e) => setClosing({ ...closing, [r.id]: e.target.value })}
+                    className="w-16 px-2 py-1 rounded border border-gray-300 text-right"
+                  />
+                </td>
+                <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{r.sold || ''}</td>
+                <td className="px-2 py-1.5 text-right text-slate-500">{r.price ? money(r.price) : ''}</td>
+                <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{r.revenue ? money(r.revenue) : ''}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
 
-      {rows.length === 0 ? (
-        <p className="text-slate-400 text-sm">No stock or sales at this station today.</p>
-      ) : (
-        <div className="overflow-x-auto bg-white rounded-xl">
-          <table className="w-full text-left text-sm">
-            <thead className="text-slate-500 uppercase text-xs">
-              <tr>
-                <th className="px-3 py-2">Item</th>
-                <th className="px-3 py-2">Issued</th>
-                <th className="px-3 py-2">Sold</th>
-                <th className="px-3 py-2">On hand</th>
-                <th className="px-3 py-2">Counted</th>
-                <th className="px-3 py-2">Variance</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-100">
-              {rows.map((r) => {
-                const counted = counts[r.id];
-                const variance = counted === undefined || counted === '' ? null : Number(counted) - (r.onHand ?? 0);
-                return (
-                  <tr key={r.id}>
-                    <td className="px-3 py-2 font-semibold text-slate-700 whitespace-nowrap">{r.name}</td>
-                    <td className="px-3 py-2 text-slate-500">{r.issued || '—'}</td>
-                    <td className="px-3 py-2 text-slate-500">{r.sold || '—'}</td>
-                    <td className="px-3 py-2 text-slate-500">{r.onHand ?? '—'}</td>
-                    <td className="px-3 py-2">
-                      <input
-                        type="number"
-                        value={counts[r.id] ?? ''}
-                        onChange={(e) => setCounts({ ...counts, [r.id]: e.target.value })}
-                        className="w-16 px-2 py-1 rounded border border-gray-300"
-                      />
-                    </td>
-                    <td className={`px-3 py-2 font-semibold ${variance == null ? 'text-slate-300' : variance === 0 ? 'text-emerald-600' : 'text-red-600'}`}>
-                      {variance == null ? '—' : variance > 0 ? `+${variance}` : variance}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+      {/* VERSEMENT — end-of-day reconciliation */}
+      <div className="bg-white rounded-xl p-4 max-w-md">
+        <p className="font-extrabold text-slate-800 mb-3">VERSEMENT <span className="text-slate-400 font-normal text-sm">— end of day</span></p>
+        <div className="space-y-2 text-sm">
+          <div className="flex justify-between items-center">
+            <span className="text-slate-600">Total Sales (Ayacurujwe)</span>
+            <span className="font-bold text-slate-900">{money(totalSales)} RWF</span>
+          </div>
+          <div className="flex justify-between items-center">
+            <span className="text-slate-600">Cash Collected</span>
+            {numInput(cash, setCash)}
+          </div>
+          <div className="flex justify-between items-center">
+            <span className="text-slate-600">MoMo Collected</span>
+            {numInput(momo, setMomo)}
+          </div>
+          <div className="flex justify-between items-center border-t border-gray-100 pt-2">
+            <span className="text-slate-600">Total Collected</span>
+            <span className="font-bold text-slate-900">{money(totalCollected)} RWF</span>
+          </div>
+          <div className="flex justify-between items-center">
+            <span className="text-slate-600">Difference</span>
+            <span className={`font-bold ${difference === 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+              {difference > 0 ? '+' : ''}{money(difference)} RWF
+            </span>
+          </div>
+          <div className="flex justify-between items-center border-t border-gray-100 pt-2">
+            <span className="text-slate-600">Daily Expenses</span>
+            {numInput(expenses, setExpenses)}
+          </div>
+          <div className="flex justify-between items-center border-t border-gray-100 pt-2">
+            <span className="text-slate-700 font-semibold">Profit Before Tax</span>
+            <span className="font-extrabold text-emerald-600">{money(profit)} RWF</span>
+          </div>
         </div>
-      )}
+      </div>
     </div>
   );
 }
