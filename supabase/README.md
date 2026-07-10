@@ -4,9 +4,11 @@ The Supabase schema for this project lives here as plain SQL, applied in order.
 
 ## Applying migrations — automatic (preferred)
 
-A GitHub Action (`.github/workflows/db-migrate.yml`) runs `supabase db push`
-whenever a file under `migrations/` changes on `main`. **Just commit the new
-`.sql` file and push — it applies itself.** No more pasting into the dashboard.
+A GitHub Action (`.github/workflows/db-migrate.yml`) runs the migration `.sql`
+files with `psql` whenever a file under `migrations/` changes on `main`. **Just
+commit the new `.sql` file and push — it applies itself.** No more pasting into
+the dashboard. (Migrations are idempotent, so it safely re-runs them all in
+order.)
 
 **One-time setup:** add a repository secret so the Action can reach the database.
 1. Supabase → **Project Settings → Database → Connection string → URI**, and copy

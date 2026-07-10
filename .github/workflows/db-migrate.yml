@@ -1,10 +1,12 @@
 name: Apply DB migrations
 
-# Applies any new supabase/migrations/*.sql to the Supabase database, so you
-# never paste SQL into the dashboard again. Runs when migrations change on main
-# (and can be run manually from the Actions tab). Migrations are idempotent, so
-# a first run that re-applies existing ones is harmless; already-applied ones
-# are then recorded and skipped next time.
+# Applies supabase/migrations/*.sql to the database with psql, in order. Every
+# migration is idempotent (IF NOT EXISTS / drop-if-exists / on conflict), so
+# re-running them is harmless — this just runs them all, oldest first, and any
+# already-applied ones no-op. No Supabase CLI, no migration bookkeeping.
+#
+# One-time setup: add repo secret SUPABASE_DB_URL = the *Session pooler*
+# connection URI (IPv4-friendly), with the password percent-encoded (@ -> %40).
 on:
   push:
     branches: [main]
@@ -17,10 +19,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: supabase/setup-cli@v1
-        with:
-          version: latest
-      - name: Push migrations
-        run: supabase db push --db-url "$SUPABASE_DB_URL"
+
+      - name: Ensure psql is available
+        run: psql --version || (sudo apt-get update && sudo apt-get install -y postgresql-client)
+
+      - name: Apply migrations
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -e
+          if [ -z "$SUPABASE_DB_URL" ]; then
+            echo "SUPABASE_DB_URL secret is not set."; exit 1
+          fi
+          for f in $(ls supabase/migrations/*.sql | sort); do
+            echo "── Applying $f"
+            psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f "$f"
+          done
+          echo "All migrations applied."
