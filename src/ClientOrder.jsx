@@ -109,6 +109,22 @@ function ClientOrder({ onExit }) {
     }
   };
 
+  // A human-readable order summary with the code at the end. decodeOrder pulls
+  // the token back out of this, so the whole message can be pasted or scanned.
+  const orderMessage = () => {
+    const who = authCustomer ? authCustomer.username : details.trim();
+    return [
+      'My self-service order' + (who ? ` — ${who}` : ''),
+      ...cartLines.map((l) => `${l.name} x${l.qty}`),
+      `Total: ${cartTotal.toLocaleString()} RWF`,
+      '',
+      'Order code (the waiter scans or enters this):',
+      qr.code,
+    ].join('\n');
+  };
+  const shareWhatsApp = () => window.open('https://wa.me/?text=' + encodeURIComponent(orderMessage()), '_blank');
+  const printQr = () => window.print();
+
   // Keep the placed round visible under "Ordered" and start a fresh round.
   const orderMore = () => {
     setOrdered((prev) => {
@@ -223,7 +239,8 @@ function ClientOrder({ onExit }) {
   // The generated-QR screen — customer shows it to the waiter.
   if (qr) {
     return (
-      <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center gap-5 font-sans px-6 py-10 text-center">
+      <>
+      <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center gap-5 font-sans px-6 py-10 text-center print:hidden">
         <h1 className="text-2xl font-extrabold text-white">Show this to the waiter</h1>
         {(authCustomer?.username || details.trim()) && (
           <p className="text-amber-300 font-bold text-lg">
@@ -255,6 +272,14 @@ function ClientOrder({ onExit }) {
 
         <p className="text-slate-500 text-sm max-w-xs">Nothing is charged until the waiter serves you.</p>
         <div className="flex flex-col gap-3 w-full max-w-xs">
+          <div className="flex gap-3">
+            <button onClick={shareWhatsApp} className="flex-1 h-12 rounded-xl bg-[#25D366] text-white font-bold active:scale-95">
+              WhatsApp
+            </button>
+            <button onClick={printQr} className="flex-1 h-12 rounded-xl bg-slate-700 text-white font-bold active:scale-95">
+              🖨️ Print
+            </button>
+          </div>
           <button onClick={orderMore} className="h-14 rounded-xl bg-amber-500 text-white font-bold active:scale-95">
             ➕ Order more
           </button>
@@ -263,6 +288,22 @@ function ClientOrder({ onExit }) {
           </button>
         </div>
       </div>
+
+      {/* Print-only ticket — shown only by window.print(). White page, so the
+          QR and code stay scannable/readable on paper. */}
+      <div className="hidden print:block p-8 text-center text-black">
+        <h2 className="text-xl font-bold mb-1">My self-service order</h2>
+        {(authCustomer?.username || details.trim()) && (
+          <p className="text-sm mb-2">{authCustomer ? authCustomer.username : details.trim()}</p>
+        )}
+        <img src={qr.dataUrl} alt="Order QR code" className="w-56 h-56 mx-auto my-3" />
+        <p className="text-sm">
+          {cartLines.reduce((s, l) => s + l.qty, 0)} item{cartLines.length === 1 ? '' : 's'} · {cartTotal.toLocaleString()} RWF
+        </p>
+        <p className="mt-3 text-[10px] font-mono break-all max-w-md mx-auto">{qr.code}</p>
+        <p className="mt-3 text-xs">Show or scan this to the waiter. Nothing is charged until served.</p>
+      </div>
+      </>
     );
   }
 

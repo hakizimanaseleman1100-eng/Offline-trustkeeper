@@ -12,16 +12,37 @@ export function encodeOrder(payload) {
   return btoa(bin);
 }
 
-// Token (or a raw JSON payload, for older codes / a pasted JSON) -> object.
-export function decodeOrder(text) {
-  const raw = String(text).trim();
+// Decode one base64 token to an order object, or null if it isn't one.
+function tryToken(s) {
   try {
-    const bin = atob(raw);
+    const bin = atob(s);
     const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
     const obj = JSON.parse(new TextDecoder().decode(bytes));
+    if (obj && typeof obj === 'object' && Array.isArray(obj.items)) return obj;
+  } catch {
+    // not a valid token
+  }
+  return null;
+}
+
+// Token, a raw JSON payload (older codes), OR a larger message that merely
+// contains the token (e.g. a shared WhatsApp text with an order summary above
+// the code) -> object. Throws if nothing decodes.
+export function decodeOrder(text) {
+  const raw = String(text).trim();
+  const whole = tryToken(raw);
+  if (whole) return whole;
+  try {
+    const obj = JSON.parse(raw);
     if (obj && typeof obj === 'object') return obj;
   } catch {
-    // Not a base64 token — fall through to plain JSON.
+    // not raw JSON either
   }
-  return JSON.parse(raw);
+  // Pull the longest base64-looking run out of a bigger message and decode it.
+  const candidates = (raw.match(/[A-Za-z0-9+/]{24,}={0,2}/g) || []).sort((a, b) => b.length - a.length);
+  for (const c of candidates) {
+    const obj = tryToken(c);
+    if (obj) return obj;
+  }
+  throw new Error('unrecognized order code');
 }
