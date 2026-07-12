@@ -124,6 +124,10 @@ function InventoryTab({ notify }) {
   const [initialStock, setInitialStock] = useState('');
   // Inline editing of catalog fields (name/price/cost/category/tax).
   const [edit, setEdit] = useState(null);
+  // Excel/CSV import: parsed preview rows and how to apply the stock column.
+  const [importRows, setImportRows] = useState(null);
+  const [importing, setImporting] = useState(false);
+  const [stockMode, setStockMode] = useState('set'); // 'set' (opening) | 'add' (restock)
 
   const loadProducts = async () => {
     const { data, error } = await supabase.from('products').select('*').order('item_name');
@@ -182,6 +186,120 @@ function InventoryTab({ notify }) {
       return false;
     }
     return true;
+  };
+
+  // ---- Excel / CSV import ---------------------------------------------------
+  const downloadTemplate = () => {
+    const csv =
+      'Item,Price,Cost,Category,Tax,Quantity\n' +
+      'Primus 50,1800,1500,Bar,B,30\n' +
+      'Coca-Cola 33cl,800,500,Bar,C,50\n';
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'stock-template.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // Reads the sheet, matches rows to existing products by name, and builds a
+  // preview with per-row status/errors. Nothing is written until Apply.
+  const handleImportFile = async (file) => {
+    try {
+      const XLSX = await import('xlsx'); // loaded on demand so it never bloats the app
+      const wb = XLSX.read(await file.arrayBuffer());
+      const raw = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
+      const byName = Object.fromEntries(products.map((p) => [p.item_name.trim().toLowerCase(), p]));
+
+      const rows = raw
+        .map((r) => {
+          const get = (re) => {
+            const key = Object.keys(r).find((k) => re.test(k));
+            return key ? String(r[key]).trim() : '';
+          };
+          const name = get(/item|name|ibicuruzwa/i);
+          const price = get(/price|ibiciro|selling/i);
+          const cost = get(/cost/i);
+          const category = get(/categ/i);
+          let tax = get(/tax/i).toUpperCase().replace(/[^ABCD]/g, '').slice(0, 1);
+          const qty = get(/qty|quantity|stock|ibyinjiye|yatangiranye/i);
+          if (!name && !price && !cost && !category && !qty) return null; // blank row
+
+          const existing = byName[name.toLowerCase()];
+          if (!tax) tax = existing?.tax_label ?? 'B';
+          let error = '';
+          if (!name) error = 'Missing item name';
+          else if (!existing && (price === '' || Number.isNaN(Number(price)))) error = 'New item needs a numeric price';
+          else if (price !== '' && Number.isNaN(Number(price))) error = 'Price is not a number';
+          else if (qty !== '' && Number.isNaN(Number(qty))) error = 'Quantity is not a number';
+
+          return { name, price, cost, category, tax, qty, existing, error, action: existing ? 'update' : 'create' };
+        })
+        .filter(Boolean);
+
+      if (rows.length === 0) {
+        notify('No rows found in that file');
+        return;
+      }
+      setImportRows(rows);
+    } catch (err) {
+      notify(`Could not read file: ${err.message}`);
+    }
+  };
+
+  const applyImport = async () => {
+    setImporting(true);
+    const valid = importRows.filter((r) => !r.error);
+    let created = 0, updated = 0;
+    for (const r of valid) {
+      let productId;
+      let currentStock = 0;
+      if (r.action === 'create') {
+        const { data, error } = await supabase
+          .from('products')
+          .insert({
+            business_id: getBusinessId(),
+            item_name: r.name,
+            unit_price: Number(r.price) || 0,
+            cost_price: Number(r.cost) || 0,
+            category: r.category || '',
+            tax_label: r.tax,
+            tax_rate: taxRateFor(r.tax),
+          })
+          .select('id')
+          .single();
+        if (error) {
+          notify(`Failed on ${r.name}: ${error.message}`);
+          continue;
+        }
+        productId = data.id;
+        created++;
+      } else {
+        productId = r.existing.id;
+        currentStock = stockMap[String(productId)] ?? 0;
+        const fields = { tax_label: r.tax, tax_rate: taxRateFor(r.tax) };
+        if (r.price !== '') fields.unit_price = Number(r.price);
+        if (r.cost !== '') fields.cost_price = Number(r.cost);
+        if (r.category !== '') fields.category = r.category;
+        const { error } = await supabase.from('products').update(fields).eq('id', productId);
+        if (error) {
+          notify(`Failed on ${r.name}: ${error.message}`);
+          continue;
+        }
+        updated++;
+      }
+      // Apply the stock column to the selected station (Set = target, Add = restock).
+      if (r.qty !== '' && selectedStation) {
+        const target = Number(r.qty);
+        const delta = stockMode === 'set' ? target - currentStock : target;
+        if (delta !== 0) await applyStock(productId, delta, delta > 0 ? 'issue' : 'adjust');
+      }
+    }
+    setImporting(false);
+    setImportRows(null);
+    notify(`Imported: ${created} new, ${updated} updated`);
+    loadProducts();
+    loadStock(selectedStation);
   };
 
   const handleAddProduct = async (e) => {
@@ -329,6 +447,46 @@ function InventoryTab({ notify }) {
         </button>
       </form>
 
+      {/* Bulk import from Excel/CSV */}
+      <div className="bg-white rounded-2xl shadow-md p-6 space-y-3">
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <p className="font-semibold text-slate-700">Import from Excel / CSV</p>
+            <p className="text-sm text-slate-400">
+              Bulk add products &amp; stock.{' '}
+              <button type="button" onClick={downloadTemplate} className="text-amber-600 underline font-semibold">
+                Download template
+              </button>
+            </p>
+          </div>
+          <div className="flex items-center gap-1 bg-slate-100 rounded-lg p-1">
+            <button
+              type="button"
+              onClick={() => setStockMode('set')}
+              className={`px-3 py-1.5 rounded-md text-sm font-semibold ${stockMode === 'set' ? 'bg-white shadow text-slate-800' : 'text-slate-500'}`}
+            >
+              Set stock
+            </button>
+            <button
+              type="button"
+              onClick={() => setStockMode('add')}
+              className={`px-3 py-1.5 rounded-md text-sm font-semibold ${stockMode === 'add' ? 'bg-white shadow text-slate-800' : 'text-slate-500'}`}
+            >
+              Add (restock)
+            </button>
+          </div>
+        </div>
+        <input
+          type="file"
+          accept=".xlsx,.xls,.csv"
+          onChange={(e) => e.target.files?.[0] && handleImportFile(e.target.files[0]) && (e.target.value = '')}
+          className="block w-full text-sm text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-amber-500 file:text-white file:font-semibold"
+        />
+        {!selectedStation && (
+          <p className="text-xs text-amber-600">Stock column is ignored until a station is selected above.</p>
+        )}
+      </div>
+
       <div className="bg-white rounded-2xl shadow-md overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-left">
@@ -406,6 +564,76 @@ function InventoryTab({ notify }) {
         </div>
         {products.length === 0 && <p className="px-5 py-6 text-slate-400">No products yet.</p>}
       </div>
+
+      {/* Import preview — review before anything is written */}
+      {importRows && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center p-4" onClick={() => !importing && setImportRows(null)}>
+          <div className="absolute inset-0 bg-black/40" />
+          <div onClick={(e) => e.stopPropagation()} className="relative bg-white rounded-2xl shadow-xl w-full max-w-2xl max-h-[85vh] flex flex-col">
+            <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
+              <h3 className="font-extrabold text-lg text-slate-900">Import preview</h3>
+              <button onClick={() => !importing && setImportRows(null)} className="text-slate-400 text-2xl leading-none w-8 h-8">×</button>
+            </div>
+            <div className="px-5 py-2 text-sm text-slate-500 border-b border-gray-100">
+              {importRows.filter((r) => !r.error && r.action === 'create').length} new ·{' '}
+              {importRows.filter((r) => !r.error && r.action === 'update').length} update ·{' '}
+              <span className={importRows.some((r) => r.error) ? 'text-red-600 font-semibold' : ''}>
+                {importRows.filter((r) => r.error).length} error
+              </span>
+              {' · '}stock: {stockMode === 'set' ? 'set to value' : 'add (restock)'}
+              {selectedStation ? '' : ' — no station, stock skipped'}
+            </div>
+            <div className="overflow-auto flex-1">
+              <table className="w-full text-left text-sm">
+                <thead className="text-slate-400 text-xs uppercase sticky top-0 bg-white">
+                  <tr>
+                    <th className="px-4 py-2">Item</th>
+                    <th className="px-4 py-2">Price</th>
+                    <th className="px-4 py-2">Tax</th>
+                    <th className="px-4 py-2">Qty</th>
+                    <th className="px-4 py-2">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {importRows.map((r, i) => (
+                    <tr key={i} className={r.error ? 'bg-red-50' : ''}>
+                      <td className="px-4 py-2 font-semibold text-slate-700">{r.name || '—'}</td>
+                      <td className="px-4 py-2 text-slate-500">{r.price || (r.action === 'update' ? '(keep)' : '')}</td>
+                      <td className="px-4 py-2 text-slate-500">{r.tax}</td>
+                      <td className="px-4 py-2 text-slate-500">{r.qty || ''}</td>
+                      <td className="px-4 py-2">
+                        {r.error ? (
+                          <span className="text-red-600 font-semibold">{r.error}</span>
+                        ) : r.action === 'create' ? (
+                          <span className="text-emerald-600 font-semibold">New</span>
+                        ) : (
+                          <span className="text-slate-500">Update</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="p-4 border-t border-gray-100 flex gap-3">
+              <button
+                onClick={() => setImportRows(null)}
+                disabled={importing}
+                className="flex-1 h-11 rounded-xl bg-slate-100 text-slate-600 font-bold active:scale-95 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={applyImport}
+                disabled={importing || importRows.every((r) => r.error)}
+                className="flex-1 h-11 rounded-xl bg-amber-500 text-white font-bold active:scale-95 disabled:opacity-50"
+              >
+                {importing ? 'Importing…' : `Apply ${importRows.filter((r) => !r.error).length} rows`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
