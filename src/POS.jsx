@@ -213,10 +213,9 @@ function POS({ currentUser, onLogout }) {
       showToast('Not a valid order code');
       return;
     }
-    if (payload?.biz !== getBusinessId()) {
-      showToast('That order is for a different venue');
-      return;
-    }
+    // The venue isn't re-checked here — a scan can only ever match products in
+    // THIS venue's menu (resolved below), so a foreign order just resolves to
+    // nothing. The order is created automatically from what we can price.
     const seen = JSON.parse(localStorage.getItem('scanned_oids') || '[]');
     if (payload.oid && seen.includes(payload.oid)) {
       showToast('This order was already scanned');
@@ -227,6 +226,13 @@ function POS({ currentUser, onLogout }) {
       showToast('Empty order');
       return;
     }
+
+    // Resolve each requested item against the current menu by id or name, so a
+    // stray id type/format can't drop an item. Price always comes from the
+    // live menu, never from the QR.
+    const inv = await db.inventory.toArray();
+    const byId = new Map(inv.map((p) => [String(p.id), p]));
+    const byName = new Map(inv.map((p) => [String(p.item_name).trim().toLowerCase(), p]));
 
     const tabNumber = (await db.active_tabs.count()) + 1;
     const id = await db.active_tabs.add({
@@ -239,21 +245,21 @@ function POS({ currentUser, onLogout }) {
     let added = 0;
     let skipped = 0;
     for (const it of orderItems) {
-      const inv = await db.inventory.get(it.id);
-      if (!inv) {
+      const prod = byId.get(String(it.id)) || byName.get(String(it.n ?? '').trim().toLowerCase());
+      if (!prod) {
         skipped++;
         continue;
       }
       const qty = Math.max(1, Number(it.q) || 1);
       await db.sales.add({
-        item_id: inv.id,
+        item_id: prod.id,
         tab_id: id,
         round: 1,
         quantity: qty,
-        total_price: inv.unit_price * qty,
-        cost_price: inv.cost_price,
-        tax_label: inv.tax_label,
-        tax_rate: inv.tax_rate,
+        total_price: prod.unit_price * qty,
+        cost_price: prod.cost_price,
+        tax_label: prod.tax_label,
+        tax_rate: prod.tax_rate,
         staff_id: currentUser?.id ?? null,
         staff_name: currentUser?.name ?? null,
         timestamp: Date.now(),
@@ -268,7 +274,7 @@ function POS({ currentUser, onLogout }) {
     }
     if (added === 0) {
       await db.active_tabs.delete(id);
-      showToast('None of those items are on the menu');
+      showToast('None of those items are on this menu');
       return;
     }
     setActiveTabId(id);

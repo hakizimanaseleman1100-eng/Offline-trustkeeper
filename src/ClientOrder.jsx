@@ -15,7 +15,10 @@ function ClientOrder({ onExit }) {
 
   const categories = useLiveQuery(() => db.inventory.orderBy('category').uniqueKeys(), [], []);
   const allItems = useLiveQuery(() => db.inventory.toArray(), [], []);
+  // The menu is exactly the venue's product list (for ordering only — this
+  // screen never touches stock). Active items only.
   const items = allItems.filter((it) => {
+    if (it.active === false) return false;
     const matchesCategory = selectedCategory === 'All' || it.category === selectedCategory;
     const matchesSearch = it.item_name.toLowerCase().includes(search.toLowerCase());
     return matchesCategory && matchesSearch;
