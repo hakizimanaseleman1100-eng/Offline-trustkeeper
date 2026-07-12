@@ -238,6 +238,7 @@ function POS({ currentUser, onLogout }) {
     // already carries the same detail, this order stacks onto it (as the tab's
     // current, unsent round) instead of opening a separate tab.
     const detail = String(payload.details ?? '').trim();
+    const cust = payload.cust ?? null; // { id, u } when the customer was signed in
     let existingTab = null;
     if (detail) {
       existingTab = await db.active_tabs
@@ -256,6 +257,8 @@ function POS({ currentUser, onLogout }) {
       targetId = await db.active_tabs.add({
         name: detail || `Tab ${tabNumber}`,
         client_ref: detail || null,
+        customer_id: cust?.id ?? null,
+        customer_username: cust?.u ?? null,
         created_at: Date.now(),
         status: 'open',
         current_round: 1,
@@ -296,6 +299,8 @@ function POS({ currentUser, onLogout }) {
           tax_rate: prod.tax_rate,
           staff_id: currentUser?.id ?? null,
           staff_name: currentUser?.name ?? null,
+          customer_id: cust?.id ?? null,
+          customer_username: cust?.u ?? null,
           timestamp: Date.now(),
           synced_status: 0,
         });
@@ -746,6 +751,8 @@ function POS({ currentUser, onLogout }) {
           check_out_date: sale.check_out_date ?? null,
           station_id: sale.station_id ?? null,
           station_name: sale.station_name ?? null,
+          customer_id: sale.customer_id ?? null,
+          customer_username: sale.customer_username ?? null,
           timestamp: new Date(sale.timestamp).toISOString(),
         }))
       );

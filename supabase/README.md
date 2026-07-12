@@ -45,6 +45,7 @@ paste the file → **Run**. Every migration is **idempotent** (guarded with
 | `0014_default_station.sql` | Auto-provisions a default "Main" station per venue (and at signup). |
 | `0015_customers.sql` | Adds the `customers` table (CRM foundation: username/password + optional phone/email/TIN), tenant-scoped. |
 | `0016_customer_master.sql` | Adds `businesses.customer_master_hash` — the owner's master password for customer lockouts. |
+| `0017_sale_customer.sql` | Adds `customer_id` / `customer_username` to `hospitality_sales` for per-customer spend tracking. |
 
 After running `0001`, the app's PIN login and per-waiter accountability work
 end-to-end. Until then, the app falls back to a local-only default owner

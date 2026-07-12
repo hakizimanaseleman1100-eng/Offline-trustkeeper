@@ -20,7 +20,8 @@ function ClientOrder({ onExit }) {
   const [ordered, setOrdered] = useState([]); // rounds already placed, merged by item
   const [details, setDetails] = useState(''); // table number / name — groups a customer's rounds
   const [qr, setQr] = useState(null); // { dataUrl } once generated
-  const [register, setRegister] = useState(null); // null | { username, password, phone, email, tin, busy, error, done }
+  const [authCustomer, setAuthCustomer] = useState(null); // { id, username } once signed in
+  const [account, setAccount] = useState(null); // null | { mode:'register'|'signin'|'forgot', ...fields, busy, error }
 
   // The menu is exactly the venue's product list (for ordering only — this
   // screen never touches stock). Active items only.
@@ -62,7 +63,10 @@ function ClientOrder({ onExit }) {
       v: 1,
       biz: getBusinessId(),
       oid: (crypto.randomUUID?.() ?? String(Date.now())).slice(0, 12),
-      details: details.trim(),
+      // A signed-in customer groups by their username automatically, and the
+      // order is attributed to them; otherwise fall back to the typed detail.
+      details: authCustomer ? authCustomer.username : details.trim(),
+      cust: authCustomer ? { id: authCustomer.id, u: authCustomer.username } : null,
       items: cartLines.map((l) => ({ id: l.id, n: l.name, q: l.qty })),
     };
     const QRCode = await import('qrcode'); // loaded on demand
@@ -87,30 +91,84 @@ function ClientOrder({ onExit }) {
     setSelectedCategory('All');
   };
 
-  // Self-registration on the venue tablet. The tablet is signed in as the venue,
-  // so this insert is scoped to it. Password is hashed, never stored plain.
-  const submitRegister = async () => {
-    const r = register;
-    if (!r.username?.trim() || !r.password) {
-      setRegister({ ...r, error: 'Username and password are required' });
-      return;
-    }
-    setRegister({ ...r, busy: true, error: '' });
-    const pw_hash = await hashPin(r.password);
-    const { error } = await supabase.from('customers').insert({
-      business_id: getBusinessId(),
-      username: r.username.trim(),
-      pw_hash,
-      phone: r.phone?.trim() || null,
-      email: r.email?.trim() || null,
-      tin: r.tin?.trim() || null,
-      active: true,
-    });
+  // Account actions run on the venue tablet (signed in as the venue), so they
+  // query/insert the venue's own customers. Passwords are hashed, never plain.
+  const openAccount = (mode) =>
+    setAccount({ mode, username: '', password: '', phone: '', email: '', tin: '', master: '', newpw: '' });
+  const patchAccount = (patch) => setAccount((a) => ({ ...a, ...patch }));
+
+  const doRegister = async () => {
+    const a = account;
+    if (!a.username?.trim() || !a.password) return patchAccount({ error: 'Username and password are required' });
+    patchAccount({ busy: true, error: '' });
+    const pw_hash = await hashPin(a.password);
+    const { data, error } = await supabase
+      .from('customers')
+      .insert({
+        business_id: getBusinessId(),
+        username: a.username.trim(),
+        pw_hash,
+        phone: a.phone?.trim() || null,
+        email: a.email?.trim() || null,
+        tin: a.tin?.trim() || null,
+        active: true,
+      })
+      .select('id, username')
+      .single();
     if (error) {
-      setRegister({ ...r, busy: false, error: /duplicate|unique/i.test(error.message) ? 'That username is taken' : error.message });
-      return;
+      return patchAccount({ busy: false, error: /duplicate|unique/i.test(error.message) ? 'That username is taken' : error.message });
     }
-    setRegister({ ...r, busy: false, done: true });
+    setAuthCustomer({ id: data.id, username: data.username }); // auto sign-in after registering
+    setAccount(null);
+  };
+
+  const doSignin = async () => {
+    const a = account;
+    if (!a.username?.trim() || !a.password) return patchAccount({ error: 'Enter your username and password' });
+    patchAccount({ busy: true, error: '' });
+    const { data } = await supabase
+      .from('customers')
+      .select('id, username, pw_hash, active')
+      .eq('business_id', getBusinessId())
+      .ilike('username', a.username.trim())
+      .limit(1);
+    const cust = data?.[0];
+    const hash = await hashPin(a.password);
+    if (!cust || cust.active === false || cust.pw_hash !== hash) {
+      return patchAccount({ busy: false, error: 'Wrong username or password' });
+    }
+    setAuthCustomer({ id: cust.id, username: cust.username });
+    setAccount(null);
+  };
+
+  // Forgot password: verified with the venue's master password (from staff),
+  // then the customer sets a new one and is signed in.
+  const doForgot = async () => {
+    const a = account;
+    if (!a.username?.trim() || !a.master || !a.newpw) return patchAccount({ error: 'Fill in all fields' });
+    patchAccount({ busy: true, error: '' });
+    const [bizRes, custRes] = await Promise.all([
+      supabase.from('businesses').select('customer_master_hash').eq('id', getBusinessId()).single(),
+      supabase.from('customers').select('id, username, active').eq('business_id', getBusinessId()).ilike('username', a.username.trim()).limit(1),
+    ]);
+    const cust = custRes.data?.[0];
+    const masterHash = bizRes.data?.customer_master_hash;
+    if (!masterHash || (await hashPin(a.master)) !== masterHash) {
+      return patchAccount({ busy: false, error: 'Master password is incorrect — ask staff' });
+    }
+    if (!cust || cust.active === false) {
+      return patchAccount({ busy: false, error: 'No such customer' });
+    }
+    const pw_hash = await hashPin(a.newpw);
+    const { error } = await supabase.from('customers').update({ pw_hash }).eq('id', cust.id);
+    if (error) return patchAccount({ busy: false, error: error.message });
+    setAuthCustomer({ id: cust.id, username: cust.username });
+    setAccount(null);
+  };
+
+  const signOutCustomer = () => {
+    setAuthCustomer(null);
+    finish();
   };
 
   // Clear everything for the next customer.
@@ -128,7 +186,11 @@ function ClientOrder({ onExit }) {
     return (
       <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center gap-5 font-sans px-6 py-10 text-center">
         <h1 className="text-2xl font-extrabold text-white">Show this to the waiter</h1>
-        {details.trim() && <p className="text-amber-300 font-bold text-lg">{details.trim()}</p>}
+        {(authCustomer?.username || details.trim()) && (
+          <p className="text-amber-300 font-bold text-lg">
+            {authCustomer ? `👤 ${authCustomer.username}` : details.trim()}
+          </p>
+        )}
         <img src={qr.dataUrl} alt="Order QR code" className="w-60 h-60 bg-white p-3 rounded-2xl" />
         <p className="text-slate-300">
           This round: {cartLines.reduce((s, l) => s + l.qty, 0)} item{cartLines.length === 1 ? '' : 's'} · {cartTotal.toLocaleString()} RWF
@@ -187,64 +249,97 @@ function ClientOrder({ onExit }) {
   return (
     <div className="min-h-screen bg-gray-50 font-sans pb-28 lg:pb-8">
       <header className="bg-slate-900 text-white px-4 sm:px-6 lg:px-10 py-3 flex justify-between items-center shadow-lg">
-        <h1 className="text-lg sm:text-2xl font-extrabold tracking-tight">Order Here 🙋</h1>
+        <div className="min-w-0">
+          <h1 className="text-lg sm:text-2xl font-extrabold tracking-tight">Order Here 🙋</h1>
+          {authCustomer && <p className="text-[11px] text-amber-300 truncate">👤 {authCustomer.username}</p>}
+        </div>
         <div className="flex items-center gap-2">
-          <button
-            onClick={() => setRegister({ username: '', password: '', phone: '', email: '', tin: '' })}
-            className="px-3 py-1.5 rounded-lg bg-amber-500 text-sm font-semibold active:scale-95"
-          >
-            Register
-          </button>
+          {authCustomer ? (
+            <button onClick={signOutCustomer} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
+              Sign out
+            </button>
+          ) : (
+            <>
+              <button onClick={() => openAccount('signin')} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
+                Sign in
+              </button>
+              <button onClick={() => openAccount('register')} className="px-3 py-1.5 rounded-lg bg-amber-500 text-sm font-semibold active:scale-95">
+                Register
+              </button>
+            </>
+          )}
           <button onClick={onExit} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
             Exit
           </button>
         </div>
       </header>
 
-      {/* Self-registration modal */}
-      {register && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center p-4" onClick={() => !register.busy && setRegister(null)}>
+      {/* Account modal — register / sign in / forgot password */}
+      {account && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center p-4" onClick={() => !account.busy && setAccount(null)}>
           <div className="absolute inset-0 bg-black/50" />
           <div onClick={(e) => e.stopPropagation()} className="relative bg-white rounded-2xl shadow-xl w-full max-w-sm p-6 space-y-3">
-            {register.done ? (
-              <div className="text-center space-y-3">
-                <p className="text-4xl">✅</p>
-                <p className="font-extrabold text-lg text-slate-900">You’re registered!</p>
-                <p className="text-slate-500 text-sm">Next time you can sign in with your username and password.</p>
-                <button onClick={() => setRegister(null)} className="w-full h-11 rounded-xl bg-amber-500 text-white font-bold active:scale-95">
-                  Done
-                </button>
-              </div>
-            ) : (
+            <div className="flex items-center justify-between">
+              <h3 className="font-extrabold text-lg text-slate-900">
+                {account.mode === 'register' ? 'Create your account' : account.mode === 'forgot' ? 'Reset password' : 'Sign in'}
+              </h3>
+              <button onClick={() => setAccount(null)} className="text-slate-400 text-2xl leading-none w-8 h-8">×</button>
+            </div>
+
+            {account.mode === 'register' && (
               <>
-                <div className="flex items-center justify-between">
-                  <h3 className="font-extrabold text-lg text-slate-900">Create your account</h3>
-                  <button onClick={() => setRegister(null)} className="text-slate-400 text-2xl leading-none w-8 h-8">×</button>
-                </div>
                 <p className="text-sm text-slate-500">Choose a username &amp; password. Phone, email and TIN are optional.</p>
-                <input placeholder="Username" value={register.username} onChange={(e) => setRegister({ ...register, username: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
-                <input type="password" placeholder="Password" value={register.password} onChange={(e) => setRegister({ ...register, password: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
-                <input placeholder="Phone (optional)" value={register.phone} onChange={(e) => setRegister({ ...register, phone: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
-                <input type="email" placeholder="Email (optional)" value={register.email} onChange={(e) => setRegister({ ...register, email: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
-                <input placeholder="TIN (optional)" value={register.tin} onChange={(e) => setRegister({ ...register, tin: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
-                {register.error && <p className="text-red-600 text-sm">{register.error}</p>}
-                <button onClick={submitRegister} disabled={register.busy} className="w-full h-12 rounded-xl bg-slate-900 text-white font-bold active:scale-95 disabled:opacity-50">
-                  {register.busy ? 'Creating…' : 'Create account'}
+                <input placeholder="Username" value={account.username} onChange={(e) => patchAccount({ username: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+                <input type="password" placeholder="Password" value={account.password} onChange={(e) => patchAccount({ password: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+                <input placeholder="Phone (optional)" value={account.phone} onChange={(e) => patchAccount({ phone: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+                <input type="email" placeholder="Email (optional)" value={account.email} onChange={(e) => patchAccount({ email: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+                <input placeholder="TIN (optional)" value={account.tin} onChange={(e) => patchAccount({ tin: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+              </>
+            )}
+
+            {account.mode === 'signin' && (
+              <>
+                <input placeholder="Username" value={account.username} onChange={(e) => patchAccount({ username: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+                <input type="password" placeholder="Password" value={account.password} onChange={(e) => patchAccount({ password: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+                <button onClick={() => patchAccount({ mode: 'forgot', error: '' })} className="text-slate-500 text-sm underline">
+                  Forgot password?
                 </button>
               </>
             )}
+
+            {account.mode === 'forgot' && (
+              <>
+                <p className="text-sm text-slate-500">Ask staff for the venue master password, then set a new password.</p>
+                <input placeholder="Username" value={account.username} onChange={(e) => patchAccount({ username: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+                <input type="password" placeholder="Master password (from staff)" value={account.master} onChange={(e) => patchAccount({ master: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+                <input type="password" placeholder="New password" value={account.newpw} onChange={(e) => patchAccount({ newpw: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+              </>
+            )}
+
+            {account.error && <p className="text-red-600 text-sm">{account.error}</p>}
+            <button
+              onClick={account.mode === 'register' ? doRegister : account.mode === 'forgot' ? doForgot : doSignin}
+              disabled={account.busy}
+              className="w-full h-12 rounded-xl bg-slate-900 text-white font-bold active:scale-95 disabled:opacity-50"
+            >
+              {account.busy ? 'Please wait…' : account.mode === 'register' ? 'Create account' : account.mode === 'forgot' ? 'Reset & sign in' : 'Sign in'}
+            </button>
           </div>
         </div>
       )}
 
       <main className="p-3 sm:p-5 lg:p-8 max-w-7xl mx-auto">
-        <input
-          type="text"
-          value={details}
-          onChange={(e) => setDetails(e.target.value)}
-          placeholder="Table number or your name (so the waiter can bring more to the same table)"
-          className="w-full mb-3 lg:mb-4 px-4 lg:px-5 py-3 rounded-xl border border-gray-300 text-sm lg:text-base shadow-sm"
-        />
+        {authCustomer ? (
+          <p className="mb-3 lg:mb-4 text-slate-500 text-sm">Ordering as <span className="font-bold text-slate-800">{authCustomer.username}</span> — your rounds go to your tab automatically.</p>
+        ) : (
+          <input
+            type="text"
+            value={details}
+            onChange={(e) => setDetails(e.target.value)}
+            placeholder="Table number or your name (so the waiter can bring more to the same table)"
+            className="w-full mb-3 lg:mb-4 px-4 lg:px-5 py-3 rounded-xl border border-gray-300 text-sm lg:text-base shadow-sm"
+          />
+        )}
         <div className="lg:flex lg:gap-6 lg:items-start">
           <div className="lg:flex-1 min-w-0 space-y-3">
             <input
