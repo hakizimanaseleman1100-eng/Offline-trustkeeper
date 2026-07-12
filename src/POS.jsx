@@ -731,6 +731,206 @@ function POS({ currentUser, onLogout }) {
     );
   }
 
+  // The running order (grouped by round) — shared by the mobile cart drawer and
+  // the desktop cart panel so there's one source of truth for the layout.
+  const orderList =
+    cartItems.length === 0 ? (
+      <p className="text-slate-400 text-lg p-5">Nothing added yet.</p>
+    ) : (
+      roundNumbers.map((r) => (
+        <div key={r} className="divide-y divide-gray-100">
+          <p className="text-xs font-bold uppercase text-slate-400 px-5 pt-4 pb-1">
+            {r === currentRound ? 'Current Round' : `Round ${r} — sent`}
+          </p>
+          {roundsMap[r].map((row) => (
+            <div key={row.id} className="flex items-center justify-between px-5 py-3 gap-3">
+              <span className="font-semibold text-slate-800 text-base flex-1 min-w-0">{row.name}</span>
+              <div className="flex items-center gap-3 shrink-0">
+                {r === currentRound ? (
+                  <div className="flex items-center gap-1 bg-slate-100 rounded-full px-1">
+                    <button
+                      onClick={() => changeQuantity(row, -1)}
+                      aria-label={`Decrease ${row.name}`}
+                      className="w-7 h-7 rounded-full font-bold text-slate-700 active:scale-95"
+                    >
+                      −
+                    </button>
+                    <span className="w-6 text-center font-semibold text-sm">{row.quantity ?? 1}</span>
+                    <button
+                      onClick={() => changeQuantity(row, 1)}
+                      aria-label={`Increase ${row.name}`}
+                      className="w-7 h-7 rounded-full font-bold text-slate-700 active:scale-95"
+                    >
+                      +
+                    </button>
+                  </div>
+                ) : (
+                  // Already sent to kitchen/bar — quantity is locked, no silent edits after the fact.
+                  <span className="text-sm text-slate-400 font-semibold px-2">x{row.quantity ?? 1}</span>
+                )}
+                <span className="text-slate-500 w-20 text-right text-sm">{row.total_price.toLocaleString()} RWF</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      ))
+    );
+
+  // Send round / details / discount, the optional panels, and the pay buttons.
+  const cartControls = (
+    <>
+      <div className="flex items-center gap-4">
+        <button
+          onClick={sendRound}
+          disabled={!roundsMap[currentRound]?.length}
+          aria-label={`Send Round ${currentRound} to Kitchen/Bar`}
+          className="flex flex-col items-center gap-0.5 disabled:opacity-40 active:scale-95"
+        >
+          <span className="w-11 h-11 rounded-full bg-slate-900 text-white flex items-center justify-center text-lg">📨</span>
+          <span className="text-[10px] font-semibold text-slate-500">Send Round {currentRound}</span>
+        </button>
+        <button
+          onClick={() => setShowCustomerDetails((open) => !open)}
+          aria-label="Customer details"
+          className="flex flex-col items-center gap-0.5 active:scale-95"
+        >
+          <span
+            className={`w-11 h-11 rounded-full flex items-center justify-center text-lg ${
+              showCustomerDetails ? 'bg-amber-500 text-white' : 'bg-slate-100 text-slate-600'
+            }`}
+          >
+            🚩
+          </span>
+          <span className="text-[10px] font-semibold text-slate-500">Details</span>
+        </button>
+        <button
+          onClick={() => setShowDiscount((open) => !open)}
+          aria-label="Discount"
+          className="flex flex-col items-center gap-0.5 active:scale-95"
+        >
+          <span
+            className={`w-11 h-11 rounded-full flex items-center justify-center text-lg ${
+              discountAmount > 0 || showDiscount ? 'bg-amber-500 text-white' : 'bg-slate-100 text-slate-600'
+            }`}
+          >
+            🏷️
+          </span>
+          <span className="text-[10px] font-semibold text-slate-500">Discount</span>
+        </button>
+      </div>
+
+      {showDiscount && (
+        <div className="space-y-2">
+          <div className="flex gap-2">
+            {[5, 10, 15].map((pct) => (
+              <button
+                key={pct}
+                onClick={() => setTabDiscount({ mode: 'percent', value: pct })}
+                className={`flex-1 h-10 rounded-xl font-semibold text-sm active:scale-95 ${
+                  discount?.mode === 'percent' && discount.value === pct
+                    ? 'bg-amber-500 text-white'
+                    : 'bg-slate-100 text-slate-600'
+                }`}
+              >
+                {pct}%
+              </button>
+            ))}
+            <button
+              onClick={() => setTabDiscount(null)}
+              className="flex-1 h-10 rounded-xl font-semibold text-sm bg-slate-100 text-slate-600 active:scale-95"
+            >
+              Clear
+            </button>
+          </div>
+          <input
+            type="number"
+            inputMode="numeric"
+            placeholder="Or a fixed amount off (RWF)"
+            value={discount?.mode === 'amount' ? discount.value : ''}
+            onChange={(e) => setTabDiscount(e.target.value ? { mode: 'amount', value: Number(e.target.value) } : null)}
+            className="w-full px-4 py-2 rounded-xl border border-gray-300 text-base"
+          />
+        </div>
+      )}
+
+      {showCustomerDetails && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <input
+            type="text"
+            placeholder="Table / Guest name"
+            defaultValue={activeTab?.name ?? ''}
+            onChange={(e) => renameTab(e.target.value)}
+            className="px-4 py-3 rounded-xl border border-gray-300 text-lg sm:col-span-2"
+          />
+          <input
+            type="number"
+            inputMode="numeric"
+            min="1"
+            placeholder="Guests (covers)"
+            value={activeTab?.guest_count ?? ''}
+            onChange={(e) =>
+              db.active_tabs.update(activeTabId, { guest_count: e.target.value ? Number(e.target.value) : null })
+            }
+            className="px-4 py-3 rounded-xl border border-gray-300 text-lg sm:col-span-2"
+          />
+          <input
+            type="text"
+            inputMode="numeric"
+            placeholder="Customer TIN"
+            value={customerTin}
+            onChange={(e) => setCustomerTin(e.target.value)}
+            className="px-4 py-3 rounded-xl border border-gray-300 text-lg"
+          />
+          <input
+            type="tel"
+            placeholder="Customer Phone"
+            value={customerPhone}
+            onChange={(e) => setCustomerPhone(e.target.value)}
+            className="px-4 py-3 rounded-xl border border-gray-300 text-lg"
+          />
+        </div>
+      )}
+
+      {momoPrompt ? (
+        <div className="space-y-3 pt-1">
+          <input
+            type="text"
+            autoFocus
+            placeholder="MoMo transaction ref (e.g. AE1234567)"
+            value={momoRef}
+            onChange={(e) => setMomoRef(e.target.value)}
+            className="w-full px-4 py-3 rounded-xl border border-gray-300 text-lg"
+          />
+          <div className="grid grid-cols-2 gap-3">
+            <button onClick={() => setMomoPrompt(false)} className="h-14 rounded-xl font-bold bg-slate-100 text-slate-600 active:scale-95">
+              ← Back
+            </button>
+            <button onClick={() => checkout('momo', momoRef)} className="h-14 rounded-xl font-bold bg-yellow-400 text-slate-900 active:scale-95">
+              {momoRef ? 'Confirm MoMo' : 'Skip & Close'}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 gap-3 pt-1">
+          <button
+            onClick={() => checkout('cash')}
+            disabled={cartItems.length === 0}
+            className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-green-600 text-white transition active:scale-95 disabled:opacity-40"
+          >
+            PAY CASH
+          </button>
+          <button
+            onClick={() => setMomoPrompt(true)}
+            disabled={cartItems.length === 0}
+            className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-yellow-400 text-slate-900 transition active:scale-95 disabled:opacity-40"
+          >
+            MOMO
+          </button>
+        </div>
+      )}
+    </>
+  );
+
   return (
     <>
     <div className="min-h-screen bg-gray-50 font-sans pb-20 print:hidden">
@@ -864,6 +1064,8 @@ function POS({ currentUser, onLogout }) {
               </button>
             </div>
 
+            <div className="lg:flex lg:gap-6 lg:items-start">
+              <div className="lg:flex-1 min-w-0 space-y-3 lg:space-y-4">
             {categories.length === 0 ? (
               <p className="text-slate-400 text-lg">No inventory yet — connect to the internet to sync products.</p>
             ) : (
@@ -911,7 +1113,7 @@ function POS({ currentUser, onLogout }) {
                 {items.length === 0 ? (
                   <p className="text-slate-400 text-lg">No items match.</p>
                 ) : (
-                  <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-7 gap-2 sm:gap-3 lg:gap-4">
+                  <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-2 sm:gap-3 lg:gap-4">
                     {items.map((item) => {
                       // Stock is per station. undefined = not tracked at this
                       // station (always sellable, e.g. rooms/services).
@@ -946,6 +1148,24 @@ function POS({ currentUser, onLogout }) {
                 )}
               </>
             )}
+              </div>
+
+              {/* Desktop cart panel — the order builds live beside the items,
+                  no icon/drawer needed on big screens. */}
+              <aside className="hidden lg:flex lg:flex-col lg:w-96 lg:shrink-0 lg:sticky lg:top-4 bg-white rounded-2xl shadow-md overflow-hidden max-h-[calc(100vh-7rem)]">
+                <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 shrink-0">
+                  <h3 className="text-lg font-extrabold text-slate-900 truncate">{activeTab?.name} — Order</h3>
+                  <button
+                    onClick={() => { setShowBill(true); ensureReceiptNo(activeTabId); }}
+                    className="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-700 text-sm font-semibold active:scale-95 shrink-0"
+                  >
+                    🧾 Bill
+                  </button>
+                </div>
+                <div className="overflow-y-auto flex-1">{orderList}</div>
+                <div className="p-3 border-t border-gray-100 space-y-3 shrink-0">{cartControls}</div>
+              </aside>
+            </div>
 
           </div>
         )}
@@ -954,7 +1174,7 @@ function POS({ currentUser, onLogout }) {
       {/* Bottom icon bar — Void lives up top next to the total, away from these
           two high-frequency buttons so it can't be mis-tapped in the same row */}
       {activeTabId !== null && (
-        <footer className="fixed bottom-0 left-0 right-0 z-20 bg-white border-t border-gray-200 shadow-[0_-4px_12px_rgba(0,0,0,0.08)] grid grid-cols-2 max-w-7xl mx-auto">
+        <footer className="lg:hidden fixed bottom-0 left-0 right-0 z-20 bg-white border-t border-gray-200 shadow-[0_-4px_12px_rgba(0,0,0,0.08)] grid grid-cols-2 max-w-7xl mx-auto">
           <button
             onClick={() => setCartOpen(true)}
             className="h-16 lg:h-20 flex flex-col items-center justify-center gap-0.5 text-slate-700 active:scale-95 relative"
@@ -980,16 +1200,16 @@ function POS({ currentUser, onLogout }) {
         </footer>
       )}
 
-      {/* Cart drawer — replaces the old inline list; grouped by round */}
+      {/* Cart drawer — mobile only; on desktop the cart is the side panel */}
       {activeTabId !== null && cartOpen && (
         <div
-          className="fixed inset-0 z-30 flex flex-col justify-end lg:items-center lg:justify-center"
+          className="lg:hidden fixed inset-0 z-30 flex flex-col justify-end"
           onClick={() => setCartOpen(false)}
         >
           <div className="absolute inset-0 bg-black/40" />
           <div
             onClick={(e) => e.stopPropagation()}
-            className="relative bg-white rounded-t-3xl lg:rounded-3xl shadow-xl max-h-[75vh] lg:max-h-[85vh] w-full lg:max-w-lg flex flex-col"
+            className="relative bg-white rounded-t-3xl shadow-xl max-h-[80vh] w-full flex flex-col"
           >
             <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
               <h3 className="text-xl font-extrabold text-slate-900">{activeTab?.name} — Order</h3>
@@ -1002,218 +1222,8 @@ function POS({ currentUser, onLogout }) {
               </button>
             </div>
 
-            <div className="overflow-y-auto flex-1">
-              {cartItems.length === 0 ? (
-                <p className="text-slate-400 text-lg p-5">Nothing added yet.</p>
-              ) : (
-                roundNumbers.map((r) => (
-                  <div key={r} className="divide-y divide-gray-100">
-                    <p className="text-xs font-bold uppercase text-slate-400 px-5 pt-4 pb-1">
-                      {r === currentRound ? 'Current Round' : `Round ${r} — sent`}
-                    </p>
-                    {roundsMap[r].map((row) => (
-                      <div key={row.id} className="flex items-center justify-between px-5 py-3 gap-3">
-                        <span className="font-semibold text-slate-800 text-base flex-1 min-w-0">{row.name}</span>
-                        <div className="flex items-center gap-3 shrink-0">
-                          {r === currentRound ? (
-                            <div className="flex items-center gap-1 bg-slate-100 rounded-full px-1">
-                              <button
-                                onClick={() => changeQuantity(row, -1)}
-                                aria-label={`Decrease ${row.name}`}
-                                className="w-7 h-7 rounded-full font-bold text-slate-700 active:scale-95"
-                              >
-                                −
-                              </button>
-                              <span className="w-6 text-center font-semibold text-sm">{row.quantity ?? 1}</span>
-                              <button
-                                onClick={() => changeQuantity(row, 1)}
-                                aria-label={`Increase ${row.name}`}
-                                className="w-7 h-7 rounded-full font-bold text-slate-700 active:scale-95"
-                              >
-                                +
-                              </button>
-                            </div>
-                          ) : (
-                            // Already sent to kitchen/bar — quantity is locked, no silent edits after the fact.
-                            <span className="text-sm text-slate-400 font-semibold px-2">x{row.quantity ?? 1}</span>
-                          )}
-                          <span className="text-slate-500 w-20 text-right text-sm">{row.total_price.toLocaleString()} RWF</span>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ))
-              )}
-            </div>
-
-            <div className="p-4 border-t border-gray-100 space-y-3">
-              {/* Send Round and Customer Details as a pair of icon buttons —
-                  a full-width "Send Round" button here used to dominate the
-                  drawer and crowd the cart list above it. */}
-              <div className="flex items-center gap-4">
-                <button
-                  onClick={sendRound}
-                  disabled={!roundsMap[currentRound]?.length}
-                  aria-label={`Send Round ${currentRound} to Kitchen/Bar`}
-                  className="flex flex-col items-center gap-0.5 disabled:opacity-40 active:scale-95"
-                >
-                  <span className="w-11 h-11 rounded-full bg-slate-900 text-white flex items-center justify-center text-lg">
-                    📨
-                  </span>
-                  <span className="text-[10px] font-semibold text-slate-500">Send Round {currentRound}</span>
-                </button>
-                <button
-                  onClick={() => setShowCustomerDetails((open) => !open)}
-                  aria-label="Customer details"
-                  className="flex flex-col items-center gap-0.5 active:scale-95"
-                >
-                  <span
-                    className={`w-11 h-11 rounded-full flex items-center justify-center text-lg ${
-                      showCustomerDetails ? 'bg-amber-500 text-white' : 'bg-slate-100 text-slate-600'
-                    }`}
-                  >
-                    🚩
-                  </span>
-                  <span className="text-[10px] font-semibold text-slate-500">Details</span>
-                </button>
-                <button
-                  onClick={() => setShowDiscount((open) => !open)}
-                  aria-label="Discount"
-                  className="flex flex-col items-center gap-0.5 active:scale-95"
-                >
-                  <span
-                    className={`w-11 h-11 rounded-full flex items-center justify-center text-lg ${
-                      discountAmount > 0 || showDiscount ? 'bg-amber-500 text-white' : 'bg-slate-100 text-slate-600'
-                    }`}
-                  >
-                    🏷️
-                  </span>
-                  <span className="text-[10px] font-semibold text-slate-500">Discount</span>
-                </button>
-              </div>
-
-              {showDiscount && (
-                <div className="space-y-2">
-                  <div className="flex gap-2">
-                    {[5, 10, 15].map((pct) => (
-                      <button
-                        key={pct}
-                        onClick={() => setTabDiscount({ mode: 'percent', value: pct })}
-                        className={`flex-1 h-10 rounded-xl font-semibold text-sm active:scale-95 ${
-                          discount?.mode === 'percent' && discount.value === pct
-                            ? 'bg-amber-500 text-white'
-                            : 'bg-slate-100 text-slate-600'
-                        }`}
-                      >
-                        {pct}%
-                      </button>
-                    ))}
-                    <button
-                      onClick={() => setTabDiscount(null)}
-                      className="flex-1 h-10 rounded-xl font-semibold text-sm bg-slate-100 text-slate-600 active:scale-95"
-                    >
-                      Clear
-                    </button>
-                  </div>
-                  <input
-                    type="number"
-                    inputMode="numeric"
-                    placeholder="Or a fixed amount off (RWF)"
-                    value={discount?.mode === 'amount' ? discount.value : ''}
-                    onChange={(e) =>
-                      setTabDiscount(e.target.value ? { mode: 'amount', value: Number(e.target.value) } : null)
-                    }
-                    className="w-full px-4 py-2 rounded-xl border border-gray-300 text-base"
-                  />
-                </div>
-              )}
-
-              {showCustomerDetails && (
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <input
-                    type="text"
-                    placeholder="Table / Guest name"
-                    defaultValue={activeTab?.name ?? ''}
-                    onChange={(e) => renameTab(e.target.value)}
-                    className="px-4 py-3 rounded-xl border border-gray-300 text-lg sm:col-span-2"
-                  />
-                  <input
-                    type="number"
-                    inputMode="numeric"
-                    min="1"
-                    placeholder="Guests (covers)"
-                    value={activeTab?.guest_count ?? ''}
-                    onChange={(e) =>
-                      db.active_tabs.update(activeTabId, {
-                        guest_count: e.target.value ? Number(e.target.value) : null,
-                      })
-                    }
-                    className="px-4 py-3 rounded-xl border border-gray-300 text-lg sm:col-span-2"
-                  />
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    placeholder="Customer TIN"
-                    value={customerTin}
-                    onChange={(e) => setCustomerTin(e.target.value)}
-                    className="px-4 py-3 rounded-xl border border-gray-300 text-lg"
-                  />
-                  <input
-                    type="tel"
-                    placeholder="Customer Phone"
-                    value={customerPhone}
-                    onChange={(e) => setCustomerPhone(e.target.value)}
-                    className="px-4 py-3 rounded-xl border border-gray-300 text-lg"
-                  />
-                </div>
-              )}
-
-              {momoPrompt ? (
-                /* MoMo two-step: capture the transaction reference, then close.
-                   The ref is optional — "Skip" still records the MoMo payment. */
-                <div className="space-y-3 pt-1">
-                  <input
-                    type="text"
-                    autoFocus
-                    placeholder="MoMo transaction ref (e.g. AE1234567)"
-                    value={momoRef}
-                    onChange={(e) => setMomoRef(e.target.value)}
-                    className="w-full px-4 py-3 rounded-xl border border-gray-300 text-lg"
-                  />
-                  <div className="grid grid-cols-2 gap-3">
-                    <button
-                      onClick={() => setMomoPrompt(false)}
-                      className="h-14 rounded-xl font-bold bg-slate-100 text-slate-600 active:scale-95"
-                    >
-                      ← Back
-                    </button>
-                    <button
-                      onClick={() => checkout('momo', momoRef)}
-                      className="h-14 rounded-xl font-bold bg-yellow-400 text-slate-900 active:scale-95"
-                    >
-                      {momoRef ? 'Confirm MoMo' : 'Skip & Close'}
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <div className="grid grid-cols-2 gap-3 pt-1">
-                  <button
-                    onClick={() => checkout('cash')}
-                    disabled={cartItems.length === 0}
-                    className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-green-600 text-white transition active:scale-95 disabled:opacity-40"
-                  >
-                    PAY CASH
-                  </button>
-                  <button
-                    onClick={() => setMomoPrompt(true)}
-                    disabled={cartItems.length === 0}
-                    className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-yellow-400 text-slate-900 transition active:scale-95 disabled:opacity-40"
-                  >
-                    MOMO
-                  </button>
-                </div>
-              )}
-            </div>
+            <div className="overflow-y-auto flex-1">{orderList}</div>
+            <div className="p-4 border-t border-gray-100 space-y-3">{cartControls}</div>
           </div>
         </div>
       )}
