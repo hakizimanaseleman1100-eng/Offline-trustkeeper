@@ -122,6 +122,7 @@ function InventoryTab({ notify }) {
   const [sellingPrice, setSellingPrice] = useState('');
   const [costPrice, setCostPrice] = useState('');
   const [productCategory, setProductCategory] = useState('');
+  const [productSubCategory, setProductSubCategory] = useState('');
   const [taxLabel, setTaxLabel] = useState('B');
   const [initialStock, setInitialStock] = useState('');
   // Inline editing of catalog fields (name/price/cost/category/tax).
@@ -191,15 +192,98 @@ function InventoryTab({ notify }) {
   };
 
   // ---- Excel / CSV import ---------------------------------------------------
+  // The template carries every importable item field as a column, pre-filled
+  // with a realistic starter catalog (bar + kitchen + motel) so the owner can
+  // download it, tweak prices, and import in one go. Columns are matched by
+  // header name (see handleImportFile), so their order can be rearranged.
   const downloadTemplate = () => {
-    const csv =
-      'Item,Price,Cost,Category,Tax,Quantity\n' +
-      'Primus 50,1800,1500,Bar,B,30\n' +
-      'Coca-Cola 33cl,800,500,Bar,C,50\n';
-    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+    const header = 'Item Name,Category,Sub-category,Selling Price,Cost Price,Tax,Item Code,Quantity';
+    const rows = [
+      // Beverages — Beer
+      ['Primus 65cl', 'Beverages', 'Beer', 1800, 1400, 'B', 'BR-001', 48],
+      ['Mutzig 65cl', 'Beverages', 'Beer', 2000, 1550, 'B', 'BR-002', 48],
+      ['Amstel 65cl', 'Beverages', 'Beer', 2000, 1550, 'B', 'BR-003', 36],
+      ['Skol 65cl', 'Beverages', 'Beer', 1800, 1400, 'B', 'BR-004', 36],
+      ['Turbo King 65cl', 'Beverages', 'Beer', 2000, 1500, 'B', 'BR-005', 24],
+      ['Legend 65cl', 'Beverages', 'Beer', 2000, 1500, 'B', 'BR-006', 24],
+      ['Gatanu 65cl', 'Beverages', 'Beer', 1600, 1200, 'B', 'BR-007', 24],
+      ['Heineken 33cl', 'Beverages', 'Beer', 2500, 1900, 'B', 'BR-008', 24],
+      ['Guinness 33cl', 'Beverages', 'Beer', 2500, 1900, 'B', 'BR-009', 24],
+      // Beverages — Soft Drinks
+      ['Coca-Cola 33cl', 'Beverages', 'Soft Drinks', 700, 450, 'B', 'SD-001', 60],
+      ['Fanta Orange 33cl', 'Beverages', 'Soft Drinks', 700, 450, 'B', 'SD-002', 60],
+      ['Fanta Citron 33cl', 'Beverages', 'Soft Drinks', 700, 450, 'B', 'SD-003', 48],
+      ['Sprite 33cl', 'Beverages', 'Soft Drinks', 700, 450, 'B', 'SD-004', 48],
+      ['Coca-Cola 50cl', 'Beverages', 'Soft Drinks', 1000, 650, 'B', 'SD-005', 36],
+      ['Fanta Orange 50cl', 'Beverages', 'Soft Drinks', 1000, 650, 'B', 'SD-006', 36],
+      ['Vitalo', 'Beverages', 'Soft Drinks', 500, 300, 'B', 'SD-007', 48],
+      ['Novida Pineapple', 'Beverages', 'Soft Drinks', 800, 500, 'B', 'SD-008', 36],
+      ['Malta Guinness', 'Beverages', 'Soft Drinks', 1000, 700, 'B', 'SD-009', 24],
+      // Beverages — Water
+      ['Inyange Water 50cl', 'Beverages', 'Water', 500, 300, 'B', 'WT-001', 72],
+      ['Inyange Water 1.5L', 'Beverages', 'Water', 1000, 600, 'B', 'WT-002', 36],
+      ['Aquafina 50cl', 'Beverages', 'Water', 500, 300, 'B', 'WT-003', 48],
+      ['Sparkling Water 50cl', 'Beverages', 'Water', 1200, 800, 'B', 'WT-004', 24],
+      // Beverages — Energy
+      ['Red Bull', 'Beverages', 'Energy', 2500, 1800, 'B', 'EN-001', 24],
+      ['Monster', 'Beverages', 'Energy', 3000, 2200, 'B', 'EN-002', 24],
+      ['Power Play', 'Beverages', 'Energy', 1500, 1000, 'B', 'EN-003', 24],
+      // Beverages — Juice
+      ['Inyange Juice Mango', 'Beverages', 'Juice', 1000, 650, 'B', 'JU-001', 24],
+      ['Inyange Juice Passion', 'Beverages', 'Juice', 1000, 650, 'B', 'JU-002', 24],
+      ['Fresh Passion Juice', 'Beverages', 'Juice', 1500, 900, 'B', 'JU-003', 12],
+      // Beverages — Wine
+      ['Red Wine Glass', 'Beverages', 'Wine', 3000, 1800, 'B', 'WN-001', 20],
+      ['White Wine Glass', 'Beverages', 'Wine', 3000, 1800, 'B', 'WN-002', 20],
+      ['Cellar Cask Red 750ml', 'Beverages', 'Wine', 12000, 9000, 'B', 'WN-003', 12],
+      ['Baron Romero 750ml', 'Beverages', 'Wine', 15000, 11000, 'B', 'WN-004', 8],
+      // Beverages — Liquor
+      ['Waragi 200ml', 'Beverages', 'Liquor', 2000, 1400, 'B', 'LQ-001', 24],
+      ['Konyagi 350ml', 'Beverages', 'Liquor', 3000, 2200, 'B', 'LQ-002', 24],
+      ['Johnnie Walker Red Shot', 'Beverages', 'Liquor', 3000, 2000, 'B', 'LQ-003', 30],
+      ['Chairmans Shot', 'Beverages', 'Liquor', 2500, 1700, 'B', 'LQ-004', 30],
+      ['Amarula Shot', 'Beverages', 'Liquor', 3000, 2100, 'B', 'LQ-005', 20],
+      ['Bond 7 Shot', 'Beverages', 'Liquor', 2500, 1700, 'B', 'LQ-006', 20],
+      ['Uganda Waragi Shot', 'Beverages', 'Liquor', 2000, 1300, 'B', 'LQ-007', 24],
+      ['Vodka Shot', 'Beverages', 'Liquor', 2500, 1700, 'B', 'LQ-008', 24],
+      ['Gin and Tonic', 'Beverages', 'Liquor', 3500, 2200, 'B', 'LQ-009', 15],
+      ['Whisky Double', 'Beverages', 'Liquor', 6000, 4200, 'B', 'LQ-010', 15],
+      // Food — Grill (not stock-tracked; quantity left blank)
+      ['Brochette Goat', 'Food', 'Grill', 1000, 500, 'B', 'GR-001', ''],
+      ['Brochette Beef', 'Food', 'Grill', 1200, 600, 'B', 'GR-002', ''],
+      ['Half Chicken Grilled', 'Food', 'Grill', 5000, 3200, 'B', 'GR-003', ''],
+      ['Whole Chicken Grilled', 'Food', 'Grill', 9000, 6000, 'B', 'GR-004', ''],
+      ['Grilled Tilapia', 'Food', 'Grill', 6000, 4000, 'B', 'GR-005', ''],
+      ['Goat Ribs', 'Food', 'Grill', 7000, 4500, 'B', 'GR-006', ''],
+      ['Sambaza Fried', 'Food', 'Grill', 3000, 1800, 'B', 'GR-007', ''],
+      // Food — Sides
+      ['Chips (Fries)', 'Food', 'Sides', 2000, 1000, 'B', 'SI-001', ''],
+      ['Fried Plantain (Ibitoke)', 'Food', 'Sides', 2000, 1100, 'B', 'SI-002', ''],
+      ['Ugali', 'Food', 'Sides', 1000, 400, 'B', 'SI-003', ''],
+      ['Rice', 'Food', 'Sides', 1500, 700, 'B', 'SI-004', ''],
+      ['Grilled Potatoes', 'Food', 'Sides', 2000, 1100, 'B', 'SI-005', ''],
+      ['Salad', 'Food', 'Sides', 1500, 700, 'B', 'SI-006', ''],
+      // Food — Snacks
+      ['Samosa', 'Food', 'Snacks', 500, 250, 'B', 'SN-001', ''],
+      ['Chapati', 'Food', 'Snacks', 500, 200, 'B', 'SN-002', ''],
+      ['Groundnuts (Ubunyobwa)', 'Food', 'Snacks', 1000, 500, 'B', 'SN-003', ''],
+      ['Isombe', 'Food', 'Snacks', 2000, 1000, 'B', 'SN-004', ''],
+      // Motel Rooms (not stock-tracked)
+      ['Standard Room (Night)', 'Motel Rooms', 'Standard', 15000, 0, 'B', 'RM-001', ''],
+      ['Deluxe Room (Night)', 'Motel Rooms', 'Deluxe', 25000, 0, 'B', 'RM-002', ''],
+      ['VIP Suite (Night)', 'Motel Rooms', 'Suite', 40000, 0, 'B', 'RM-003', ''],
+      ['Extra Bed', 'Motel Rooms', 'Add-on', 5000, 0, 'B', 'RM-004', ''],
+      // Tobacco
+      ['Cigarette Stick', 'Tobacco', 'Cigarettes', 200, 120, 'B', 'TB-001', 100],
+      ['Dunhill Pack', 'Tobacco', 'Cigarettes', 3000, 2400, 'B', 'TB-002', 20],
+      ['Intore Pack', 'Tobacco', 'Cigarettes', 2500, 2000, 'B', 'TB-003', 20],
+    ];
+    const cell = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
+    const csv = [header, ...rows.map((r) => r.map(cell).join(','))].join('\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'stock-template.csv';
+    a.download = 'product-import-template.csv';
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -219,10 +303,12 @@ function InventoryTab({ notify }) {
             const key = Object.keys(r).find((k) => re.test(k));
             return key ? String(r[key]).trim() : '';
           };
-          const name = get(/item|name|ibicuruzwa/i);
+          const name = get(/^item$|name|ibicuruzwa/i);
           const price = get(/price|ibiciro|selling/i);
           const cost = get(/cost/i);
-          const category = get(/categ/i);
+          const category = get(/^categ|icyiciro/i);
+          const subCategory = get(/sub.?categ|subcat|ubwoko/i);
+          const code = get(/code|barcode|sku/i);
           let tax = get(/tax/i).toUpperCase().replace(/[^ABCD]/g, '').slice(0, 1);
           const qty = get(/qty|quantity|stock|ibyinjiye|yatangiranye/i);
           if (!name && !price && !cost && !category && !qty) return null; // blank row
@@ -235,7 +321,7 @@ function InventoryTab({ notify }) {
           else if (price !== '' && Number.isNaN(Number(price))) error = 'Price is not a number';
           else if (qty !== '' && Number.isNaN(Number(qty))) error = 'Quantity is not a number';
 
-          return { name, price, cost, category, tax, qty, existing, error, action: existing ? 'update' : 'create' };
+          return { name, price, cost, category, subCategory, code, tax, qty, existing, error, action: existing ? 'update' : 'create' };
         })
         .filter(Boolean);
 
@@ -265,6 +351,8 @@ function InventoryTab({ notify }) {
             unit_price: Number(r.price) || 0,
             cost_price: Number(r.cost) || 0,
             category: r.category || '',
+            sub_category: r.subCategory || null,
+            item_code: r.code || null,
             tax_label: r.tax,
             tax_rate: taxRateFor(r.tax),
           })
@@ -283,6 +371,8 @@ function InventoryTab({ notify }) {
         if (r.price !== '') fields.unit_price = Number(r.price);
         if (r.cost !== '') fields.cost_price = Number(r.cost);
         if (r.category !== '') fields.category = r.category;
+        if (r.subCategory !== '') fields.sub_category = r.subCategory;
+        if (r.code !== '') fields.item_code = r.code;
         const { error } = await supabase.from('products').update(fields).eq('id', productId);
         if (error) {
           notify(`Failed on ${r.name}: ${error.message}`);
@@ -314,6 +404,7 @@ function InventoryTab({ notify }) {
         unit_price: Number(sellingPrice),
         cost_price: Number(costPrice),
         category: productCategory,
+        sub_category: productSubCategory || null,
         tax_label: taxLabel,
         tax_rate: taxRateFor(taxLabel),
       })
@@ -331,6 +422,7 @@ function InventoryTab({ notify }) {
     setSellingPrice('');
     setCostPrice('');
     setProductCategory('');
+    setProductSubCategory('');
     setTaxLabel('B');
     setInitialStock('');
     notify(`Added ${itemName}`);
@@ -348,6 +440,7 @@ function InventoryTab({ notify }) {
         unit_price: Number(edit.unit_price),
         cost_price: Number(edit.cost_price),
         category: edit.category,
+        sub_category: edit.sub_category || null,
         tax_label: edit.tax_label,
         tax_rate: taxRateFor(edit.tax_label),
       })
@@ -428,7 +521,8 @@ function InventoryTab({ notify }) {
         <input required placeholder="Item Name" value={itemName} onChange={(e) => setItemName(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
         <input required type="number" placeholder="Selling Price" value={sellingPrice} onChange={(e) => setSellingPrice(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
         <input required type="number" placeholder="Cost Price" value={costPrice} onChange={(e) => setCostPrice(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
-        <input required placeholder="Category" value={productCategory} onChange={(e) => setProductCategory(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
+        <input required placeholder="Category (e.g. Beverages)" value={productCategory} onChange={(e) => setProductCategory(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
+        <input placeholder="Sub-category (e.g. Beer)" value={productSubCategory} onChange={(e) => setProductSubCategory(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
         <select value={taxLabel} onChange={(e) => setTaxLabel(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300">
           {TAX_CATEGORIES.map((t) => (
             <option key={t.label} value={t.label}>
@@ -496,6 +590,7 @@ function InventoryTab({ notify }) {
               <tr>
                 <th className="px-5 py-3">Item</th>
                 <th className="px-5 py-3">Category</th>
+                <th className="px-5 py-3">Sub-category</th>
                 <th className="px-5 py-3">Price</th>
                 <th className="px-5 py-3">Cost</th>
                 <th className="px-5 py-3">Tax</th>
@@ -512,6 +607,7 @@ function InventoryTab({ notify }) {
                   <tr key={p.id} className="bg-amber-50">
                     <td className="px-5 py-3">{editCell('item_name')}</td>
                     <td className="px-5 py-3">{editCell('category')}</td>
+                    <td className="px-5 py-3">{editCell('sub_category')}</td>
                     <td className="px-5 py-3">{editCell('unit_price', { type: 'number' })}</td>
                     <td className="px-5 py-3">{editCell('cost_price', { type: 'number' })}</td>
                     <td className="px-5 py-3">
@@ -533,6 +629,7 @@ function InventoryTab({ notify }) {
                   <tr key={p.id}>
                     <td className="px-5 py-3 font-semibold text-slate-800 whitespace-nowrap">{p.item_name}</td>
                     <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.category}</td>
+                    <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.sub_category || <span className="text-slate-300">—</span>}</td>
                     <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.unit_price?.toLocaleString()} RWF</td>
                     <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.cost_price?.toLocaleString()} RWF</td>
                     <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.tax_label} ({p.tax_rate}%)</td>
@@ -590,6 +687,8 @@ function InventoryTab({ notify }) {
                 <thead className="text-slate-400 text-xs uppercase sticky top-0 bg-white">
                   <tr>
                     <th className="px-4 py-2">Item</th>
+                    <th className="px-4 py-2">Category</th>
+                    <th className="px-4 py-2">Sub-cat</th>
                     <th className="px-4 py-2">Price</th>
                     <th className="px-4 py-2">Tax</th>
                     <th className="px-4 py-2">Qty</th>
@@ -600,6 +699,8 @@ function InventoryTab({ notify }) {
                   {importRows.map((r, i) => (
                     <tr key={i} className={r.error ? 'bg-red-50' : ''}>
                       <td className="px-4 py-2 font-semibold text-slate-700">{r.name || '—'}</td>
+                      <td className="px-4 py-2 text-slate-500">{r.category || ''}</td>
+                      <td className="px-4 py-2 text-slate-500">{r.subCategory || ''}</td>
                       <td className="px-4 py-2 text-slate-500">{r.price || (r.action === 'update' ? '(keep)' : '')}</td>
                       <td className="px-4 py-2 text-slate-500">{r.tax}</td>
                       <td className="px-4 py-2 text-slate-500">{r.qty || ''}</td>
