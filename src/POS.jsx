@@ -3,6 +3,7 @@ import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './db';
 import { supabase } from './supabaseClient';
 import { getBusinessId } from './session';
+import QrScanner from './QrScanner';
 import { getDeviceId, nextReceiptNo } from './receipts';
 
 // "5m ago" style label for the last successful sync.
@@ -40,6 +41,7 @@ function POS({ currentUser, onLogout }) {
   // Room item awaiting a nights count before it's added to the tab.
   const [roomPrompt, setRoomPrompt] = useState(null);
   const [nightsInput, setNightsInput] = useState('1');
+  const [scanning, setScanning] = useState(false); // self-service QR scanner open
   // Even-split calculator on the bill: how many ways to divide the total.
   const [splitWays, setSplitWays] = useState(1);
 
@@ -196,6 +198,83 @@ function POS({ currentUser, onLogout }) {
     setActiveTabId(id);
     setSelectedCategory('All');
     setSearchQuery('');
+  };
+
+  // A self-service QR was scanned. It's just a request until accepted here: we
+  // verify it's for THIS venue, refuse a duplicate scan, then create a real tab
+  // with the items (priced from the current menu). Stock/sync happen normally
+  // when the waiter serves & bills — never from the customer's device.
+  const handleScannedOrder = async (text) => {
+    setScanning(false);
+    let payload;
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      showToast('Not a valid order code');
+      return;
+    }
+    if (payload?.biz !== getBusinessId()) {
+      showToast('That order is for a different venue');
+      return;
+    }
+    const seen = JSON.parse(localStorage.getItem('scanned_oids') || '[]');
+    if (payload.oid && seen.includes(payload.oid)) {
+      showToast('This order was already scanned');
+      return;
+    }
+    const orderItems = Array.isArray(payload.items) ? payload.items : [];
+    if (orderItems.length === 0) {
+      showToast('Empty order');
+      return;
+    }
+
+    const tabNumber = (await db.active_tabs.count()) + 1;
+    const id = await db.active_tabs.add({
+      name: `Tab ${tabNumber}`,
+      created_at: Date.now(),
+      status: 'open',
+      current_round: 1,
+    });
+
+    let added = 0;
+    let skipped = 0;
+    for (const it of orderItems) {
+      const inv = await db.inventory.get(it.id);
+      if (!inv) {
+        skipped++;
+        continue;
+      }
+      const qty = Math.max(1, Number(it.q) || 1);
+      await db.sales.add({
+        item_id: inv.id,
+        tab_id: id,
+        round: 1,
+        quantity: qty,
+        total_price: inv.unit_price * qty,
+        cost_price: inv.cost_price,
+        tax_label: inv.tax_label,
+        tax_rate: inv.tax_rate,
+        staff_id: currentUser?.id ?? null,
+        staff_name: currentUser?.name ?? null,
+        timestamp: Date.now(),
+        synced_status: 0,
+      });
+      added++;
+    }
+
+    if (payload.oid) {
+      seen.push(payload.oid);
+      localStorage.setItem('scanned_oids', JSON.stringify(seen.slice(-300)));
+    }
+    if (added === 0) {
+      await db.active_tabs.delete(id);
+      showToast('None of those items are on the menu');
+      return;
+    }
+    setActiveTabId(id);
+    setSelectedCategory('All');
+    setSearchQuery('');
+    showToast(skipped ? `Order loaded — ${skipped} item(s) unavailable` : `Order loaded — ${added} item(s)`);
   };
 
   // A waiter can optionally rename the tab later, from the Customer Details
@@ -1045,12 +1124,20 @@ function POS({ currentUser, onLogout }) {
                 </div>
               )}
             </div>
-            <button
-              onClick={createTab}
-              className="h-20 sm:h-24 lg:h-28 rounded-2xl text-xl sm:text-2xl lg:text-3xl font-bold bg-amber-500 text-white shadow-md transition active:scale-95"
-            >
-              + New Tab
-            </button>
+            <div className="flex flex-col gap-3">
+              <button
+                onClick={createTab}
+                className="h-20 sm:h-24 lg:h-28 rounded-2xl text-xl sm:text-2xl lg:text-3xl font-bold bg-amber-500 text-white shadow-md transition active:scale-95"
+              >
+                + New Tab
+              </button>
+              <button
+                onClick={() => setScanning(true)}
+                className="h-14 lg:h-16 rounded-2xl text-base lg:text-lg font-bold bg-white text-slate-700 shadow-md transition active:scale-95"
+              >
+                📷 Scan self-service order
+              </button>
+            </div>
           </div>
         ) : (
           /* INSIDE A TAB: category → items → running cart */
@@ -1410,6 +1497,9 @@ function POS({ currentUser, onLogout }) {
           </div>
         </div>
       )}
+
+      {/* Self-service QR scanner */}
+      {scanning && <QrScanner onResult={handleScannedOrder} onClose={() => setScanning(false)} />}
 
       {/* Toast */}
       {toast && (

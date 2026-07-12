@@ -4,6 +4,7 @@ import { supabase } from './supabaseClient';
 import POS from './POS';
 import OwnerDashboard from './OwnerDashboard';
 import KitchenDisplay from './KitchenDisplay';
+import ClientOrder from './ClientOrder';
 import PinLogin from './PinLogin';
 import BusinessAuth from './BusinessAuth';
 import { getBusinessId, currentSession, resolveBusinessId, ensureBusiness, signOutBusiness } from './session';
@@ -154,7 +155,17 @@ function App() {
   }
 
   if (!currentUser) {
-    return <PinLogin onSuccess={setCurrentUser} onSignOutVenue={signOutVenue} />;
+    return (
+      <PinLogin
+        onSuccess={setCurrentUser}
+        onSignOutVenue={signOutVenue}
+        onSelfService={() => setCurrentUser({ role: 'CLIENT', name: 'Self-service' })}
+      />
+    );
+  }
+
+  if (currentUser.role === 'CLIENT') {
+    return <ClientOrder onExit={logout} />;
   }
 
   if (currentUser.role === 'OWNER' || currentUser.role === 'MANAGER') {
