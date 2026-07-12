@@ -109,20 +109,10 @@ function ClientOrder({ onExit }) {
     }
   };
 
-  // A human-readable order summary with the code at the end. decodeOrder pulls
-  // the token back out of this, so the whole message can be pasted or scanned.
-  const orderMessage = () => {
-    const who = authCustomer ? authCustomer.username : details.trim();
-    return [
-      'My self-service order' + (who ? ` — ${who}` : ''),
-      ...cartLines.map((l) => `${l.name} x${l.qty}`),
-      `Total: ${cartTotal.toLocaleString()} RWF`,
-      '',
-      'Order code (the waiter scans or enters this):',
-      qr.code,
-    ].join('\n');
-  };
-  const shareWhatsApp = () => window.open('https://wa.me/?text=' + encodeURIComponent(orderMessage()), '_blank');
+  // WhatsApp carries ONLY the code, so the whole message is the code — trivial
+  // to copy or forward, with no surrounding words for the decoder to trip on.
+  // The order details show on the waiter's screen once the code loads.
+  const shareWhatsApp = () => window.open('https://wa.me/?text=' + encodeURIComponent(qr.code), '_blank');
   const printQr = () => window.print();
 
   // Keep the placed round visible under "Ordered" and start a fresh round.
