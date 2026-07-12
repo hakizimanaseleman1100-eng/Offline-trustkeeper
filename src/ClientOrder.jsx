@@ -6,18 +6,23 @@ import { getBusinessId } from './session';
 // Self-service ordering on a venue tablet. The customer browses the menu and
 // builds an order, then generates a QR the waiter scans. This screen NEVER
 // writes to the database, touches stock, or syncs — the order is just a request
-// until a waiter accepts it, which is what keeps self-service conflict-free.
+// until a waiter accepts it, which keeps self-service conflict-free.
+//
+// After a round is placed (QR generated) the customer keeps seeing it under
+// "Ordered" and can keep adding rounds; each QR carries only the new round, and
+// the venue stacks them onto one tab via the detail (table/name).
 function ClientOrder({ onExit }) {
   const [selectedCategory, setSelectedCategory] = useState('All');
   const [search, setSearch] = useState('');
-  const [cart, setCart] = useState({}); // item_id -> { id, name, price, qty }
+  const [cart, setCart] = useState({}); // item_id -> { id, name, price, qty } — the round being built
+  const [ordered, setOrdered] = useState([]); // rounds already placed, merged by item
   const [details, setDetails] = useState(''); // table number / name — groups a customer's rounds
   const [qr, setQr] = useState(null); // { dataUrl } once generated
 
-  const categories = useLiveQuery(() => db.inventory.orderBy('category').uniqueKeys(), [], []);
-  const allItems = useLiveQuery(() => db.inventory.toArray(), [], []);
   // The menu is exactly the venue's product list (for ordering only — this
   // screen never touches stock). Active items only.
+  const categories = useLiveQuery(() => db.inventory.orderBy('category').uniqueKeys(), [], []);
+  const allItems = useLiveQuery(() => db.inventory.toArray(), [], []);
   const items = allItems.filter((it) => {
     if (it.active === false) return false;
     const matchesCategory = selectedCategory === 'All' || it.category === selectedCategory;
@@ -25,9 +30,11 @@ function ClientOrder({ onExit }) {
     return matchesCategory && matchesSearch;
   });
 
-  const lines = Object.values(cart);
-  const total = lines.reduce((s, l) => s + l.price * l.qty, 0);
-  const count = lines.reduce((s, l) => s + l.qty, 0);
+  const cartLines = Object.values(cart);
+  const cartTotal = cartLines.reduce((s, l) => s + l.price * l.qty, 0);
+  const orderedTotal = ordered.reduce((s, l) => s + l.price * l.qty, 0);
+  const grandTotal = cartTotal + orderedTotal;
+  const grandCount = cartLines.reduce((s, l) => s + l.qty, 0) + ordered.reduce((s, l) => s + l.qty, 0);
 
   const add = (it) =>
     setCart((c) => {
@@ -47,39 +54,106 @@ function ClientOrder({ onExit }) {
     });
 
   const showQr = async () => {
-    if (lines.length === 0) return;
+    if (cartLines.length === 0) return;
     const payload = {
       v: 1,
       biz: getBusinessId(),
       oid: (crypto.randomUUID?.() ?? String(Date.now())).slice(0, 12),
-      details: details.trim(), // groups repeat orders onto one tab after scanning
-      items: lines.map((l) => ({ id: l.id, n: l.name, q: l.qty })),
+      details: details.trim(),
+      items: cartLines.map((l) => ({ id: l.id, n: l.name, q: l.qty })),
     };
     const QRCode = await import('qrcode'); // loaded on demand
     const dataUrl = await QRCode.toDataURL(JSON.stringify(payload), { width: 320, margin: 1 });
     setQr({ dataUrl });
   };
 
-  const reset = () => {
+  // Keep the placed round visible under "Ordered" and start a fresh round.
+  const orderMore = () => {
+    setOrdered((prev) => {
+      const merged = [...prev];
+      for (const l of cartLines) {
+        const found = merged.find((m) => m.id === l.id);
+        if (found) found.qty += l.qty;
+        else merged.push({ ...l });
+      }
+      return merged;
+    });
     setCart({});
     setQr(null);
+    setSearch('');
+    setSelectedCategory('All');
+  };
+
+  // Clear everything for the next customer.
+  const finish = () => {
+    setOrdered([]);
+    setCart({});
+    setDetails('');
+    setQr(null);
+    setSearch('');
+    setSelectedCategory('All');
   };
 
   // The generated-QR screen — customer shows it to the waiter.
   if (qr) {
     return (
-      <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center gap-6 font-sans px-6 py-10 text-center">
+      <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center gap-5 font-sans px-6 py-10 text-center">
         <h1 className="text-2xl font-extrabold text-white">Show this to the waiter</h1>
         {details.trim() && <p className="text-amber-300 font-bold text-lg">{details.trim()}</p>}
-        <img src={qr.dataUrl} alt="Order QR code" className="w-64 h-64 bg-white p-3 rounded-2xl" />
-        <p className="text-slate-300">{count} item{count === 1 ? '' : 's'} · {total.toLocaleString()} RWF</p>
-        <p className="text-slate-500 text-sm max-w-xs">The waiter scans this to bring your order. Nothing is charged until they serve you.</p>
-        <button onClick={reset} className="px-6 py-3 rounded-xl bg-amber-500 text-white font-bold active:scale-95">
-          Start a new order
-        </button>
+        <img src={qr.dataUrl} alt="Order QR code" className="w-60 h-60 bg-white p-3 rounded-2xl" />
+        <p className="text-slate-300">
+          This round: {cartLines.reduce((s, l) => s + l.qty, 0)} item{cartLines.length === 1 ? '' : 's'} · {cartTotal.toLocaleString()} RWF
+        </p>
+        <p className="text-slate-500 text-sm max-w-xs">Nothing is charged until the waiter serves you.</p>
+        <div className="flex flex-col gap-3 w-full max-w-xs">
+          <button onClick={orderMore} className="h-14 rounded-xl bg-amber-500 text-white font-bold active:scale-95">
+            ➕ Order more
+          </button>
+          <button onClick={finish} className="h-12 rounded-xl bg-slate-700 text-white font-bold active:scale-95">
+            Done
+          </button>
+        </div>
       </div>
     );
   }
+
+  const orderBody = (
+    <>
+      {ordered.length > 0 && (
+        <div className="border-b border-gray-100">
+          <p className="text-xs font-bold uppercase text-emerald-500 px-5 pt-3 pb-1">Ordered</p>
+          {ordered.map((l) => (
+            <div key={l.id} className="flex items-center justify-between px-5 py-2 gap-3 text-slate-500">
+              <span className="flex-1 min-w-0">
+                {l.name} <span className="text-slate-400">× {l.qty}</span>
+              </span>
+              <span className="text-sm">{(l.price * l.qty).toLocaleString()} RWF</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {ordered.length > 0 && cartLines.length > 0 && (
+        <p className="text-xs font-bold uppercase text-slate-400 px-5 pt-3 pb-1">New round</p>
+      )}
+      {cartLines.length === 0 ? (
+        <p className="text-slate-400 p-5">{ordered.length ? 'Add another round, or show your QR.' : 'Tap items to add them.'}</p>
+      ) : (
+        <div className="divide-y divide-gray-100">
+          {cartLines.map((l) => (
+            <div key={l.id} className="flex items-center justify-between px-5 py-3 gap-3">
+              <span className="font-semibold text-slate-800 flex-1 min-w-0">{l.name}</span>
+              <div className="flex items-center gap-1 bg-slate-100 rounded-full px-1">
+                <button onClick={() => bump(l.id, -1)} className="w-7 h-7 rounded-full font-bold text-slate-700 active:scale-95">−</button>
+                <span className="w-6 text-center font-semibold text-sm">{l.qty}</span>
+                <button onClick={() => bump(l.id, 1)} className="w-7 h-7 rounded-full font-bold text-slate-700 active:scale-95">+</button>
+              </div>
+              <span className="text-slate-500 w-20 text-right text-sm">{(l.price * l.qty).toLocaleString()} RWF</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
 
   return (
     <div className="min-h-screen bg-gray-50 font-sans pb-28 lg:pb-8">
@@ -140,39 +214,21 @@ function ClientOrder({ onExit }) {
             )}
           </div>
 
-          {/* Order summary — side panel on desktop, bottom bar on mobile */}
+          {/* Order summary — side panel on desktop */}
           <aside className="hidden lg:flex lg:flex-col lg:w-96 lg:shrink-0 lg:sticky lg:top-4 bg-white rounded-2xl shadow-md overflow-hidden max-h-[calc(100vh-7rem)]">
             <div className="px-4 py-3 border-b border-gray-100 font-extrabold text-slate-900">Your Order</div>
-            <div className="overflow-y-auto flex-1">
-              {lines.length === 0 ? (
-                <p className="text-slate-400 p-5">Tap items to add them.</p>
-              ) : (
-                <div className="divide-y divide-gray-100">
-                  {lines.map((l) => (
-                    <div key={l.id} className="flex items-center justify-between px-5 py-3 gap-3">
-                      <span className="font-semibold text-slate-800 flex-1 min-w-0">{l.name}</span>
-                      <div className="flex items-center gap-1 bg-slate-100 rounded-full px-1">
-                        <button onClick={() => bump(l.id, -1)} className="w-7 h-7 rounded-full font-bold text-slate-700 active:scale-95">−</button>
-                        <span className="w-6 text-center font-semibold text-sm">{l.qty}</span>
-                        <button onClick={() => bump(l.id, 1)} className="w-7 h-7 rounded-full font-bold text-slate-700 active:scale-95">+</button>
-                      </div>
-                      <span className="text-slate-500 w-20 text-right text-sm">{(l.price * l.qty).toLocaleString()} RWF</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
+            <div className="overflow-y-auto flex-1">{orderBody}</div>
             <div className="p-4 border-t border-gray-100 space-y-3">
               <div className="flex items-center justify-between text-xl font-bold text-slate-900 px-1">
                 <span>Total</span>
-                <span>{total.toLocaleString()} RWF</span>
+                <span>{grandTotal.toLocaleString()} RWF</span>
               </div>
               <button
                 onClick={showQr}
-                disabled={lines.length === 0}
+                disabled={cartLines.length === 0}
                 className="w-full h-14 rounded-xl bg-slate-900 text-white text-lg font-bold active:scale-95 disabled:opacity-40"
               >
-                Done — Show QR
+                {ordered.length ? 'Show QR for new round' : 'Done — Show QR'}
               </button>
             </div>
           </aside>
@@ -180,15 +236,15 @@ function ClientOrder({ onExit }) {
       </main>
 
       {/* Mobile order bar */}
-      {lines.length > 0 && (
-        <MobileOrderBar lines={lines} total={total} count={count} bump={bump} onDone={showQr} />
+      {(cartLines.length > 0 || ordered.length > 0) && (
+        <MobileOrderBar body={orderBody} grandTotal={grandTotal} grandCount={grandCount} onDone={showQr} canShow={cartLines.length > 0} orderedOnly={cartLines.length === 0} />
       )}
     </div>
   );
 }
 
 // Bottom bar + expandable order list for phones.
-function MobileOrderBar({ lines, total, count, bump, onDone }) {
+function MobileOrderBar({ body, grandTotal, grandCount, onDone, canShow, orderedOnly }) {
   const [open, setOpen] = useState(false);
   return (
     <>
@@ -197,22 +253,10 @@ function MobileOrderBar({ lines, total, count, bump, onDone }) {
           <div className="absolute inset-0 bg-black/40" />
           <div onClick={(e) => e.stopPropagation()} className="relative bg-white rounded-t-3xl shadow-xl max-h-[75vh] flex flex-col">
             <div className="px-5 py-4 border-b border-gray-100 font-extrabold text-slate-900">Your Order</div>
-            <div className="overflow-y-auto flex-1 divide-y divide-gray-100">
-              {lines.map((l) => (
-                <div key={l.id} className="flex items-center justify-between px-5 py-3 gap-3">
-                  <span className="font-semibold text-slate-800 flex-1 min-w-0">{l.name}</span>
-                  <div className="flex items-center gap-1 bg-slate-100 rounded-full px-1">
-                    <button onClick={() => bump(l.id, -1)} className="w-7 h-7 rounded-full font-bold text-slate-700 active:scale-95">−</button>
-                    <span className="w-6 text-center font-semibold text-sm">{l.qty}</span>
-                    <button onClick={() => bump(l.id, 1)} className="w-7 h-7 rounded-full font-bold text-slate-700 active:scale-95">+</button>
-                  </div>
-                  <span className="text-slate-500 w-20 text-right text-sm">{(l.price * l.qty).toLocaleString()} RWF</span>
-                </div>
-              ))}
-            </div>
+            <div className="overflow-y-auto flex-1">{body}</div>
             <div className="p-4 border-t border-gray-100">
-              <button onClick={onDone} className="w-full h-14 rounded-xl bg-slate-900 text-white text-lg font-bold active:scale-95">
-                Done — Show QR
+              <button onClick={onDone} disabled={!canShow} className="w-full h-14 rounded-xl bg-slate-900 text-white text-lg font-bold active:scale-95 disabled:opacity-40">
+                Show QR
               </button>
             </div>
           </div>
@@ -220,11 +264,11 @@ function MobileOrderBar({ lines, total, count, bump, onDone }) {
       )}
       <div className="lg:hidden fixed bottom-0 inset-x-0 z-20 bg-white border-t border-gray-200 shadow-[0_-4px_12px_rgba(0,0,0,0.08)] p-3 flex items-center gap-3">
         <button onClick={() => setOpen(true)} className="flex-1 flex items-center justify-between px-4 h-12 rounded-xl bg-slate-100 font-bold text-slate-700 active:scale-95">
-          <span>🛒 {count} item{count === 1 ? '' : 's'}</span>
-          <span>{total.toLocaleString()} RWF</span>
+          <span>🛒 {grandCount} item{grandCount === 1 ? '' : 's'}</span>
+          <span>{grandTotal.toLocaleString()} RWF</span>
         </button>
-        <button onClick={onDone} className="h-12 px-5 rounded-xl bg-slate-900 text-white font-bold active:scale-95">
-          Done
+        <button onClick={onDone} disabled={!canShow} className="h-12 px-5 rounded-xl bg-slate-900 text-white font-bold active:scale-95 disabled:opacity-40">
+          {orderedOnly ? 'Add' : 'Done'}
         </button>
       </div>
     </>
