@@ -16,6 +16,7 @@ const NAV_LINKS = [
   { key: 'Inventory', icon: '📦' },
   { key: 'Expenses', icon: '💵' },
   { key: 'Team', icon: '👥' },
+  { key: 'Customers', icon: '🧑' },
 ];
 
 // On phones the bottom bar shows only these four most-used views; the rest go
@@ -1569,6 +1570,111 @@ function StationsTab({ notify }) {
   );
 }
 
+function CustomersTab({ notify }) {
+  const [customers, setCustomers] = useState([]);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [phone, setPhone] = useState('');
+  const [email, setEmail] = useState('');
+  const [tin, setTin] = useState('');
+
+  const load = async () => {
+    const { data, error } = await supabase
+      .from('customers')
+      .select('*')
+      .eq('business_id', getBusinessId())
+      .order('username');
+    if (error) {
+      console.error('Failed to load customers:', error.message);
+      return;
+    }
+    setCustomers(data ?? []);
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const addCustomer = async (e) => {
+    e.preventDefault();
+    if (!username.trim() || !password) {
+      notify('Username and password are required');
+      return;
+    }
+    const pw_hash = await hashPin(password); // salted SHA-256, never plaintext
+    const { error } = await supabase.from('customers').insert({
+      business_id: getBusinessId(),
+      username: username.trim(),
+      pw_hash,
+      phone: phone.trim() || null,
+      email: email.trim() || null,
+      tin: tin.trim() || null,
+      active: true,
+    });
+    if (error) {
+      notify(/duplicate|unique/i.test(error.message) ? 'That username is already taken' : `Could not register: ${error.message}`);
+      return;
+    }
+    setUsername('');
+    setPassword('');
+    setPhone('');
+    setEmail('');
+    setTin('');
+    notify(`Registered ${username.trim()}`);
+    load();
+  };
+
+  const setActive = async (c, active) => {
+    const { error } = await supabase.from('customers').update({ active }).eq('id', c.id);
+    if (error) {
+      notify(`Could not update: ${error.message}`);
+      return;
+    }
+    notify(`${c.username} ${active ? 're-activated' : 'deactivated'}`);
+    load();
+  };
+
+  return (
+    <div className="space-y-8">
+      <form onSubmit={addCustomer} className="bg-white rounded-2xl shadow-md p-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        <input required placeholder="Username" value={username} onChange={(e) => setUsername(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
+        <input required type="password" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
+        <input placeholder="Phone (optional)" value={phone} onChange={(e) => setPhone(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
+        <input type="email" placeholder="Email (optional)" value={email} onChange={(e) => setEmail(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
+        <input placeholder="TIN (optional)" value={tin} onChange={(e) => setTin(e.target.value)} className="px-4 py-2 rounded-lg border border-gray-300" />
+        <button type="submit" className="sm:col-span-2 lg:col-span-1 py-2 rounded-lg bg-amber-500 text-white font-semibold active:scale-95">
+          Register Customer
+        </button>
+      </form>
+
+      <div className="bg-white rounded-2xl shadow-md divide-y divide-gray-100">
+        {customers.length === 0 ? (
+          <p className="px-5 py-6 text-slate-400">No customers yet. Register one above.</p>
+        ) : (
+          customers.map((c) => (
+            <div key={c.id} className="flex items-center justify-between px-5 py-4 gap-3">
+              <div className="min-w-0">
+                <p className={`font-semibold truncate ${c.active === false ? 'text-slate-400 line-through' : 'text-slate-800'}`}>{c.username}</p>
+                <p className="text-xs text-slate-400 truncate">
+                  {[c.phone, c.email, c.tin && `TIN ${c.tin}`].filter(Boolean).join(' · ') || '—'}
+                </p>
+              </div>
+              <button
+                onClick={() => setActive(c, c.active === false)}
+                className={`shrink-0 px-3 py-1.5 rounded-lg text-sm font-semibold active:scale-95 ${
+                  c.active === false ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600'
+                }`}
+              >
+                {c.active === false ? 'Re-activate' : 'Deactivate'}
+              </button>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 function OwnerDashboard({ currentUser, onLogout }) {
   const [activeLink, setActiveLink] = useState('Dashboard');
   const [moreOpen, setMoreOpen] = useState(false);
@@ -1668,6 +1774,7 @@ function OwnerDashboard({ currentUser, onLogout }) {
         {activeLink === 'Inventory' && <InventoryTab notify={notify} />}
         {activeLink === 'Expenses' && <ExpensesTab notify={notify} />}
         {activeLink === 'Team' && <TeamTab notify={notify} />}
+        {activeLink === 'Customers' && <CustomersTab notify={notify} />}
         {activeLink === 'Reports' && <ReportsTab />}
       </main>
 
