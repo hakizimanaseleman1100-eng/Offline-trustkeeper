@@ -1,7 +1,9 @@
 import { useState } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './db';
+import { supabase } from './supabaseClient';
 import { getBusinessId } from './session';
+import { hashPin } from './auth';
 
 // Self-service ordering on a venue tablet. The customer browses the menu and
 // builds an order, then generates a QR the waiter scans. This screen NEVER
@@ -18,6 +20,7 @@ function ClientOrder({ onExit }) {
   const [ordered, setOrdered] = useState([]); // rounds already placed, merged by item
   const [details, setDetails] = useState(''); // table number / name — groups a customer's rounds
   const [qr, setQr] = useState(null); // { dataUrl } once generated
+  const [register, setRegister] = useState(null); // null | { username, password, phone, email, tin, busy, error, done }
 
   // The menu is exactly the venue's product list (for ordering only — this
   // screen never touches stock). Active items only.
@@ -82,6 +85,32 @@ function ClientOrder({ onExit }) {
     setQr(null);
     setSearch('');
     setSelectedCategory('All');
+  };
+
+  // Self-registration on the venue tablet. The tablet is signed in as the venue,
+  // so this insert is scoped to it. Password is hashed, never stored plain.
+  const submitRegister = async () => {
+    const r = register;
+    if (!r.username?.trim() || !r.password) {
+      setRegister({ ...r, error: 'Username and password are required' });
+      return;
+    }
+    setRegister({ ...r, busy: true, error: '' });
+    const pw_hash = await hashPin(r.password);
+    const { error } = await supabase.from('customers').insert({
+      business_id: getBusinessId(),
+      username: r.username.trim(),
+      pw_hash,
+      phone: r.phone?.trim() || null,
+      email: r.email?.trim() || null,
+      tin: r.tin?.trim() || null,
+      active: true,
+    });
+    if (error) {
+      setRegister({ ...r, busy: false, error: /duplicate|unique/i.test(error.message) ? 'That username is taken' : error.message });
+      return;
+    }
+    setRegister({ ...r, busy: false, done: true });
   };
 
   // Clear everything for the next customer.
@@ -159,10 +188,54 @@ function ClientOrder({ onExit }) {
     <div className="min-h-screen bg-gray-50 font-sans pb-28 lg:pb-8">
       <header className="bg-slate-900 text-white px-4 sm:px-6 lg:px-10 py-3 flex justify-between items-center shadow-lg">
         <h1 className="text-lg sm:text-2xl font-extrabold tracking-tight">Order Here 🙋</h1>
-        <button onClick={onExit} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
-          Exit
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setRegister({ username: '', password: '', phone: '', email: '', tin: '' })}
+            className="px-3 py-1.5 rounded-lg bg-amber-500 text-sm font-semibold active:scale-95"
+          >
+            Register
+          </button>
+          <button onClick={onExit} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
+            Exit
+          </button>
+        </div>
       </header>
+
+      {/* Self-registration modal */}
+      {register && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center p-4" onClick={() => !register.busy && setRegister(null)}>
+          <div className="absolute inset-0 bg-black/50" />
+          <div onClick={(e) => e.stopPropagation()} className="relative bg-white rounded-2xl shadow-xl w-full max-w-sm p-6 space-y-3">
+            {register.done ? (
+              <div className="text-center space-y-3">
+                <p className="text-4xl">✅</p>
+                <p className="font-extrabold text-lg text-slate-900">You’re registered!</p>
+                <p className="text-slate-500 text-sm">Next time you can sign in with your username and password.</p>
+                <button onClick={() => setRegister(null)} className="w-full h-11 rounded-xl bg-amber-500 text-white font-bold active:scale-95">
+                  Done
+                </button>
+              </div>
+            ) : (
+              <>
+                <div className="flex items-center justify-between">
+                  <h3 className="font-extrabold text-lg text-slate-900">Create your account</h3>
+                  <button onClick={() => setRegister(null)} className="text-slate-400 text-2xl leading-none w-8 h-8">×</button>
+                </div>
+                <p className="text-sm text-slate-500">Choose a username &amp; password. Phone, email and TIN are optional.</p>
+                <input placeholder="Username" value={register.username} onChange={(e) => setRegister({ ...register, username: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+                <input type="password" placeholder="Password" value={register.password} onChange={(e) => setRegister({ ...register, password: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+                <input placeholder="Phone (optional)" value={register.phone} onChange={(e) => setRegister({ ...register, phone: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+                <input type="email" placeholder="Email (optional)" value={register.email} onChange={(e) => setRegister({ ...register, email: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+                <input placeholder="TIN (optional)" value={register.tin} onChange={(e) => setRegister({ ...register, tin: e.target.value })} className="w-full px-4 py-3 rounded-xl border border-gray-300" />
+                {register.error && <p className="text-red-600 text-sm">{register.error}</p>}
+                <button onClick={submitRegister} disabled={register.busy} className="w-full h-12 rounded-xl bg-slate-900 text-white font-bold active:scale-95 disabled:opacity-50">
+                  {register.busy ? 'Creating…' : 'Create account'}
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       <main className="p-3 sm:p-5 lg:p-8 max-w-7xl mx-auto">
         <input
