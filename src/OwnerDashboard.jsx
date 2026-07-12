@@ -1570,19 +1570,61 @@ function StationsTab({ notify }) {
   );
 }
 
+// Compact money for tight stat cards: 2,500,000 -> "2.5M", 45,000 -> "45k".
+// Keeps big lifetime-spend figures from overflowing a phone-width card.
+function compactMoney(n) {
+  const v = Math.round(n || 0);
+  if (Math.abs(v) >= 1_000_000) return `${(v / 1_000_000).toFixed(v % 1_000_000 === 0 ? 0 : 1)}M`;
+  if (Math.abs(v) >= 10_000) return `${Math.round(v / 1000)}k`;
+  return v.toLocaleString();
+}
+const couponLabel = (c) => (c.kind === 'percent' ? `${c.value}% off` : `${Number(c.value).toLocaleString()} RWF off`);
+
 function CustomersTab({ notify }) {
   const [customers, setCustomers] = useState([]);
+  const [stats, setStats] = useState({}); // customer_id -> { spend, profit, visits, last }
+  const [coupons, setCoupons] = useState({}); // customer_id -> [active coupons]
   const [masterSet, setMasterSet] = useState(false);
   const [master, setMaster] = useState('');
+  const [rule, setRule] = useState({ threshold: '', pct: '' }); // loyalty auto-reward
+  const [grantFor, setGrantFor] = useState(null); // customer being granted a manual coupon
+  const [grant, setGrant] = useState({ kind: 'percent', value: '', reason: '' });
+  const [loading, setLoading] = useState(true);
 
   const load = async () => {
-    const [cRes, bRes] = await Promise.all([
+    setLoading(true);
+    const [cRes, bRes, sRes, cpRes] = await Promise.all([
       supabase.from('customers').select('*').eq('business_id', getBusinessId()).order('username'),
-      supabase.from('businesses').select('customer_master_hash').eq('id', getBusinessId()).single(),
+      supabase.from('businesses').select('customer_master_hash, loyalty_threshold, loyalty_reward_pct').eq('id', getBusinessId()).single(),
+      supabase
+        .from('hospitality_sales')
+        .select('customer_id, total_price, cost_price, quantity, receipt_no, timestamp')
+        .eq('business_id', getBusinessId())
+        .not('customer_id', 'is', null),
+      supabase.from('customer_coupons').select('*').eq('business_id', getBusinessId()).eq('status', 'active'),
     ]);
     if (cRes.error) console.error('Failed to load customers:', cRes.error.message);
     else setCustomers(cRes.data ?? []);
-    if (!bRes.error) setMasterSet(!!bRes.data?.customer_master_hash);
+    if (!bRes.error && bRes.data) {
+      setMasterSet(!!bRes.data.customer_master_hash);
+      setRule({ threshold: bRes.data.loyalty_threshold ?? '', pct: bRes.data.loyalty_reward_pct ?? '' });
+    }
+    // Aggregate spend / profit / visits / last visit per customer.
+    const agg = {};
+    for (const r of sRes.data ?? []) {
+      const a = (agg[r.customer_id] ||= { spend: 0, profit: 0, receipts: new Set(), last: 0 });
+      a.spend += r.total_price ?? 0;
+      a.profit += (r.total_price ?? 0) - (r.cost_price ?? 0) * (r.quantity ?? 1);
+      if (r.receipt_no) a.receipts.add(r.receipt_no);
+      const t = new Date(r.timestamp).getTime();
+      if (t > a.last) a.last = t;
+    }
+    setStats(Object.fromEntries(Object.entries(agg).map(([id, a]) => [id, { spend: a.spend, profit: a.profit, visits: a.receipts.size, last: a.last }])));
+    // Group active coupons by customer.
+    const byCust = {};
+    for (const cp of cpRes.data ?? []) (byCust[cp.customer_id] ||= []).push(cp);
+    setCoupons(byCust);
+    setLoading(false);
   };
 
   useEffect(() => {
@@ -1590,35 +1632,200 @@ function CustomersTab({ notify }) {
   }, []);
 
   const saveMaster = async () => {
-    if (!master) {
-      notify('Enter a master password');
-      return;
-    }
+    if (!master) return notify('Enter a master password');
     const customer_master_hash = await hashPin(master);
     const { error } = await supabase.from('businesses').update({ customer_master_hash }).eq('id', getBusinessId());
-    if (error) {
-      notify(`Could not save: ${error.message}`);
-      return;
-    }
+    if (error) return notify(`Could not save: ${error.message}`);
     setMaster('');
     setMasterSet(true);
     notify('Customer master password saved');
   };
 
+  const saveRule = async () => {
+    const threshold = rule.threshold === '' ? null : Number(rule.threshold);
+    const pct = rule.pct === '' ? null : Number(rule.pct);
+    const { error } = await supabase
+      .from('businesses')
+      .update({ loyalty_threshold: threshold, loyalty_reward_pct: pct })
+      .eq('id', getBusinessId());
+    if (error) return notify(`Could not save: ${error.message}`);
+    notify(threshold && pct ? 'Loyalty reward rule saved' : 'Loyalty reward turned off');
+  };
+
   const setActive = async (c, active) => {
     const { error } = await supabase.from('customers').update({ active }).eq('id', c.id);
-    if (error) {
-      notify(`Could not update: ${error.message}`);
-      return;
-    }
+    if (error) return notify(`Could not update: ${error.message}`);
     notify(`${c.username} ${active ? 're-activated' : 'deactivated'}`);
     load();
   };
 
+  const addCoupon = async (c, kind, value, reason) => {
+    const { error } = await supabase.from('customer_coupons').insert({
+      business_id: getBusinessId(),
+      customer_id: c.id,
+      customer_username: c.username,
+      kind,
+      value,
+      reason: reason || null,
+      status: 'active',
+    });
+    if (error) return notify(`Could not grant coupon: ${error.message}`);
+    notify(`Coupon granted to ${c.username}`);
+    load();
+  };
+
+  const grantReward = (c) => addCoupon(c, 'percent', Number(rule.pct), `Loyalty — spent ${Number(rule.threshold).toLocaleString()}+`);
+
+  const submitGrant = async () => {
+    const value = Number(grant.value);
+    if (!value || value <= 0) return notify('Enter a coupon value');
+    if (grant.kind === 'percent' && value > 100) return notify('Percent must be 100 or less');
+    await addCoupon(grantFor, grant.kind, value, grant.reason.trim());
+    setGrantFor(null);
+    setGrant({ kind: 'percent', value: '', reason: '' });
+  };
+
+  const ruleActive = Number(rule.threshold) > 0 && Number(rule.pct) > 0;
+  const eligible = (c) => ruleActive && (stats[c.id]?.spend ?? 0) >= Number(rule.threshold) && (coupons[c.id]?.length ?? 0) === 0;
+
+  // Customers sorted by lifetime spend (best customers first).
+  const ranked = [...customers].sort((a, b) => (stats[b.id]?.spend ?? 0) - (stats[a.id]?.spend ?? 0));
+  const totalSpend = Object.values(stats).reduce((s, a) => s + a.spend, 0);
+  const activeCouponCount = Object.values(coupons).reduce((s, list) => s + list.length, 0);
+
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
+      {/* Overview */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+        <StatCard label="Customers" value={customers.length.toLocaleString()} />
+        <StatCard label="Total spend" value={`${compactMoney(totalSpend)} RWF`} sub="by registered customers" />
+        <StatCard label="Active coupons" value={activeCouponCount.toLocaleString()} tone={activeCouponCount ? 'emerald' : 'slate'} />
+      </div>
+
+      {/* Loyalty auto-reward rule */}
+      <div className="bg-white rounded-2xl shadow-md p-5 sm:p-6 space-y-3">
+        <div>
+          <p className="font-semibold text-slate-700">Loyalty reward</p>
+          <p className="text-sm text-slate-400">
+            Automatically flag a customer for a coupon once their lifetime spend reaches a target. Leave blank to grant coupons only by hand.
+          </p>
+        </div>
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="text-sm">
+            <span className="block text-slate-500 mb-1">Spend reaches (RWF)</span>
+            <input
+              type="number"
+              inputMode="numeric"
+              placeholder="e.g. 50000"
+              value={rule.threshold}
+              onChange={(e) => setRule((r) => ({ ...r, threshold: e.target.value }))}
+              className="w-40 px-4 py-2 rounded-lg border border-gray-300 tabular-nums"
+            />
+          </label>
+          <label className="text-sm">
+            <span className="block text-slate-500 mb-1">Reward (% off)</span>
+            <input
+              type="number"
+              inputMode="numeric"
+              placeholder="e.g. 10"
+              value={rule.pct}
+              onChange={(e) => setRule((r) => ({ ...r, pct: e.target.value }))}
+              className="w-32 px-4 py-2 rounded-lg border border-gray-300 tabular-nums"
+            />
+          </label>
+          <button onClick={saveRule} className="px-6 py-2 rounded-lg bg-amber-500 text-white font-semibold active:scale-95">
+            Save
+          </button>
+        </div>
+      </div>
+
+      {/* Customer cards — spend, profit, visits, coupons */}
+      <div>
+        <p className="text-slate-500 font-semibold mb-3">
+          Registered customers <span className="text-slate-400 font-normal">— they register themselves in Self-service</span>
+        </p>
+        {loading ? (
+          <p className="text-slate-400">Loading…</p>
+        ) : ranked.length === 0 ? (
+          <div className="bg-white rounded-2xl shadow-md px-5 py-6 text-slate-400">No customers registered yet.</div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            {ranked.map((c) => {
+              const s = stats[c.id] ?? { spend: 0, profit: 0, visits: 0, last: 0 };
+              const list = coupons[c.id] ?? [];
+              const inactive = c.active === false;
+              return (
+                <div key={c.id} className={`bg-white rounded-2xl shadow-md p-4 sm:p-5 flex flex-col gap-3 ${inactive ? 'opacity-60' : ''}`}>
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className={`font-semibold text-base truncate ${inactive ? 'text-slate-400 line-through' : 'text-slate-800'}`}>{c.username}</p>
+                      <p className="text-xs text-slate-400 truncate">
+                        {[c.phone, c.email, c.tin && `TIN ${c.tin}`].filter(Boolean).join(' · ') || 'No contact details'}
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => setActive(c, inactive)}
+                      className={`shrink-0 px-2.5 py-1 rounded-lg text-xs font-semibold active:scale-95 ${
+                        inactive ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600'
+                      }`}
+                    >
+                      {inactive ? 'Restore' : 'Deactivate'}
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2 text-center">
+                    <div className="rounded-xl bg-slate-50 py-2">
+                      <p className="text-[10px] uppercase tracking-wide text-slate-400">Spend</p>
+                      <p className="text-sm font-bold text-slate-800 tabular-nums">{compactMoney(s.spend)}</p>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 py-2">
+                      <p className="text-[10px] uppercase tracking-wide text-slate-400">Profit</p>
+                      <p className={`text-sm font-bold tabular-nums ${s.profit >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>{compactMoney(s.profit)}</p>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 py-2">
+                      <p className="text-[10px] uppercase tracking-wide text-slate-400">Visits</p>
+                      <p className="text-sm font-bold text-slate-800 tabular-nums">{s.visits}</p>
+                    </div>
+                  </div>
+
+                  {list.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {list.map((cp) => (
+                        <span key={cp.id} className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 text-xs font-semibold">
+                          🎟 {couponLabel(cp)}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap gap-2 mt-auto pt-1">
+                    {eligible(c) && (
+                      <button
+                        onClick={() => grantReward(c)}
+                        className="px-3 py-1.5 rounded-lg text-sm font-semibold bg-emerald-500 text-white active:scale-95"
+                      >
+                        Grant {rule.pct}% reward
+                      </button>
+                    )}
+                    <button
+                      onClick={() => {
+                        setGrantFor(c);
+                        setGrant({ kind: 'percent', value: '', reason: '' });
+                      }}
+                      className="px-3 py-1.5 rounded-lg text-sm font-semibold bg-slate-100 text-slate-600 active:scale-95"
+                    >
+                      Grant coupon
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
       {/* Master password — used to help a customer who forgot theirs */}
-      <div className="bg-white rounded-2xl shadow-md p-6 space-y-3 max-w-lg">
+      <div className="bg-white rounded-2xl shadow-md p-5 sm:p-6 space-y-3 max-w-lg">
         <div>
           <p className="font-semibold text-slate-700">Customer master password</p>
           <p className="text-sm text-slate-400">
@@ -1631,44 +1838,63 @@ function CustomersTab({ notify }) {
             placeholder={masterSet ? 'Enter a new master password' : 'Set a master password'}
             value={master}
             onChange={(e) => setMaster(e.target.value)}
-            className="flex-1 px-4 py-2 rounded-lg border border-gray-300"
+            className="flex-1 min-w-0 px-4 py-2 rounded-lg border border-gray-300"
           />
-          <button onClick={saveMaster} className="px-6 py-2 rounded-lg bg-amber-500 text-white font-semibold active:scale-95">
+          <button onClick={saveMaster} className="shrink-0 px-6 py-2 rounded-lg bg-amber-500 text-white font-semibold active:scale-95">
             Save
           </button>
         </div>
       </div>
 
-      {/* Registered customers — customers register themselves in Self-service */}
-      <div>
-        <p className="text-slate-500 font-semibold mb-3">
-          Registered customers <span className="text-slate-400 font-normal">— they register themselves in Self-service</span>
-        </p>
-        <div className="bg-white rounded-2xl shadow-md divide-y divide-gray-100">
-          {customers.length === 0 ? (
-            <p className="px-5 py-6 text-slate-400">No customers registered yet.</p>
-          ) : (
-            customers.map((c) => (
-              <div key={c.id} className="flex items-center justify-between px-5 py-4 gap-3">
-                <div className="min-w-0">
-                  <p className={`font-semibold truncate ${c.active === false ? 'text-slate-400 line-through' : 'text-slate-800'}`}>{c.username}</p>
-                  <p className="text-xs text-slate-400 truncate">
-                    {[c.phone, c.email, c.tin && `TIN ${c.tin}`].filter(Boolean).join(' · ') || '—'}
-                  </p>
-                </div>
-                <button
-                  onClick={() => setActive(c, c.active === false)}
-                  className={`shrink-0 px-3 py-1.5 rounded-lg text-sm font-semibold active:scale-95 ${
-                    c.active === false ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600'
-                  }`}
-                >
-                  {c.active === false ? 'Re-activate' : 'Deactivate'}
-                </button>
-              </div>
-            ))
-          )}
+      {/* Manual grant modal */}
+      {grantFor && (
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center p-0 sm:p-4" onClick={() => setGrantFor(null)}>
+          <div className="bg-white w-full sm:max-w-sm rounded-t-2xl sm:rounded-2xl p-5 space-y-4" onClick={(e) => e.stopPropagation()}>
+            <div>
+              <p className="font-bold text-slate-800">Grant coupon</p>
+              <p className="text-sm text-slate-400 truncate">to {grantFor.username}</p>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={() => setGrant((g) => ({ ...g, kind: 'percent' }))}
+                className={`py-2 rounded-lg text-sm font-semibold active:scale-95 ${grant.kind === 'percent' ? 'bg-amber-500 text-white' : 'bg-slate-100 text-slate-600'}`}
+              >
+                % off
+              </button>
+              <button
+                onClick={() => setGrant((g) => ({ ...g, kind: 'amount' }))}
+                className={`py-2 rounded-lg text-sm font-semibold active:scale-95 ${grant.kind === 'amount' ? 'bg-amber-500 text-white' : 'bg-slate-100 text-slate-600'}`}
+              >
+                RWF off
+              </button>
+            </div>
+            <input
+              type="number"
+              inputMode="numeric"
+              autoFocus
+              placeholder={grant.kind === 'percent' ? 'Percent, e.g. 10' : 'Amount off, e.g. 2000'}
+              value={grant.value}
+              onChange={(e) => setGrant((g) => ({ ...g, value: e.target.value }))}
+              className="w-full px-4 py-2.5 rounded-lg border border-gray-300 tabular-nums"
+            />
+            <input
+              type="text"
+              placeholder="Reason (optional)"
+              value={grant.reason}
+              onChange={(e) => setGrant((g) => ({ ...g, reason: e.target.value }))}
+              className="w-full px-4 py-2.5 rounded-lg border border-gray-300"
+            />
+            <div className="flex gap-2">
+              <button onClick={() => setGrantFor(null)} className="flex-1 py-2.5 rounded-lg bg-slate-100 text-slate-600 font-semibold active:scale-95">
+                Cancel
+              </button>
+              <button onClick={submitGrant} className="flex-1 py-2.5 rounded-lg bg-emerald-500 text-white font-semibold active:scale-95">
+                Grant
+              </button>
+            </div>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

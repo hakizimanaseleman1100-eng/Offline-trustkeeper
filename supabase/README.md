@@ -46,6 +46,7 @@ paste the file → **Run**. Every migration is **idempotent** (guarded with
 | `0015_customers.sql` | Adds the `customers` table (CRM foundation: username/password + optional phone/email/TIN), tenant-scoped. |
 | `0016_customer_master.sql` | Adds `businesses.customer_master_hash` — the owner's master password for customer lockouts. |
 | `0017_sale_customer.sql` | Adds `customer_id` / `customer_username` to `hospitality_sales` for per-customer spend tracking. |
+| `0018_coupons.sql` | Adds the `customer_coupons` table (loyalty coupons redeemed as a bill discount) and the venue's optional auto-reward rule (`businesses.loyalty_threshold` / `loyalty_reward_pct`). |
 
 After running `0001`, the app's PIN login and per-waiter accountability work
 end-to-end. Until then, the app falls back to a local-only default owner

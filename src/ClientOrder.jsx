@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './db';
 import { supabase } from './supabaseClient';
@@ -33,6 +33,28 @@ function ClientOrder({ onExit }) {
     const matchesSearch = it.item_name.toLowerCase().includes(search.toLowerCase());
     return matchesCategory && matchesSearch;
   });
+
+  // Refresh the local customer mirror whenever the tablet is online, so sign-in
+  // keeps working if the connection drops mid-shift. The order flow itself needs
+  // no network — this only makes recognising a returning customer offline-proof.
+  useEffect(() => {
+    if (!navigator.onLine) return;
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from('customers')
+        .select('id, business_id, username, pw_hash, phone, email, tin, active')
+        .eq('business_id', getBusinessId());
+      if (cancelled || error || !data) return;
+      await db.customers.clear();
+      await db.customers.bulkPut(
+        data.map((c) => ({ ...c, uname: String(c.username).trim().toLowerCase() }))
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const cartLines = Object.values(cart);
   const cartTotal = cartLines.reduce((s, l) => s + l.price * l.qty, 0);
@@ -97,9 +119,13 @@ function ClientOrder({ onExit }) {
     setAccount({ mode, username: '', password: '', phone: '', email: '', tin: '', master: '', newpw: '' });
   const patchAccount = (patch) => setAccount((a) => ({ ...a, ...patch }));
 
+  // Registering a new account needs the internet — a username has to be unique
+  // across every device, which only the server can guarantee. Ordering without
+  // an account always works offline, so this never blocks a sale.
   const doRegister = async () => {
     const a = account;
     if (!a.username?.trim() || !a.password) return patchAccount({ error: 'Username and password are required' });
+    if (!navigator.onLine) return patchAccount({ error: 'Registering needs internet. You can still order without an account.' });
     patchAccount({ busy: true, error: '' });
     const pw_hash = await hashPin(a.password);
     const { data, error } = await supabase
@@ -113,26 +139,23 @@ function ClientOrder({ onExit }) {
         tin: a.tin?.trim() || null,
         active: true,
       })
-      .select('id, username')
+      .select('id, username, business_id, pw_hash, phone, email, tin, active')
       .single();
     if (error) {
       return patchAccount({ busy: false, error: /duplicate|unique/i.test(error.message) ? 'That username is taken' : error.message });
     }
+    await db.customers.put({ ...data, uname: String(data.username).trim().toLowerCase() }); // so they're recognised offline right away
     setAuthCustomer({ id: data.id, username: data.username }); // auto sign-in after registering
     setAccount(null);
   };
 
+  // Sign-in reads the local customer mirror, so a returning customer is
+  // recognised even with no connection (the mirror is refreshed when online).
   const doSignin = async () => {
     const a = account;
     if (!a.username?.trim() || !a.password) return patchAccount({ error: 'Enter your username and password' });
     patchAccount({ busy: true, error: '' });
-    const { data } = await supabase
-      .from('customers')
-      .select('id, username, pw_hash, active')
-      .eq('business_id', getBusinessId())
-      .ilike('username', a.username.trim())
-      .limit(1);
-    const cust = data?.[0];
+    const cust = await db.customers.where('uname').equals(a.username.trim().toLowerCase()).first();
     const hash = await hashPin(a.password);
     if (!cust || cust.active === false || cust.pw_hash !== hash) {
       return patchAccount({ busy: false, error: 'Wrong username or password' });
@@ -142,10 +165,12 @@ function ClientOrder({ onExit }) {
   };
 
   // Forgot password: verified with the venue's master password (from staff),
-  // then the customer sets a new one and is signed in.
+  // then the customer sets a new one and is signed in. Needs internet (the
+  // master password lives on the server and the new one must be saved there).
   const doForgot = async () => {
     const a = account;
     if (!a.username?.trim() || !a.master || !a.newpw) return patchAccount({ error: 'Fill in all fields' });
+    if (!navigator.onLine) return patchAccount({ error: 'Resetting a password needs internet.' });
     patchAccount({ busy: true, error: '' });
     const [bizRes, custRes] = await Promise.all([
       supabase.from('businesses').select('customer_master_hash').eq('id', getBusinessId()).single(),
@@ -162,6 +187,7 @@ function ClientOrder({ onExit }) {
     const pw_hash = await hashPin(a.newpw);
     const { error } = await supabase.from('customers').update({ pw_hash }).eq('id', cust.id);
     if (error) return patchAccount({ busy: false, error: error.message });
+    await db.customers.where('id').equals(cust.id).modify({ pw_hash }); // keep the offline mirror in step
     setAuthCustomer({ id: cust.id, username: cust.username });
     setAccount(null);
   };

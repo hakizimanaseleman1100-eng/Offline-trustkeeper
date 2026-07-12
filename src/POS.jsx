@@ -35,6 +35,9 @@ function POS({ currentUser, onLogout }) {
   const [momoRef, setMomoRef] = useState('');
   const [lastSyncAt, setLastSyncAt] = useState(null);
   const [showDiscount, setShowDiscount] = useState(false);
+  // Active coupons belonging to the tab's signed-in customer (loaded when online),
+  // offered as one-tap discounts at the till.
+  const [tabCoupons, setTabCoupons] = useState([]);
   // The station this session sells from. Normally the logged-in staff's
   // assigned station; if unassigned, the waiter picks one (kept on the device).
   const [sessionStation, setSessionStation] = useState(null);
@@ -89,6 +92,30 @@ function POS({ currentUser, onLogout }) {
     () => (activeTabId ? db.active_tabs.get(activeTabId) : null),
     [activeTabId]
   );
+
+  // Pull the tab customer's active coupons when online, so the waiter can redeem
+  // one as a bill discount. No connection just means no coupons are offered —
+  // the till still works and manual discounts are unaffected.
+  const tabCustomerId = activeTab?.customer_id ?? null;
+  useEffect(() => {
+    if (!tabCustomerId || !navigator.onLine) {
+      setTabCoupons([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from('customer_coupons')
+        .select('*')
+        .eq('business_id', getBusinessId())
+        .eq('customer_id', tabCustomerId)
+        .eq('status', 'active');
+      if (!cancelled && !error) setTabCoupons(data ?? []);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [tabCustomerId]);
 
   // Which station this device is selling from. Staff assignment wins; otherwise
   // a device-remembered choice (sessionStation). Null = no station set up yet,
@@ -372,6 +399,26 @@ function POS({ currentUser, onLogout }) {
         `Discount ${nextDiscount.mode === 'percent' ? nextDiscount.value + '%' : nextDiscount.value + ' RWF'} on ${activeTab?.name ?? ''}`
       );
     }
+  };
+
+  // Redeem a customer coupon as this tab's bill discount. Marked 'redeemed' on
+  // the server at the moment it's applied, so it can't be used twice (even from
+  // another till). Requires connection — coupons only load when online anyway.
+  const redeemCoupon = async (coupon) => {
+    const nextDiscount = coupon.kind === 'percent' ? { mode: 'percent', value: coupon.value } : { mode: 'amount', value: coupon.value };
+    const { error } = await supabase
+      .from('customer_coupons')
+      .update({ status: 'redeemed', redeemed_at: new Date().toISOString() })
+      .eq('id', coupon.id)
+      .eq('status', 'active'); // guard against a double redeem
+    if (error) {
+      showToast('Could not apply coupon');
+      return;
+    }
+    await setTabDiscount(nextDiscount);
+    setTabCoupons((list) => list.filter((c) => c.id !== coupon.id));
+    logAudit('COUPON', `Redeemed ${coupon.kind === 'percent' ? coupon.value + '%' : coupon.value + ' RWF'} coupon for ${coupon.customer_username ?? 'customer'}`);
+    showToast('Coupon applied');
   };
 
   // Quick-access from a tab card on the Home screen — jump straight into the
@@ -962,6 +1009,24 @@ function POS({ currentUser, onLogout }) {
 
       {showDiscount && (
         <div className="space-y-2">
+          {tabCoupons.length > 0 && (
+            <div className="space-y-1.5">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                {activeTab?.customer_username ? `${activeTab.customer_username}'s coupons` : 'Customer coupons'}
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {tabCoupons.map((cp) => (
+                  <button
+                    key={cp.id}
+                    onClick={() => redeemCoupon(cp)}
+                    className="px-3 h-10 rounded-xl font-semibold text-sm bg-emerald-500 text-white active:scale-95"
+                  >
+                    🎟 {cp.kind === 'percent' ? `${cp.value}% off` : `${Number(cp.value).toLocaleString()} off`}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="flex gap-2">
             {[5, 10, 15].map((pct) => (
               <button
@@ -1202,7 +1267,12 @@ function POS({ currentUser, onLogout }) {
               >
                 ←
               </button>
-              <h2 className="text-lg lg:text-2xl font-extrabold text-slate-900 truncate text-center flex-1">{activeTab?.name}</h2>
+              <div className="flex-1 min-w-0 text-center">
+                <h2 className="text-lg lg:text-2xl font-extrabold text-slate-900 truncate">{activeTab?.name}</h2>
+                {activeTab?.customer_username && (
+                  <p className="text-[11px] lg:text-xs font-semibold text-amber-600 truncate">👤 {activeTab.customer_username}</p>
+                )}
+              </div>
               <span className="text-lg lg:text-2xl font-bold text-slate-800 shrink-0">{cartTotal.toLocaleString()} RWF</span>
               <button
                 onClick={cancelTab}
@@ -1361,11 +1431,16 @@ function POS({ currentUser, onLogout }) {
             className="relative bg-white rounded-t-3xl shadow-xl max-h-[80vh] w-full flex flex-col"
           >
             <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
-              <h3 className="text-xl font-extrabold text-slate-900">{activeTab?.name} — Order</h3>
+              <div className="min-w-0">
+                <h3 className="text-xl font-extrabold text-slate-900 truncate">{activeTab?.name} — Order</h3>
+                {activeTab?.customer_username && (
+                  <p className="text-xs font-semibold text-amber-600 truncate">👤 {activeTab.customer_username}</p>
+                )}
+              </div>
               <button
                 onClick={() => setCartOpen(false)}
                 aria-label="Close cart"
-                className="text-slate-400 text-2xl leading-none w-8 h-8"
+                className="shrink-0 text-slate-400 text-2xl leading-none w-8 h-8"
               >
                 ×
               </button>

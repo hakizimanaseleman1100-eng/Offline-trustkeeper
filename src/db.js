@@ -133,3 +133,16 @@ db.version(9).stores({
   stations: 'id, business_id',
   station_stock: '[station_id+product_id], station_id, product_id',
 });
+
+/*
+ * version(10): local mirror of the Supabase `customers` table so a signed-in
+ * customer can be recognised on the self-service screen even when the tablet is
+ * offline. Same rationale (and same safety) as the `staff` mirror in v7: the
+ * pw_hash is a salted SHA-256, never a plaintext password, so caching it locally
+ * is fine. `uname` holds lower(username) for a single .where() login lookup;
+ * `active` is stored but not indexed (IndexedDB can't index booleans). The
+ * mirror is refreshed from the server whenever the tablet is online.
+ */
+db.version(10).stores({
+  customers: 'id, business_id, uname',
+});
