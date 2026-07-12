@@ -325,13 +325,23 @@ function POS({ currentUser, onLogout }) {
   // "Motel Rooms", "Rooms", "Room", etc.) so it isn't tied to one fixed label.
   const isRoom = (item) => /room|motel|lodg/i.test(item.category ?? '');
 
-  const addItemToTab = async (item) => {
+  // Taps are serialized through this promise chain so rapid double-taps on the
+  // same item merge into one line (each add re-checks the existing line only
+  // after the previous add has finished) instead of racing to create duplicates.
+  const addChainRef = useRef(Promise.resolve());
+
+  const addItemToTab = (item) => {
     if (isRoom(item)) {
       setRoomPrompt(item);
       setNightsInput('1');
       return;
     }
+    addChainRef.current = addChainRef.current
+      .then(() => doAddItem(item))
+      .catch((err) => console.error('Add item failed:', err));
+  };
 
+  const doAddItem = async (item) => {
     const currentRound = activeTab?.current_round ?? 1;
 
     // Repeated taps on the same item bump quantity on its existing cart line —
