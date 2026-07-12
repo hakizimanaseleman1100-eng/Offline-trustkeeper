@@ -91,6 +91,23 @@ async function syncStations() {
   }
 }
 
+// Mirrors the venue's Settings (name, address, TIN, MoMo pay number, receipt
+// footer, loyalty rule) into local meta so the POS can print a complete receipt
+// offline. Business-scoped; runs before login. Left untouched when offline.
+async function syncBusiness() {
+  try {
+    const { data, error } = await supabase
+      .from('businesses')
+      .select('name, address, phone, email, tin, momo_code, receipt_footer, loyalty_threshold, loyalty_reward_pct')
+      .eq('id', getBusinessId())
+      .single();
+    if (error) throw error;
+    await db.meta.put({ key: 'business', value: data });
+  } catch (err) {
+    console.error('Business settings down-sync skipped:', err.message);
+  }
+}
+
 function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [checking, setChecking] = useState(true); // resolving the venue session
@@ -102,6 +119,7 @@ function App() {
     if (navigator.onLine) {
       await syncInventory();
       await syncStations();
+      await syncBusiness();
     }
     await syncStaff();
     setReady(true);

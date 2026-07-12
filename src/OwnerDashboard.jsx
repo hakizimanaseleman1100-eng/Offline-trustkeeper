@@ -17,6 +17,7 @@ const NAV_LINKS = [
   { key: 'Expenses', icon: '💵' },
   { key: 'Team', icon: '👥' },
   { key: 'Customers', icon: '🧑' },
+  { key: 'Settings', icon: '⚙️' },
 ];
 
 // On phones the bottom bar shows only these four most-used views; the rest go
@@ -1570,6 +1571,135 @@ function StationsTab({ notify }) {
   );
 }
 
+// One place for the venue's business constants — reused across receipts,
+// payments and the loyalty rule. Persisted on the `businesses` row and mirrored
+// into local meta so the POS can print a complete bill offline.
+function SettingsTab({ notify }) {
+  const [f, setF] = useState(null); // form fields, null until loaded
+  const [saving, setSaving] = useState(false);
+  const set = (patch) => setF((prev) => ({ ...prev, ...patch }));
+
+  useEffect(() => {
+    (async () => {
+      const { data, error } = await supabase
+        .from('businesses')
+        .select('name, address, phone, email, tin, momo_code, receipt_footer, loyalty_threshold, loyalty_reward_pct')
+        .eq('id', getBusinessId())
+        .single();
+      if (error) {
+        notify(`Could not load settings: ${error.message}`);
+        setF({});
+        return;
+      }
+      setF({
+        name: data.name ?? '',
+        address: data.address ?? '',
+        phone: data.phone ?? '',
+        email: data.email ?? '',
+        tin: data.tin ?? '',
+        momo_code: data.momo_code ?? '',
+        receipt_footer: data.receipt_footer ?? '',
+        loyalty_threshold: data.loyalty_threshold ?? '',
+        loyalty_reward_pct: data.loyalty_reward_pct ?? '',
+      });
+    })();
+  }, []);
+
+  const save = async () => {
+    setSaving(true);
+    const payload = {
+      name: f.name?.trim() || 'My Venue',
+      address: f.address?.trim() || null,
+      phone: f.phone?.trim() || null,
+      email: f.email?.trim() || null,
+      tin: f.tin?.trim() || null,
+      momo_code: f.momo_code?.trim() || null,
+      receipt_footer: f.receipt_footer?.trim() || null,
+      loyalty_threshold: f.loyalty_threshold === '' ? null : Number(f.loyalty_threshold),
+      loyalty_reward_pct: f.loyalty_reward_pct === '' ? null : Number(f.loyalty_reward_pct),
+    };
+    const { error } = await supabase.from('businesses').update(payload).eq('id', getBusinessId());
+    setSaving(false);
+    if (error) return notify(`Could not save: ${error.message}`);
+    // Keep the local mirror in step so the next printed bill uses the new info.
+    await db.meta.put({ key: 'business', value: payload });
+    notify('Settings saved');
+  };
+
+  if (!f) return <p className="text-slate-400">Loading…</p>;
+
+  const field = (label, key, props = {}) => (
+    <label className="text-sm block">
+      <span className="block text-slate-500 mb-1">{label}</span>
+      <input
+        value={f[key] ?? ''}
+        onChange={(e) => set({ [key]: e.target.value })}
+        className="w-full px-4 py-2.5 rounded-lg border border-gray-300"
+        {...props}
+      />
+    </label>
+  );
+
+  return (
+    <div className="space-y-6 max-w-3xl">
+      {/* Business identity — printed at the top of every receipt */}
+      <div className="bg-white rounded-2xl shadow-md p-5 sm:p-6 space-y-4">
+        <div>
+          <p className="font-semibold text-slate-700">Business identity</p>
+          <p className="text-sm text-slate-400">Shown at the top of printed and shared bills.</p>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {field('Business name', 'name')}
+          {field('TIN', 'tin', { inputMode: 'numeric' })}
+          {field('Phone', 'phone', { type: 'tel' })}
+          {field('Email', 'email', { type: 'email' })}
+          <div className="sm:col-span-2">{field('Address', 'address')}</div>
+        </div>
+      </div>
+
+      {/* Payments */}
+      <div className="bg-white rounded-2xl shadow-md p-5 sm:p-6 space-y-4">
+        <div>
+          <p className="font-semibold text-slate-700">Payments</p>
+          <p className="text-sm text-slate-400">Your MoMo pay number / code is printed on the bill so guests can pay.</p>
+        </div>
+        {field('MoMo pay number / code', 'momo_code', { inputMode: 'numeric', placeholder: 'e.g. 0788123456 or *182*8*1*CODE#' })}
+      </div>
+
+      {/* Receipt footer */}
+      <div className="bg-white rounded-2xl shadow-md p-5 sm:p-6 space-y-4">
+        <div>
+          <p className="font-semibold text-slate-700">Receipt footer</p>
+          <p className="text-sm text-slate-400">A short thank-you or note at the bottom of the bill.</p>
+        </div>
+        {field('Footer message', 'receipt_footer', { placeholder: 'e.g. Murakoze! Come again.' })}
+      </div>
+
+      {/* Loyalty reward rule (moved here from Customers) */}
+      <div className="bg-white rounded-2xl shadow-md p-5 sm:p-6 space-y-4">
+        <div>
+          <p className="font-semibold text-slate-700">Loyalty reward</p>
+          <p className="text-sm text-slate-400">
+            Flag a customer for a coupon once their lifetime spend reaches this target. Leave blank to grant coupons only by hand.
+          </p>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {field('Spend reaches (RWF)', 'loyalty_threshold', { type: 'number', inputMode: 'numeric', placeholder: 'e.g. 50000' })}
+          {field('Reward (% off)', 'loyalty_reward_pct', { type: 'number', inputMode: 'numeric', placeholder: 'e.g. 10' })}
+        </div>
+      </div>
+
+      <button
+        onClick={save}
+        disabled={saving}
+        className="w-full sm:w-auto px-8 py-3 rounded-xl bg-amber-500 text-white font-bold active:scale-95 disabled:opacity-50"
+      >
+        {saving ? 'Saving…' : 'Save settings'}
+      </button>
+    </div>
+  );
+}
+
 // Compact money for tight stat cards: 2,500,000 -> "2.5M", 45,000 -> "45k".
 // Keeps big lifetime-spend figures from overflowing a phone-width card.
 function compactMoney(n) {
@@ -1641,17 +1771,6 @@ function CustomersTab({ notify }) {
     notify('Customer master password saved');
   };
 
-  const saveRule = async () => {
-    const threshold = rule.threshold === '' ? null : Number(rule.threshold);
-    const pct = rule.pct === '' ? null : Number(rule.pct);
-    const { error } = await supabase
-      .from('businesses')
-      .update({ loyalty_threshold: threshold, loyalty_reward_pct: pct })
-      .eq('id', getBusinessId());
-    if (error) return notify(`Could not save: ${error.message}`);
-    notify(threshold && pct ? 'Loyalty reward rule saved' : 'Loyalty reward turned off');
-  };
-
   const setActive = async (c, active) => {
     const { error } = await supabase.from('customers').update({ active }).eq('id', c.id);
     if (error) return notify(`Could not update: ${error.message}`);
@@ -1700,43 +1819,6 @@ function CustomersTab({ notify }) {
         <StatCard label="Customers" value={customers.length.toLocaleString()} />
         <StatCard label="Total spend" value={`${compactMoney(totalSpend)} RWF`} sub="by registered customers" />
         <StatCard label="Active coupons" value={activeCouponCount.toLocaleString()} tone={activeCouponCount ? 'emerald' : 'slate'} />
-      </div>
-
-      {/* Loyalty auto-reward rule */}
-      <div className="bg-white rounded-2xl shadow-md p-5 sm:p-6 space-y-3">
-        <div>
-          <p className="font-semibold text-slate-700">Loyalty reward</p>
-          <p className="text-sm text-slate-400">
-            Automatically flag a customer for a coupon once their lifetime spend reaches a target. Leave blank to grant coupons only by hand.
-          </p>
-        </div>
-        <div className="flex flex-wrap items-end gap-3">
-          <label className="text-sm">
-            <span className="block text-slate-500 mb-1">Spend reaches (RWF)</span>
-            <input
-              type="number"
-              inputMode="numeric"
-              placeholder="e.g. 50000"
-              value={rule.threshold}
-              onChange={(e) => setRule((r) => ({ ...r, threshold: e.target.value }))}
-              className="w-40 px-4 py-2 rounded-lg border border-gray-300 tabular-nums"
-            />
-          </label>
-          <label className="text-sm">
-            <span className="block text-slate-500 mb-1">Reward (% off)</span>
-            <input
-              type="number"
-              inputMode="numeric"
-              placeholder="e.g. 10"
-              value={rule.pct}
-              onChange={(e) => setRule((r) => ({ ...r, pct: e.target.value }))}
-              className="w-32 px-4 py-2 rounded-lg border border-gray-300 tabular-nums"
-            />
-          </label>
-          <button onClick={saveRule} className="px-6 py-2 rounded-lg bg-amber-500 text-white font-semibold active:scale-95">
-            Save
-          </button>
-        </div>
       </div>
 
       {/* Customer cards — spend, profit, visits, coupons */}
@@ -1999,6 +2081,7 @@ function OwnerDashboard({ currentUser, onLogout }) {
         {activeLink === 'Expenses' && <ExpensesTab notify={notify} />}
         {activeLink === 'Team' && <TeamTab notify={notify} />}
         {activeLink === 'Customers' && <CustomersTab notify={notify} />}
+        {activeLink === 'Settings' && <SettingsTab notify={notify} />}
         {activeLink === 'Reports' && <ReportsTab />}
       </main>
 

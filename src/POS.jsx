@@ -135,6 +135,10 @@ function POS({ currentUser, onLogout }) {
     {}
   );
 
+  // Venue settings (name, address, TIN, MoMo pay number, footer) for the bill.
+  // Mirrored into local meta at bootstrap, so the receipt is complete offline.
+  const business = useLiveQuery(async () => (await db.meta.get('business'))?.value ?? {}, [], {});
+
   // Categories come from whatever is actually in inventory — no hardcoded list.
   const categories = useLiveQuery(() => db.inventory.orderBy('category').uniqueKeys(), [], []);
 
@@ -624,6 +628,12 @@ function POS({ currentUser, onLogout }) {
   // Plain-text bill — used for both the share sheet and the clipboard fallback.
   const billText = () =>
     [
+      // Venue identity header (only the lines that are actually set).
+      ...(business.name ? [business.name] : []),
+      ...(business.address ? [business.address] : []),
+      ...(business.phone ? [`Tel: ${business.phone}`] : []),
+      ...(business.tin ? [`TIN: ${business.tin}`] : []),
+      ...(business.name || business.address || business.phone || business.tin ? [''] : []),
       activeTab?.name ?? 'Bill',
       ...(activeTab?.receipt_no ? [`Receipt ${activeTab.receipt_no}`] : []),
       ...billItems.map((row) => `${row.name} x${row.quantity} — ${row.total_price.toLocaleString()} RWF`),
@@ -635,6 +645,8 @@ function POS({ currentUser, onLogout }) {
         : []),
       `Total: ${cartTotal.toLocaleString()} RWF`,
       ...taxSummary.map((t) => `VAT ${t.label} (${t.rate}%) incl.: ${Math.round(t.amount).toLocaleString()} RWF`),
+      ...(business.momo_code ? ['', `Pay via MoMo: ${business.momo_code}`] : []),
+      ...(business.receipt_footer ? ['', business.receipt_footer] : []),
     ].join('\n');
 
   // Prints in-place using a hidden, print-only section of the page (see the
@@ -1099,6 +1111,12 @@ function POS({ currentUser, onLogout }) {
 
       {momoPrompt ? (
         <div className="space-y-3 pt-1">
+          {business.momo_code && (
+            <div className="rounded-xl bg-yellow-50 border border-yellow-200 px-4 py-2 text-center">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-yellow-700">Guest pays to</p>
+              <p className="text-lg font-bold text-slate-900 tabular-nums break-all">{business.momo_code}</p>
+            </div>
+          )}
           <input
             type="text"
             autoFocus
@@ -1641,6 +1659,15 @@ function POS({ currentUser, onLogout }) {
         with everything else when the page is printed. */}
     {activeTabId !== null && (
       <div className="hidden print:block p-6 font-mono text-black">
+        {/* Venue identity header */}
+        {(business.name || business.address || business.phone || business.tin) && (
+          <div className="text-center mb-3 pb-3 border-b border-dashed border-black">
+            {business.name && <p className="text-base font-bold">{business.name}</p>}
+            {business.address && <p className="text-xs">{business.address}</p>}
+            {business.phone && <p className="text-xs">Tel: {business.phone}</p>}
+            {business.tin && <p className="text-xs">TIN: {business.tin}</p>}
+          </div>
+        )}
         <h2 className="text-lg font-bold">{activeTab?.name ?? 'Bill'}</h2>
         {activeTab?.receipt_no && <p className="text-sm mb-3">Receipt {activeTab.receipt_no}</p>}
         {billItems.map((row) => (
@@ -1674,6 +1701,10 @@ function POS({ currentUser, onLogout }) {
             <span>{Math.round(t.amount).toLocaleString()} RWF</span>
           </div>
         ))}
+        {business.momo_code && (
+          <p className="text-center text-xs mt-3 pt-3 border-t border-dashed border-black">Pay via MoMo: {business.momo_code}</p>
+        )}
+        {business.receipt_footer && <p className="text-center text-xs mt-2">{business.receipt_footer}</p>}
       </div>
     )}
     </>
