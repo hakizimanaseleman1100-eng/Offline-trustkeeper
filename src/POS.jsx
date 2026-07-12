@@ -5,6 +5,7 @@ import { supabase } from './supabaseClient';
 import { getBusinessId } from './session';
 import QrScanner from './QrScanner';
 import { getDeviceId, nextReceiptNo } from './receipts';
+import { decodeOrder } from './orderCode';
 
 // "5m ago" style label for the last successful sync.
 function relativeTime(ms) {
@@ -239,7 +240,7 @@ function POS({ currentUser, onLogout }) {
     setScanning(false);
     let payload;
     try {
-      payload = JSON.parse(text);
+      payload = decodeOrder(text);
     } catch {
       showToast('Not a valid order code');
       return;

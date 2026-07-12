@@ -4,6 +4,7 @@ import { db } from './db';
 import { supabase } from './supabaseClient';
 import { getBusinessId } from './session';
 import { hashPin } from './auth';
+import { encodeOrder } from './orderCode';
 
 // Self-service ordering on a venue tablet. The customer browses the menu and
 // builds an order, then generates a QR the waiter scans. This screen NEVER
@@ -91,9 +92,21 @@ function ClientOrder({ onExit }) {
       cust: authCustomer ? { id: authCustomer.id, u: authCustomer.username } : null,
       items: cartLines.map((l) => ({ id: l.id, n: l.name, q: l.qty })),
     };
+    const code = encodeOrder(payload); // same string the QR carries
     const QRCode = await import('qrcode'); // loaded on demand
-    const dataUrl = await QRCode.toDataURL(JSON.stringify(payload), { width: 320, margin: 1 });
-    setQr({ dataUrl });
+    const dataUrl = await QRCode.toDataURL(code, { width: 320, margin: 1 });
+    setQr({ dataUrl, code });
+  };
+
+  const [copied, setCopied] = useState(false);
+  const copyCode = async () => {
+    try {
+      await navigator.clipboard.writeText(qr.code);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard blocked — the code is still selectable on screen.
+    }
   };
 
   // Keep the placed round visible under "Ordered" and start a fresh round.
@@ -221,6 +234,25 @@ function ClientOrder({ onExit }) {
         <p className="text-slate-300">
           This round: {cartLines.reduce((s, l) => s + l.qty, 0)} item{cartLines.length === 1 ? '' : 's'} · {cartTotal.toLocaleString()} RWF
         </p>
+
+        {/* Can't-scan fallback: the same code the QR carries, shown as text so a
+            waiter on a desktop (no camera) can type or paste it instead. */}
+        <div className="w-full max-w-xs">
+          <p className="text-slate-400 text-xs mb-1">Can’t scan? Give the waiter this code:</p>
+          <div className="flex items-stretch gap-2">
+            <textarea
+              readOnly
+              value={qr.code}
+              onFocus={(e) => e.target.select()}
+              rows={2}
+              className="flex-1 min-w-0 p-2 rounded-lg bg-slate-800 text-slate-200 border border-slate-700 text-[11px] font-mono resize-none break-all"
+            />
+            <button onClick={copyCode} className="shrink-0 px-3 rounded-lg bg-slate-700 text-white text-sm font-bold active:scale-95">
+              {copied ? '✓' : 'Copy'}
+            </button>
+          </div>
+        </div>
+
         <p className="text-slate-500 text-sm max-w-xs">Nothing is charged until the waiter serves you.</p>
         <div className="flex flex-col gap-3 w-full max-w-xs">
           <button onClick={orderMore} className="h-14 rounded-xl bg-amber-500 text-white font-bold active:scale-95">
