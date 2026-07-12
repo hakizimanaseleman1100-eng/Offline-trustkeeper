@@ -98,7 +98,7 @@ async function syncBusiness() {
   try {
     const { data, error } = await supabase
       .from('businesses')
-      .select('name, address, phone, email, tin, momo_code, receipt_footer, loyalty_threshold, loyalty_reward_pct')
+      .select('name, address, phone, email, tin, momo_code, receipt_footer, loyalty_threshold, loyalty_reward_pct, app_url')
       .eq('id', getBusinessId())
       .single();
     if (error) throw error;

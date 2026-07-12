@@ -36,16 +36,34 @@ function ClientOrder({ onExit, guestPortal = false, initialDetails = '' }) {
   // Dexie mirror instead.
   useEffect(() => {
     if (!guestPortal) return;
+    const bid = getBusinessId();
+    const cacheKey = `portal_menu_${bid}`;
+    // Show a cached copy instantly — repeat scans then work even offline; only
+    // the very first visit needs a connection.
+    try {
+      const cached = JSON.parse(localStorage.getItem(cacheKey) || 'null');
+      if (cached) {
+        setVenueName(cached.name || '');
+        setGuestMenu(Array.isArray(cached.items) ? cached.items : []);
+      }
+    } catch {
+      // ignore a bad cache
+    }
     let cancelled = false;
     (async () => {
-      const { data, error } = await supabase.rpc('get_public_menu', { p_business_id: getBusinessId() });
+      const { data, error } = await supabase.rpc('get_public_menu', { p_business_id: bid });
       if (cancelled) return;
       if (error || !data) {
-        setGuestMenu([]);
+        setGuestMenu((m) => m ?? []); // no network and no cache → empty
         return;
       }
       setVenueName(data.name || '');
       setGuestMenu(Array.isArray(data.items) ? data.items : []);
+      try {
+        localStorage.setItem(cacheKey, JSON.stringify({ name: data.name, items: data.items }));
+      } catch {
+        // storage full / blocked — the live copy still works this session
+      }
     })();
     return () => {
       cancelled = true;
@@ -116,9 +134,10 @@ function ClientOrder({ onExit, guestPortal = false, initialDetails = '' }) {
       v: 1,
       biz: getBusinessId(),
       oid: (crypto.randomUUID?.() ?? String(Date.now())).slice(0, 12),
-      // A signed-in customer groups by their username automatically, and the
-      // order is attributed to them; otherwise fall back to the typed detail.
-      details: authCustomer ? authCustomer.username : details.trim(),
+      // Grouping detail = the table/room when it came from a table QR (so rounds
+      // reach the right table), else a signed-in customer's username, else the
+      // typed detail. A signed-in customer is always attached via `cust` too.
+      details: guestPortal && details.trim() ? details.trim() : authCustomer ? authCustomer.username : details.trim(),
       cust: authCustomer ? { id: authCustomer.id, u: authCustomer.username } : null,
       items: cartLines.map((l) => ({ id: l.id, n: l.name, q: l.qty })),
     };
@@ -176,6 +195,22 @@ function ClientOrder({ onExit, guestPortal = false, initialDetails = '' }) {
     if (!a.username?.trim() || !a.password) return patchAccount({ error: 'Username and password are required' });
     if (!navigator.onLine) return patchAccount({ error: 'Registering needs internet. You can still order without an account.' });
     patchAccount({ busy: true, error: '' });
+    // Guest portal (own phone, no venue login): register via an anon-safe RPC.
+    if (guestPortal) {
+      const { data, error } = await supabase.rpc('register_customer', {
+        p_business_id: getBusinessId(),
+        p_username: a.username.trim(),
+        p_pw_hash: await hashPin(a.password),
+        p_phone: a.phone?.trim() || null,
+        p_email: a.email?.trim() || null,
+        p_tin: a.tin?.trim() || null,
+      });
+      if (error) return patchAccount({ busy: false, error: error.message });
+      if (data?.error) return patchAccount({ busy: false, error: data.error });
+      setAuthCustomer({ id: data.id, username: data.username });
+      setAccount(null);
+      return;
+    }
     const pw_hash = await hashPin(a.password);
     const { data, error } = await supabase
       .from('customers')
@@ -204,6 +239,20 @@ function ClientOrder({ onExit, guestPortal = false, initialDetails = '' }) {
     const a = account;
     if (!a.username?.trim() || !a.password) return patchAccount({ error: 'Enter your username and password' });
     patchAccount({ busy: true, error: '' });
+    // Guest portal has no local mirror — verify online via an anon-safe RPC.
+    if (guestPortal) {
+      if (!navigator.onLine) return patchAccount({ busy: false, error: 'Sign-in needs internet.' });
+      const { data, error } = await supabase.rpc('signin_customer', {
+        p_business_id: getBusinessId(),
+        p_username: a.username.trim(),
+        p_pw_hash: await hashPin(a.password),
+      });
+      if (error) return patchAccount({ busy: false, error: error.message });
+      if (!data?.id) return patchAccount({ busy: false, error: data?.error || 'Wrong username or password' });
+      setAuthCustomer({ id: data.id, username: data.username });
+      setAccount(null);
+      return;
+    }
     const cust = await db.customers.where('uname').equals(a.username.trim().toLowerCase()).first();
     const hash = await hashPin(a.password);
     if (!cust || cust.active === false || cust.pw_hash !== hash) {
@@ -221,6 +270,20 @@ function ClientOrder({ onExit, guestPortal = false, initialDetails = '' }) {
     if (!a.username?.trim() || !a.master || !a.newpw) return patchAccount({ error: 'Fill in all fields' });
     if (!navigator.onLine) return patchAccount({ error: 'Resetting a password needs internet.' });
     patchAccount({ busy: true, error: '' });
+    // Guest portal: verify master + set new password via an anon-safe RPC.
+    if (guestPortal) {
+      const { data, error } = await supabase.rpc('reset_customer_password', {
+        p_business_id: getBusinessId(),
+        p_username: a.username.trim(),
+        p_master_hash: await hashPin(a.master),
+        p_new_pw_hash: await hashPin(a.newpw),
+      });
+      if (error) return patchAccount({ busy: false, error: error.message });
+      if (!data?.id) return patchAccount({ busy: false, error: data?.error || 'Could not reset password' });
+      setAuthCustomer({ id: data.id, username: data.username });
+      setAccount(null);
+      return;
+    }
     const [bizRes, custRes] = await Promise.all([
       supabase.from('businesses').select('customer_master_hash').eq('id', getBusinessId()).single(),
       supabase.from('customers').select('id, username, active').eq('business_id', getBusinessId()).ilike('username', a.username.trim()).limit(1),
@@ -371,34 +434,36 @@ function ClientOrder({ onExit, guestPortal = false, initialDetails = '' }) {
         <div className="min-w-0">
           <h1 className="text-lg sm:text-2xl font-extrabold tracking-tight truncate">{guestPortal && venueName ? venueName : 'Order Here 🙋'}</h1>
           {guestPortal ? (
-            <p className="text-[11px] text-amber-300 truncate">Self-service{details ? ` · ${details}` : ''}</p>
+            <p className="text-[11px] text-amber-300 truncate">
+              Self-service{details ? ` · ${details}` : ''}{authCustomer ? ` · 👤 ${authCustomer.username}` : ''}
+            </p>
           ) : (
             authCustomer && <p className="text-[11px] text-amber-300 truncate">👤 {authCustomer.username}</p>
           )}
         </div>
-        {/* Account & exit belong to the venue tablet only; a guest on their own
-            phone just orders and closes the tab. */}
-        {!guestPortal && (
-          <div className="flex items-center gap-2">
-            {authCustomer ? (
-              <button onClick={signOutCustomer} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
-                Sign out
+        {/* Sign-in works in both modes (guests use anon-safe RPCs). Exit belongs
+            to the venue tablet only — a guest just closes the tab. */}
+        <div className="flex items-center gap-2">
+          {authCustomer ? (
+            <button onClick={signOutCustomer} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
+              Sign out
+            </button>
+          ) : (
+            <>
+              <button onClick={() => openAccount('signin')} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
+                Sign in
               </button>
-            ) : (
-              <>
-                <button onClick={() => openAccount('signin')} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
-                  Sign in
-                </button>
-                <button onClick={() => openAccount('register')} className="px-3 py-1.5 rounded-lg bg-amber-500 text-sm font-semibold active:scale-95">
-                  Register
-                </button>
-              </>
-            )}
+              <button onClick={() => openAccount('register')} className="px-3 py-1.5 rounded-lg bg-amber-500 text-sm font-semibold active:scale-95">
+                Register
+              </button>
+            </>
+          )}
+          {!guestPortal && (
             <button onClick={onExit} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
               Exit
             </button>
-          </div>
-        )}
+          )}
+        </div>
       </header>
 
       {/* Account modal — register / sign in / forgot password */}

@@ -50,6 +50,7 @@ paste the file → **Run**. Every migration is **idempotent** (guarded with
 | `0019_business_settings.sql` | Adds receipt/business constants to `businesses` (`address`, `phone`, `email`, `tin`, `receipt_footer`) for the owner Settings hub; `name` and `momo_code` from 0011 are reused as the business name and MoMo pay number. |
 | `0020_product_subcategory.sql` | Adds `products.sub_category` (finer taxonomy under `category`, e.g. Beer/Liquor/Soft Drinks) and ensures `products.item_code` exists (used by the CSV import). |
 | `0021_public_menu.sql` | Adds the `get_public_menu(business_id)` RPC (SECURITY DEFINER, granted to `anon`) returning display-safe menu fields, so a guest who scans a table/room QR on their own phone can load the menu without a venue login. Never exposes `cost_price`. |
+| `0022_portal_accounts.sql` | Adds `businesses.app_url` (public link the table QR codes point to) and anon-safe customer account RPCs — `register_customer`, `signin_customer`, `reset_customer_password` (all SECURITY DEFINER, granted to `anon`) — so a guest can register/sign in/reset from their own phone. Functions only ever see the salted hash, never a plaintext password. |
 
 After running `0001`, the app's PIN login and per-waiter accountability work
 end-to-end. Until then, the app falls back to a local-only default owner

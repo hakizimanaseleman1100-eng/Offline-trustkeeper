@@ -1683,14 +1683,19 @@ function PortalQrTab({ notify }) {
   const [input, setInput] = useState('');
   const [quickN, setQuickN] = useState('');
   const [qrMap, setQrMap] = useState({}); // label -> QR data URL
+  const [appUrl, setAppUrl] = useState(''); // configured public app link (Settings)
 
-  const base = window.location.origin + window.location.pathname;
-  const urlFor = (label) => `${base}?s=${encodeURIComponent(getBusinessId())}&t=${encodeURIComponent(label)}`;
+  // Codes point to the App link set in Settings; fall back to this device's URL.
+  const base = (appUrl || window.location.origin).replace(/\/+$/, '');
+  const isLocal = /localhost|127\.0\.0\.1|\b0\.0\.0\.0\b/.test(base);
+  const urlFor = (label) => `${base}/?s=${encodeURIComponent(getBusinessId())}&t=${encodeURIComponent(label)}`;
 
   useEffect(() => {
     (async () => {
       const row = await db.meta.get('portal_labels');
       if (Array.isArray(row?.value) && row.value.length) setLabels(row.value);
+      const biz = (await db.meta.get('business'))?.value;
+      if (biz?.app_url) setAppUrl(biz.app_url);
     })();
   }, []);
 
@@ -1711,7 +1716,8 @@ function PortalQrTab({ notify }) {
     return () => {
       cancelled = true;
     };
-  }, [labels]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [labels, base]);
 
   const persist = (next) => {
     setLabels(next);
@@ -1776,6 +1782,14 @@ function PortalQrTab({ notify }) {
             Print these and place them on tables or in rooms. A guest scans one with their phone to open self-service — the table is filled in
             automatically, so their order reaches the right table.
           </p>
+          <p className="text-xs text-slate-400 mt-2">
+            Codes point to: <span className="font-mono text-slate-600 break-all">{base}</span>
+          </p>
+          {isLocal && (
+            <p className="text-xs text-amber-600 mt-1">
+              This is a local address — other phones can’t open it. Set your public <span className="font-semibold">App link</span> in Settings first.
+            </p>
+          )}
         </div>
         <div className="flex flex-wrap items-end gap-3">
           <label className="text-sm">
@@ -1853,7 +1867,7 @@ function SettingsTab({ notify }) {
     (async () => {
       const { data, error } = await supabase
         .from('businesses')
-        .select('name, address, phone, email, tin, momo_code, receipt_footer, loyalty_threshold, loyalty_reward_pct')
+        .select('name, address, phone, email, tin, momo_code, receipt_footer, loyalty_threshold, loyalty_reward_pct, app_url')
         .eq('id', getBusinessId())
         .single();
       if (error) {
@@ -1871,6 +1885,7 @@ function SettingsTab({ notify }) {
         receipt_footer: data.receipt_footer ?? '',
         loyalty_threshold: data.loyalty_threshold ?? '',
         loyalty_reward_pct: data.loyalty_reward_pct ?? '',
+        app_url: data.app_url ?? '',
       });
     })();
   }, []);
@@ -1887,6 +1902,7 @@ function SettingsTab({ notify }) {
       receipt_footer: f.receipt_footer?.trim() || null,
       loyalty_threshold: f.loyalty_threshold === '' ? null : Number(f.loyalty_threshold),
       loyalty_reward_pct: f.loyalty_reward_pct === '' ? null : Number(f.loyalty_reward_pct),
+      app_url: f.app_url?.trim().replace(/\/+$/, '') || null,
     };
     const { error } = await supabase.from('businesses').update(payload).eq('id', getBusinessId());
     setSaving(false);
@@ -1943,6 +1959,18 @@ function SettingsTab({ notify }) {
           <p className="text-sm text-slate-400">A short thank-you or note at the bottom of the bill.</p>
         </div>
         {field('Footer message', 'receipt_footer', { placeholder: 'e.g. Murakoze! Come again.' })}
+      </div>
+
+      {/* Self-service link — the public app URL the table/room QR codes point to */}
+      <div className="bg-white rounded-2xl shadow-md p-5 sm:p-6 space-y-4">
+        <div>
+          <p className="font-semibold text-slate-700">Self-service link</p>
+          <p className="text-sm text-slate-400">
+            The public address of this app — used for the table/room QR codes so a guest's phone can open them. Paste the link you see in the
+            browser when the app is deployed (not localhost).
+          </p>
+        </div>
+        {field('App link', 'app_url', { type: 'url', placeholder: 'e.g. https://your-venue.vercel.app' })}
       </div>
 
       {/* Loyalty reward rule (moved here from Customers) */}
