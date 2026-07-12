@@ -17,6 +17,7 @@ const NAV_LINKS = [
   { key: 'Expenses', icon: '💵' },
   { key: 'Team', icon: '👥' },
   { key: 'Customers', icon: '🧑' },
+  { key: 'Order QR', icon: '📱' },
   { key: 'Settings', icon: '⚙️' },
 ];
 
@@ -1672,6 +1673,174 @@ function StationsTab({ notify }) {
   );
 }
 
+// Printable table/room QR codes. Each encodes a link to this app that drops the
+// guest straight into read-only self-service for THIS venue, with the table
+// pre-filled — so a customer scans the code on their own phone and orders. The
+// link is deterministic (venue id + label), so codes are reproducible without
+// storing them; the label list is just remembered locally for convenience.
+function PortalQrTab({ notify }) {
+  const [labels, setLabels] = useState([]);
+  const [input, setInput] = useState('');
+  const [quickN, setQuickN] = useState('');
+  const [qrMap, setQrMap] = useState({}); // label -> QR data URL
+
+  const base = window.location.origin + window.location.pathname;
+  const urlFor = (label) => `${base}?s=${encodeURIComponent(getBusinessId())}&t=${encodeURIComponent(label)}`;
+
+  useEffect(() => {
+    (async () => {
+      const row = await db.meta.get('portal_labels');
+      if (Array.isArray(row?.value) && row.value.length) setLabels(row.value);
+    })();
+  }, []);
+
+  // Regenerate QR images whenever the label list changes.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (labels.length === 0) {
+        setQrMap({});
+        return;
+      }
+      const QRCode = await import('qrcode');
+      const entries = await Promise.all(
+        labels.map(async (l) => [l, await QRCode.toDataURL(urlFor(l), { width: 400, margin: 1 })])
+      );
+      if (!cancelled) setQrMap(Object.fromEntries(entries));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [labels]);
+
+  const persist = (next) => {
+    setLabels(next);
+    db.meta.put({ key: 'portal_labels', value: next });
+  };
+  const addLabel = () => {
+    const v = input.trim();
+    if (!v) return;
+    if (labels.includes(v)) {
+      notify('Already added');
+      return;
+    }
+    persist([...labels, v]);
+    setInput('');
+  };
+  const addTables = () => {
+    const n = Math.min(Number(quickN) || 0, 100);
+    if (n < 1) return;
+    const next = [...labels];
+    for (let i = 1; i <= n; i++) {
+      const l = `Table ${i}`;
+      if (!next.includes(l)) next.push(l);
+    }
+    persist(next);
+    setQuickN('');
+  };
+  const removeLabel = (l) => persist(labels.filter((x) => x !== l));
+
+  // Print a self-contained sheet of all codes (opens a clean print window so it
+  // doesn't fight the dashboard layout). Each card is cut-and-place ready.
+  const printAll = () => {
+    const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const cards = labels
+      .map(
+        (l) => `<div class="card"><img src="${qrMap[l] || ''}"/><div class="label">${esc(l)}</div><div class="hint">Scan to order</div></div>`
+      )
+      .join('');
+    const html = `<!doctype html><html><head><title>Order QR codes</title><style>
+      *{font-family:sans-serif;box-sizing:border-box}
+      .grid{display:flex;flex-wrap:wrap;gap:16px;padding:16px;justify-content:center}
+      .card{width:240px;border:1px dashed #999;border-radius:12px;padding:14px;text-align:center;page-break-inside:avoid}
+      .card img{width:210px;height:210px}
+      .label{font-weight:800;font-size:20px;margin-top:8px}
+      .hint{color:#666;font-size:12px;margin-top:2px}
+    </style></head><body><div class="grid">${cards}</div>
+    <script>window.onload=function(){window.print()}<\/script></body></html>`;
+    const w = window.open('', '_blank');
+    if (!w) {
+      notify('Allow pop-ups to print');
+      return;
+    }
+    w.document.write(html);
+    w.document.close();
+  };
+
+  return (
+    <div className="space-y-6 max-w-4xl">
+      <div className="bg-white rounded-2xl shadow-md p-5 sm:p-6 space-y-4">
+        <div>
+          <p className="font-semibold text-slate-700">Table &amp; room QR codes</p>
+          <p className="text-sm text-slate-400">
+            Print these and place them on tables or in rooms. A guest scans one with their phone to open self-service — the table is filled in
+            automatically, so their order reaches the right table.
+          </p>
+        </div>
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="text-sm">
+            <span className="block text-slate-500 mb-1">Add a table / room</span>
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && addLabel()}
+              placeholder="e.g. Table 7 or Room 101"
+              className="w-52 px-4 py-2 rounded-lg border border-gray-300"
+            />
+          </label>
+          <button onClick={addLabel} className="px-5 py-2 rounded-lg bg-slate-900 text-white font-semibold active:scale-95">
+            Add
+          </button>
+          <span className="text-slate-300">|</span>
+          <label className="text-sm">
+            <span className="block text-slate-500 mb-1">Quick add tables 1–N</span>
+            <input
+              type="number"
+              inputMode="numeric"
+              value={quickN}
+              onChange={(e) => setQuickN(e.target.value)}
+              placeholder="e.g. 10"
+              className="w-28 px-4 py-2 rounded-lg border border-gray-300 tabular-nums"
+            />
+          </label>
+          <button onClick={addTables} className="px-5 py-2 rounded-lg bg-slate-100 text-slate-700 font-semibold active:scale-95">
+            Add tables
+          </button>
+        </div>
+      </div>
+
+      {labels.length > 0 && (
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <p className="text-slate-500 font-semibold">{labels.length} code{labels.length === 1 ? '' : 's'}</p>
+          <button onClick={printAll} className="px-6 py-2.5 rounded-xl bg-amber-500 text-white font-bold active:scale-95">
+            🖨️ Print all
+          </button>
+        </div>
+      )}
+
+      {labels.length === 0 ? (
+        <div className="bg-white rounded-2xl shadow-md px-5 py-6 text-slate-400">No codes yet — add a table or room above.</div>
+      ) : (
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+          {labels.map((l) => (
+            <div key={l} className="bg-white rounded-2xl shadow-md p-4 flex flex-col items-center gap-2 text-center">
+              {qrMap[l] ? (
+                <img src={qrMap[l]} alt={`QR for ${l}`} className="w-full max-w-[160px] aspect-square" />
+              ) : (
+                <div className="w-full max-w-[160px] aspect-square bg-slate-100 rounded-lg animate-pulse" />
+              )}
+              <p className="font-bold text-slate-800 truncate w-full">{l}</p>
+              <button onClick={() => removeLabel(l)} className="text-xs font-semibold text-red-600 active:scale-95">
+                Remove
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // One place for the venue's business constants — reused across receipts,
 // payments and the loyalty rule. Persisted on the `businesses` row and mirrored
 // into local meta so the POS can print a complete bill offline.
@@ -2182,6 +2351,7 @@ function OwnerDashboard({ currentUser, onLogout }) {
         {activeLink === 'Expenses' && <ExpensesTab notify={notify} />}
         {activeLink === 'Team' && <TeamTab notify={notify} />}
         {activeLink === 'Customers' && <CustomersTab notify={notify} />}
+        {activeLink === 'Order QR' && <PortalQrTab notify={notify} />}
         {activeLink === 'Settings' && <SettingsTab notify={notify} />}
         {activeLink === 'Reports' && <ReportsTab />}
       </main>

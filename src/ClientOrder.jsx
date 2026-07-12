@@ -14,21 +14,50 @@ import { encodeOrder } from './orderCode';
 // After a round is placed (QR generated) the customer keeps seeing it under
 // "Ordered" and can keep adding rounds; each QR carries only the new round, and
 // the venue stacks them onto one tab via the detail (table/name).
-function ClientOrder({ onExit }) {
+// `guestPortal` = the customer reached this from a table/room QR on their own
+// phone (no venue login). In that mode the menu is fetched read-only via a
+// public RPC, the table is pre-filled and locked, and account features are
+// hidden. Otherwise it's the venue tablet's self-service (menu from the local
+// mirror, optional customer sign-in).
+function ClientOrder({ onExit, guestPortal = false, initialDetails = '' }) {
   const [selectedCategory, setSelectedCategory] = useState('All');
   const [search, setSearch] = useState('');
   const [cart, setCart] = useState({}); // item_id -> { id, name, price, qty } — the round being built
   const [ordered, setOrdered] = useState([]); // rounds already placed, merged by item
-  const [details, setDetails] = useState(''); // table number / name — groups a customer's rounds
+  const [details, setDetails] = useState(initialDetails); // table number / name — groups a customer's rounds
   const [qr, setQr] = useState(null); // { dataUrl } once generated
   const [authCustomer, setAuthCustomer] = useState(null); // { id, username } once signed in
   const [account, setAccount] = useState(null); // null | { mode:'register'|'signin'|'forgot', ...fields, busy, error }
+  const [guestMenu, setGuestMenu] = useState(guestPortal ? null : []); // public menu rows (null = loading)
+  const [venueName, setVenueName] = useState('');
 
-  // The menu is exactly the venue's product list (for ordering only — this
-  // screen never touches stock). Active items only.
-  const categories = useLiveQuery(() => db.inventory.orderBy('category').uniqueKeys(), [], []);
-  const allItems = useLiveQuery(() => db.inventory.toArray(), [], []);
-  const items = allItems.filter((it) => {
+  // Guest portal: pull the venue's public menu (display-safe fields only) so a
+  // phone with no venue login can still order. The venue tablet uses the local
+  // Dexie mirror instead.
+  useEffect(() => {
+    if (!guestPortal) return;
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase.rpc('get_public_menu', { p_business_id: getBusinessId() });
+      if (cancelled) return;
+      if (error || !data) {
+        setGuestMenu([]);
+        return;
+      }
+      setVenueName(data.name || '');
+      setGuestMenu(Array.isArray(data.items) ? data.items : []);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [guestPortal]);
+
+  // The menu is the venue's active product list (ordering only — never touches
+  // stock). Source is the public RPC in portal mode, the local mirror otherwise.
+  const dexieItems = useLiveQuery(() => db.inventory.toArray(), [], []);
+  const sourceItems = guestPortal ? guestMenu ?? [] : dexieItems;
+  const categories = [...new Set(sourceItems.map((i) => i.category).filter(Boolean))].sort();
+  const items = sourceItems.filter((it) => {
     if (it.active === false) return false;
     const matchesCategory = selectedCategory === 'All' || it.category === selectedCategory;
     const matchesSearch = it.item_name.toLowerCase().includes(search.toLowerCase());
@@ -38,8 +67,9 @@ function ClientOrder({ onExit }) {
   // Refresh the local customer mirror whenever the tablet is online, so sign-in
   // keeps working if the connection drops mid-shift. The order flow itself needs
   // no network — this only makes recognising a returning customer offline-proof.
+  // Skipped in portal mode: a guest phone has no access to the customer list.
   useEffect(() => {
-    if (!navigator.onLine) return;
+    if (guestPortal || !navigator.onLine) return;
     let cancelled = false;
     (async () => {
       const { data, error } = await supabase
@@ -55,7 +85,7 @@ function ClientOrder({ onExit }) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [guestPortal]);
 
   const cartLines = Object.values(cart);
   const cartTotal = cartLines.reduce((s, l) => s + l.price * l.qty, 0);
@@ -339,28 +369,36 @@ function ClientOrder({ onExit }) {
     <div className="min-h-screen bg-gray-50 font-sans pb-28 lg:pb-8">
       <header className="bg-slate-900 text-white px-4 sm:px-6 lg:px-10 py-3 flex justify-between items-center shadow-lg">
         <div className="min-w-0">
-          <h1 className="text-lg sm:text-2xl font-extrabold tracking-tight">Order Here 🙋</h1>
-          {authCustomer && <p className="text-[11px] text-amber-300 truncate">👤 {authCustomer.username}</p>}
-        </div>
-        <div className="flex items-center gap-2">
-          {authCustomer ? (
-            <button onClick={signOutCustomer} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
-              Sign out
-            </button>
+          <h1 className="text-lg sm:text-2xl font-extrabold tracking-tight truncate">{guestPortal && venueName ? venueName : 'Order Here 🙋'}</h1>
+          {guestPortal ? (
+            <p className="text-[11px] text-amber-300 truncate">Self-service{details ? ` · ${details}` : ''}</p>
           ) : (
-            <>
-              <button onClick={() => openAccount('signin')} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
-                Sign in
-              </button>
-              <button onClick={() => openAccount('register')} className="px-3 py-1.5 rounded-lg bg-amber-500 text-sm font-semibold active:scale-95">
-                Register
-              </button>
-            </>
+            authCustomer && <p className="text-[11px] text-amber-300 truncate">👤 {authCustomer.username}</p>
           )}
-          <button onClick={onExit} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
-            Exit
-          </button>
         </div>
+        {/* Account & exit belong to the venue tablet only; a guest on their own
+            phone just orders and closes the tab. */}
+        {!guestPortal && (
+          <div className="flex items-center gap-2">
+            {authCustomer ? (
+              <button onClick={signOutCustomer} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
+                Sign out
+              </button>
+            ) : (
+              <>
+                <button onClick={() => openAccount('signin')} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
+                  Sign in
+                </button>
+                <button onClick={() => openAccount('register')} className="px-3 py-1.5 rounded-lg bg-amber-500 text-sm font-semibold active:scale-95">
+                  Register
+                </button>
+              </>
+            )}
+            <button onClick={onExit} className="px-3 py-1.5 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95">
+              Exit
+            </button>
+          </div>
+        )}
       </header>
 
       {/* Account modal — register / sign in / forgot password */}
@@ -418,7 +456,10 @@ function ClientOrder({ onExit }) {
       )}
 
       <main className="p-3 sm:p-5 lg:p-8 max-w-7xl mx-auto">
-        {authCustomer ? (
+        {guestPortal && details ? (
+          // Table/room came from the QR — fixed, so orders always group to it.
+          <p className="mb-3 lg:mb-4 text-slate-600 text-sm">Ordering for <span className="font-bold text-slate-900">{details}</span></p>
+        ) : authCustomer ? (
           <p className="mb-3 lg:mb-4 text-slate-500 text-sm">Ordering as <span className="font-bold text-slate-800">{authCustomer.username}</span> — your rounds go to your tab automatically.</p>
         ) : (
           <input
