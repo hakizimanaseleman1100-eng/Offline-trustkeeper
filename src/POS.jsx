@@ -234,13 +234,37 @@ function POS({ currentUser, onLogout }) {
     const byId = new Map(inv.map((p) => [String(p.id), p]));
     const byName = new Map(inv.map((p) => [String(p.item_name).trim().toLowerCase(), p]));
 
-    const tabNumber = (await db.active_tabs.count()) + 1;
-    const id = await db.active_tabs.add({
-      name: `Tab ${tabNumber}`,
-      created_at: Date.now(),
-      status: 'open',
-      current_round: 1,
-    });
+    // The detail (table/name) groups a customer's repeat orders: if an open tab
+    // already carries the same detail, this order stacks onto it (as the tab's
+    // current, unsent round) instead of opening a separate tab.
+    const detail = String(payload.details ?? '').trim();
+    let existingTab = null;
+    if (detail) {
+      existingTab = await db.active_tabs
+        .where('status')
+        .equals('open')
+        .filter((t) => (t.client_ref ?? '').trim().toLowerCase() === detail.toLowerCase())
+        .first();
+    }
+
+    let targetId;
+    let createdNew = false;
+    if (existingTab) {
+      targetId = existingTab.id;
+    } else {
+      const tabNumber = (await db.active_tabs.count()) + 1;
+      targetId = await db.active_tabs.add({
+        name: detail || `Tab ${tabNumber}`,
+        client_ref: detail || null,
+        created_at: Date.now(),
+        status: 'open',
+        current_round: 1,
+      });
+      createdNew = true;
+    }
+
+    const tab = await db.active_tabs.get(targetId);
+    const round = tab.current_round ?? 1;
 
     let added = 0;
     let skipped = 0;
@@ -251,20 +275,31 @@ function POS({ currentUser, onLogout }) {
         continue;
       }
       const qty = Math.max(1, Number(it.q) || 1);
-      await db.sales.add({
-        item_id: prod.id,
-        tab_id: id,
-        round: 1,
-        quantity: qty,
-        total_price: prod.unit_price * qty,
-        cost_price: prod.cost_price,
-        tax_label: prod.tax_label,
-        tax_rate: prod.tax_rate,
-        staff_id: currentUser?.id ?? null,
-        staff_name: currentUser?.name ?? null,
-        timestamp: Date.now(),
-        synced_status: 0,
-      });
+      // Merge with an existing line in the same (unsent) round.
+      const existingLine = await db.sales
+        .where('tab_id')
+        .equals(targetId)
+        .filter((row) => row.item_id === prod.id && (row.round ?? 1) === round)
+        .first();
+      if (existingLine) {
+        const newQty = (existingLine.quantity ?? 1) + qty;
+        await db.sales.update(existingLine.id, { quantity: newQty, total_price: prod.unit_price * newQty });
+      } else {
+        await db.sales.add({
+          item_id: prod.id,
+          tab_id: targetId,
+          round,
+          quantity: qty,
+          total_price: prod.unit_price * qty,
+          cost_price: prod.cost_price,
+          tax_label: prod.tax_label,
+          tax_rate: prod.tax_rate,
+          staff_id: currentUser?.id ?? null,
+          staff_name: currentUser?.name ?? null,
+          timestamp: Date.now(),
+          synced_status: 0,
+        });
+      }
       added++;
     }
 
@@ -273,14 +308,18 @@ function POS({ currentUser, onLogout }) {
       localStorage.setItem('scanned_oids', JSON.stringify(seen.slice(-300)));
     }
     if (added === 0) {
-      await db.active_tabs.delete(id);
+      if (createdNew) await db.active_tabs.delete(targetId);
       showToast('None of those items are on this menu');
       return;
     }
-    setActiveTabId(id);
+    setActiveTabId(targetId);
     setSelectedCategory('All');
     setSearchQuery('');
-    showToast(skipped ? `Order loaded — ${skipped} item(s) unavailable` : `Order loaded — ${added} item(s)`);
+    if (existingTab) {
+      showToast(`Added ${added} item(s) to ${tab.name}`);
+    } else {
+      showToast(skipped ? `New order — ${skipped} item(s) unavailable` : `New order — ${added} item(s)`);
+    }
   };
 
   // A waiter can optionally rename the tab later, from the Customer Details

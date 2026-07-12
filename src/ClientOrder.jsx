@@ -11,6 +11,7 @@ function ClientOrder({ onExit }) {
   const [selectedCategory, setSelectedCategory] = useState('All');
   const [search, setSearch] = useState('');
   const [cart, setCart] = useState({}); // item_id -> { id, name, price, qty }
+  const [details, setDetails] = useState(''); // table number / name — groups a customer's rounds
   const [qr, setQr] = useState(null); // { dataUrl } once generated
 
   const categories = useLiveQuery(() => db.inventory.orderBy('category').uniqueKeys(), [], []);
@@ -51,6 +52,7 @@ function ClientOrder({ onExit }) {
       v: 1,
       biz: getBusinessId(),
       oid: (crypto.randomUUID?.() ?? String(Date.now())).slice(0, 12),
+      details: details.trim(), // groups repeat orders onto one tab after scanning
       items: lines.map((l) => ({ id: l.id, n: l.name, q: l.qty })),
     };
     const QRCode = await import('qrcode'); // loaded on demand
@@ -68,6 +70,7 @@ function ClientOrder({ onExit }) {
     return (
       <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center gap-6 font-sans px-6 py-10 text-center">
         <h1 className="text-2xl font-extrabold text-white">Show this to the waiter</h1>
+        {details.trim() && <p className="text-amber-300 font-bold text-lg">{details.trim()}</p>}
         <img src={qr.dataUrl} alt="Order QR code" className="w-64 h-64 bg-white p-3 rounded-2xl" />
         <p className="text-slate-300">{count} item{count === 1 ? '' : 's'} · {total.toLocaleString()} RWF</p>
         <p className="text-slate-500 text-sm max-w-xs">The waiter scans this to bring your order. Nothing is charged until they serve you.</p>
@@ -88,6 +91,13 @@ function ClientOrder({ onExit }) {
       </header>
 
       <main className="p-3 sm:p-5 lg:p-8 max-w-7xl mx-auto">
+        <input
+          type="text"
+          value={details}
+          onChange={(e) => setDetails(e.target.value)}
+          placeholder="Table number or your name (so the waiter can bring more to the same table)"
+          className="w-full mb-3 lg:mb-4 px-4 lg:px-5 py-3 rounded-xl border border-gray-300 text-sm lg:text-base shadow-sm"
+        />
         <div className="lg:flex lg:gap-6 lg:items-start">
           <div className="lg:flex-1 min-w-0 space-y-3">
             <input
