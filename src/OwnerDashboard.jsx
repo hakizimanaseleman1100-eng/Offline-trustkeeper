@@ -1327,9 +1327,12 @@ function ReconcilePanel({ station }) {
   const [loading, setLoading] = useState(true);
   const [rows, setRows] = useState([]); // {id, name, price, opening, received, onHand}
   const [closing, setClosing] = useState({}); // product_id -> physical count (string)
-  const [cash, setCash] = useState('');
-  const [momo, setMomo] = useState('');
-  const [expenses, setExpenses] = useState('');
+  // VERSEMENT figures come from real data (read-only); only the counted cash is typed.
+  const [salesTotal, setSalesTotal] = useState(0); // actual POS sales (matches the dashboard)
+  const [cashCollected, setCashCollected] = useState(0); // completed cash payments
+  const [momoCollected, setMomoCollected] = useState(0); // completed MoMo payments
+  const [expensesTotal, setExpensesTotal] = useState(0); // recorded expenses
+  const [actual, setActual] = useState(''); // Actual available (Ahari) — counted at close
 
   useEffect(() => {
     let cancelled = false;
@@ -1370,19 +1373,24 @@ function ReconcilePanel({ station }) {
           };
         });
 
-      let cashSum = 0, momoSum = 0;
+      let cashSum = 0, momoSum = 0, salesSum = 0;
       for (const s of salesRes.data ?? []) {
-        if (s.payment_method === 'cash') cashSum += s.total_price ?? 0;
-        else if (s.payment_method === 'momo') momoSum += s.total_price ?? 0;
+        const amt = s.total_price ?? 0;
+        salesSum += amt;
+        if (s.payment_method === 'cash') cashSum += amt;
+        else if (s.payment_method === 'momo') momoSum += amt;
       }
       const expSum = (expRes.data ?? []).reduce((a, e) => a + (e.amount ?? 0), 0);
 
       setRows(list);
       // Closing defaults to system on-hand; the storeman overwrites with the count.
       setClosing(Object.fromEntries(list.map((r) => [r.id, String(r.onHand)])));
-      setCash(String(Math.round(cashSum)));
-      setMomo(String(Math.round(momoSum)));
-      setExpenses(String(Math.round(expSum)));
+      setSalesTotal(Math.round(salesSum));
+      setCashCollected(Math.round(cashSum));
+      setMomoCollected(Math.round(momoSum));
+      setExpensesTotal(Math.round(expSum));
+      // Default the counted amount to what the system expects; the storeman edits it.
+      setActual(String(Math.round(cashSum + momoSum)));
       setLoading(false);
     })();
     return () => {
@@ -1405,15 +1413,18 @@ function ReconcilePanel({ station }) {
     const diffQty = closingVal - systemClosing;
     return { ...r, total, closingVal, sold, revenue: sold * r.price, systemClosing, diffQty, diffMoney: diffQty * r.price };
   });
-  const totalSales = computed.reduce((a, r) => a + r.revenue, 0);
+  const totalSales = computed.reduce((a, r) => a + r.revenue, 0); // stock-derived, for the table
   const totalSold = computed.reduce((a, r) => a + r.sold, 0);
   const totalDiffQty = computed.reduce((a, r) => a + r.diffQty, 0);
   const totalDiffMoney = computed.reduce((a, r) => a + r.diffMoney, 0);
   const signed = (n) => `${n > 0 ? '+' : ''}${money(n)}`;
   const diffColor = (n) => (n < 0 ? 'text-red-600' : n > 0 ? 'text-emerald-600' : 'text-slate-300');
-  const totalCollected = (Number(cash) || 0) + (Number(momo) || 0);
-  const difference = totalCollected - totalSales;
-  const profit = totalSales - (Number(expenses) || 0);
+
+  // VERSEMENT: what the system expects to have been collected vs what was counted.
+  const expectedCollected = cashCollected + momoCollected;
+  const actualAvailable = Number(actual) || 0;
+  const cashDifference = actualAvailable - expectedCollected;
+  const profit = salesTotal - expensesTotal;
 
   const numInput = (value, onChange, extra = '') => (
     <input
@@ -1494,29 +1505,29 @@ function ReconcilePanel({ station }) {
         <div className="space-y-2 text-sm">
           <div className="flex justify-between items-center">
             <span className="text-slate-600">Total Sales (Ayacurujwe)</span>
-            <span className="font-bold text-slate-900">{money(totalSales)} RWF</span>
+            <span className="font-bold text-slate-900">{money(salesTotal)} RWF</span>
           </div>
           <div className="flex justify-between items-center">
             <span className="text-slate-600">Cash Collected</span>
-            {numInput(cash, setCash)}
+            <span className="font-semibold text-slate-800">{money(cashCollected)} RWF</span>
           </div>
           <div className="flex justify-between items-center">
             <span className="text-slate-600">MoMo Collected</span>
-            {numInput(momo, setMomo)}
+            <span className="font-semibold text-slate-800">{money(momoCollected)} RWF</span>
           </div>
           <div className="flex justify-between items-center border-t border-gray-100 pt-2">
-            <span className="text-slate-600">Total Collected</span>
-            <span className="font-bold text-slate-900">{money(totalCollected)} RWF</span>
+            <span className="text-slate-600">Actual available (Ahari)</span>
+            {numInput(actual, setActual)}
           </div>
           <div className="flex justify-between items-center">
             <span className="text-slate-600">Difference</span>
-            <span className={`font-bold ${difference === 0 ? 'text-emerald-600' : 'text-red-600'}`}>
-              {difference > 0 ? '+' : ''}{money(difference)} RWF
+            <span className={`font-bold ${cashDifference === 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+              {cashDifference > 0 ? '+' : ''}{money(cashDifference)} RWF
             </span>
           </div>
           <div className="flex justify-between items-center border-t border-gray-100 pt-2">
             <span className="text-slate-600">Daily Expenses</span>
-            {numInput(expenses, setExpenses)}
+            <span className="font-semibold text-slate-800">{money(expensesTotal)} RWF</span>
           </div>
           <div className="flex justify-between items-center border-t border-gray-100 pt-2">
             <span className="text-slate-700 font-semibold">Profit Before Tax</span>
