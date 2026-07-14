@@ -1333,6 +1333,8 @@ function ReconcilePanel({ station }) {
   const [momoCollected, setMomoCollected] = useState(0); // completed MoMo payments
   const [expensesTotal, setExpensesTotal] = useState(0); // recorded expenses
   const [actual, setActual] = useState(''); // Actual available (Ahari) — counted at close
+  // Debts (amadeni) — populated by the future debt-management feature; zero until then.
+  const [debts] = useState({ recovered: 0, started: 0, outstanding: 0 });
 
   useEffect(() => {
     let cancelled = false;
@@ -1544,23 +1546,48 @@ function ReconcilePanel({ station }) {
         </div>
       </div>
 
-      {/* AGACIRO KA STOCK IHARI — value of the stock still on hand */}
-      <div className="bg-white rounded-xl shadow-md p-4 w-full lg:max-w-sm">
-        <p className="font-extrabold text-slate-800 mb-3">
-          AGACIRO KA STOCK IHARI <span className="text-slate-400 font-normal text-sm">— stock value on hand</span>
-        </p>
-        <div className="space-y-2 text-sm">
-          <div className="flex justify-between items-center">
-            <span className="text-slate-600">At cost (Ikiguzi)</span>
-            <span className="font-semibold text-slate-800">{money(stockAtCost)} RWF</span>
+      {/* Right column: stock value on top, debts below it. */}
+      <div className="w-full lg:max-w-sm space-y-4">
+        {/* AGACIRO KA STOCK IHARI — value of the stock still on hand */}
+        <div className="bg-white rounded-xl shadow-md p-4">
+          <p className="font-extrabold text-slate-800 mb-3">
+            AGACIRO KA STOCK IHARI <span className="text-slate-400 font-normal text-sm">— stock value on hand</span>
+          </p>
+          <div className="space-y-2 text-sm">
+            <div className="flex justify-between items-center">
+              <span className="text-slate-600">At cost (Ikiguzi)</span>
+              <span className="font-semibold text-slate-800">{money(stockAtCost)} RWF</span>
+            </div>
+            <div className="flex justify-between items-center">
+              <span className="text-slate-600">At selling price (Igiciro)</span>
+              <span className="font-semibold text-slate-800">{money(stockAtPrice)} RWF</span>
+            </div>
+            <div className="flex justify-between items-center border-t border-gray-100 pt-2">
+              <span className="text-slate-700 font-semibold">Expected gross profit</span>
+              <span className="font-extrabold text-emerald-600">{money(expectedGross)} RWF</span>
+            </div>
           </div>
-          <div className="flex justify-between items-center">
-            <span className="text-slate-600">At selling price (Igiciro)</span>
-            <span className="font-semibold text-slate-800">{money(stockAtPrice)} RWF</span>
-          </div>
-          <div className="flex justify-between items-center border-t border-gray-100 pt-2">
-            <span className="text-slate-700 font-semibold">Expected gross profit</span>
-            <span className="font-extrabold text-emerald-600">{money(expectedGross)} RWF</span>
+        </div>
+
+        {/* AMADENI — debts. Figures come from the (future) debt-management
+            feature; until then they read zero. */}
+        <div className="bg-white rounded-xl shadow-md p-4">
+          <p className="font-extrabold text-slate-800 mb-3">
+            AMADENI <span className="text-slate-400 font-normal text-sm">— debts</span>
+          </p>
+          <div className="space-y-2 text-sm">
+            <div className="flex justify-between items-center">
+              <span className="text-slate-600">Recovered (Yishyuwe)</span>
+              <span className="font-semibold text-emerald-600">{money(debts.recovered)} RWF</span>
+            </div>
+            <div className="flex justify-between items-center">
+              <span className="text-slate-600">New today (Mashya)</span>
+              <span className="font-semibold text-slate-800">{money(debts.started)} RWF</span>
+            </div>
+            <div className="flex justify-between items-center border-t border-gray-100 pt-2">
+              <span className="text-slate-700 font-semibold">Outstanding (Asigaye)</span>
+              <span className="font-extrabold text-amber-600">{money(debts.outstanding)} RWF</span>
+            </div>
           </div>
         </div>
       </div>
