@@ -1340,7 +1340,7 @@ function ReconcilePanel({ station }) {
       setLoading(true);
       const since = startOfTodayISO();
       const [productsRes, stockRes, movesRes, salesRes, expRes] = await Promise.all([
-        supabase.from('products').select('id, item_name, unit_price, active').eq('business_id', getBusinessId()).order('item_name'),
+        supabase.from('products').select('id, item_name, unit_price, cost_price, active').eq('business_id', getBusinessId()).order('item_name'),
         supabase.from('station_stock').select('*').eq('station_id', station.id),
         supabase.from('stock_movements').select('*').eq('station_id', station.id).gte('created_at', since),
         supabase.from('hospitality_sales').select('payment_method, total_price').eq('station_id', station.id).gte('timestamp', since),
@@ -1367,6 +1367,7 @@ function ReconcilePanel({ station }) {
             id,
             name: p.item_name,
             price: Number(p.unit_price ?? 0),
+            cost: Number(p.cost_price ?? 0),
             received: issued[id] ?? 0,
             onHand: oh,
             opening: oh - (deltaSum[id] ?? 0), // start-of-day = now minus today's movement
@@ -1425,6 +1426,12 @@ function ReconcilePanel({ station }) {
   const actualAvailable = Number(actual) || 0;
   const cashDifference = actualAvailable - expectedCollected;
   const profit = salesTotal - expensesTotal;
+
+  // Value of the stock still on hand (the physical closing count), at cost and at
+  // selling price; the gap is the gross profit expected once it's all sold.
+  const stockAtCost = computed.reduce((a, r) => a + r.closingVal * r.cost, 0);
+  const stockAtPrice = computed.reduce((a, r) => a + r.closingVal * r.price, 0);
+  const expectedGross = stockAtPrice - stockAtCost;
 
   const numInput = (value, onChange, extra = '') => (
     <input
@@ -1499,8 +1506,9 @@ function ReconcilePanel({ station }) {
         </table>
       </div>
 
+      <div className="flex flex-col lg:flex-row gap-4 lg:items-start">
       {/* VERSEMENT — end-of-day reconciliation */}
-      <div className="bg-white rounded-xl shadow-md p-4 max-w-md">
+      <div className="bg-white rounded-xl shadow-md p-4 w-full lg:max-w-md">
         <p className="font-extrabold text-slate-800 mb-3">VERSEMENT <span className="text-slate-400 font-normal text-sm">— end of day</span></p>
         <div className="space-y-2 text-sm">
           <div className="flex justify-between items-center">
@@ -1534,6 +1542,28 @@ function ReconcilePanel({ station }) {
             <span className="font-extrabold text-emerald-600">{money(profit)} RWF</span>
           </div>
         </div>
+      </div>
+
+      {/* AGACIRO KA STOCK IHARI — value of the stock still on hand */}
+      <div className="bg-white rounded-xl shadow-md p-4 w-full lg:max-w-sm">
+        <p className="font-extrabold text-slate-800 mb-3">
+          AGACIRO KA STOCK IHARI <span className="text-slate-400 font-normal text-sm">— stock value on hand</span>
+        </p>
+        <div className="space-y-2 text-sm">
+          <div className="flex justify-between items-center">
+            <span className="text-slate-600">At cost (Ikiguzi)</span>
+            <span className="font-semibold text-slate-800">{money(stockAtCost)} RWF</span>
+          </div>
+          <div className="flex justify-between items-center">
+            <span className="text-slate-600">At selling price (Igiciro)</span>
+            <span className="font-semibold text-slate-800">{money(stockAtPrice)} RWF</span>
+          </div>
+          <div className="flex justify-between items-center border-t border-gray-100 pt-2">
+            <span className="text-slate-700 font-semibold">Expected gross profit</span>
+            <span className="font-extrabold text-emerald-600">{money(expectedGross)} RWF</span>
+          </div>
+        </div>
+      </div>
       </div>
     </div>
   );
