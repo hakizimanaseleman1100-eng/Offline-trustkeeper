@@ -1394,14 +1394,23 @@ function ReconcilePanel({ station }) {
 
   if (loading) return <p className="text-slate-400">Loading…</p>;
 
-  // Live totals derived from the (editable) closing counts.
+  // Live totals derived from the (editable) closing counts. The system closing
+  // is what the POS thinks is left (station stock after sales); the difference
+  // is the physical count minus that — negative = a shortage (missing stock).
   const computed = rows.map((r) => {
     const closingVal = Number(closing[r.id] ?? r.onHand) || 0;
     const total = r.opening + r.received;
     const sold = Math.max(0, total - closingVal);
-    return { ...r, total, closingVal, sold, revenue: sold * r.price };
+    const systemClosing = r.onHand;
+    const diffQty = closingVal - systemClosing;
+    return { ...r, total, closingVal, sold, revenue: sold * r.price, systemClosing, diffQty, diffMoney: diffQty * r.price };
   });
   const totalSales = computed.reduce((a, r) => a + r.revenue, 0);
+  const totalSold = computed.reduce((a, r) => a + r.sold, 0);
+  const totalDiffQty = computed.reduce((a, r) => a + r.diffQty, 0);
+  const totalDiffMoney = computed.reduce((a, r) => a + r.diffMoney, 0);
+  const signed = (n) => `${n > 0 ? '+' : ''}${money(n)}`;
+  const diffColor = (n) => (n < 0 ? 'text-red-600' : n > 0 ? 'text-emerald-600' : 'text-slate-300');
   const totalCollected = (Number(cash) || 0) + (Number(momo) || 0);
   const difference = totalCollected - totalSales;
   const profit = totalSales - (Number(expenses) || 0);
@@ -1427,6 +1436,9 @@ function ReconcilePanel({ station }) {
               <th className="px-2 py-2 text-right">IBYINJIYE<div className="font-normal text-slate-400 normal-case">In</div></th>
               <th className="px-2 py-2 text-right">TOTAL</th>
               <th className="px-2 py-2 text-right">STOCK IRAYE<div className="font-normal text-slate-400 normal-case">Closing count</div></th>
+              <th className="px-2 py-2 text-right">SYSTEM<div className="font-normal text-slate-400 normal-case">System closing</div></th>
+              <th className="px-2 py-2 text-right">ITANDUKANIRO<div className="font-normal text-slate-400 normal-case">Difference (qty)</div></th>
+              <th className="px-2 py-2 text-right">ITANDUKANIRO (RWF)<div className="font-normal text-slate-400 normal-case">Difference value</div></th>
               <th className="px-2 py-2 text-right">IBYACURUJWE<div className="font-normal text-slate-400 normal-case">Sold</div></th>
               <th className="px-2 py-2 text-right">IBICIRO<div className="font-normal text-slate-400 normal-case">Price</div></th>
               <th className="px-2 py-2 text-right">AYACURUJWE<div className="font-normal text-slate-400 normal-case">Revenue</div></th>
@@ -1448,12 +1460,31 @@ function ReconcilePanel({ station }) {
                     className="w-16 px-2 py-1 rounded border border-gray-300 text-right"
                   />
                 </td>
+                <td className="px-2 py-1.5 text-right text-slate-500">{r.systemClosing || ''}</td>
+                <td className={`px-2 py-1.5 text-right font-semibold ${diffColor(r.diffQty)}`}>{r.diffQty ? signed(r.diffQty) : ''}</td>
+                <td className={`px-2 py-1.5 text-right font-semibold ${diffColor(r.diffMoney)}`}>{r.diffMoney ? signed(r.diffMoney) : ''}</td>
                 <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{r.sold || ''}</td>
                 <td className="px-2 py-1.5 text-right text-slate-500">{r.price ? money(r.price) : ''}</td>
                 <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{r.revenue ? money(r.revenue) : ''}</td>
               </tr>
             ))}
           </tbody>
+          <tfoot className="bg-slate-100 border-t-2 border-slate-200 text-slate-800">
+            <tr className="font-bold">
+              <td className="px-2 py-2" />
+              <td className="px-2 py-2">IGITERANYO<div className="font-normal text-slate-400 text-[11px] normal-case">Totals</div></td>
+              <td className="px-2 py-2" />
+              <td className="px-2 py-2" />
+              <td className="px-2 py-2" />
+              <td className="px-2 py-2" />
+              <td className="px-2 py-2" />
+              <td className={`px-2 py-2 text-right ${diffColor(totalDiffQty)}`}>{signed(totalDiffQty)}</td>
+              <td className={`px-2 py-2 text-right ${diffColor(totalDiffMoney)}`}>{signed(totalDiffMoney)}</td>
+              <td className="px-2 py-2 text-right">{totalSold || ''}</td>
+              <td className="px-2 py-2" />
+              <td className="px-2 py-2 text-right">{money(totalSales)}</td>
+            </tr>
+          </tfoot>
         </table>
       </div>
 
