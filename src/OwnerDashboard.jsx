@@ -1437,11 +1437,11 @@ function ReconcilePanel({ station }) {
               <th className="px-2 py-2 text-right">TOTAL</th>
               <th className="px-2 py-2 text-right">STOCK IRAYE<div className="font-normal text-slate-400 normal-case">Closing count</div></th>
               <th className="px-2 py-2 text-right">SYSTEM<div className="font-normal text-slate-400 normal-case">System closing</div></th>
-              <th className="px-2 py-2 text-right">ITANDUKANIRO<div className="font-normal text-slate-400 normal-case">Difference (qty)</div></th>
-              <th className="px-2 py-2 text-right">ITANDUKANIRO (RWF)<div className="font-normal text-slate-400 normal-case">Difference value</div></th>
               <th className="px-2 py-2 text-right">IBYACURUJWE<div className="font-normal text-slate-400 normal-case">Sold</div></th>
               <th className="px-2 py-2 text-right">IBICIRO<div className="font-normal text-slate-400 normal-case">Price</div></th>
               <th className="px-2 py-2 text-right">AYACURUJWE<div className="font-normal text-slate-400 normal-case">Revenue</div></th>
+              <th className="px-2 py-2 text-right">ITANDUKANIRO<div className="font-normal text-slate-400 normal-case">Difference (qty)</div></th>
+              <th className="px-2 py-2 text-right">ITANDUKANIRO (RWF)<div className="font-normal text-slate-400 normal-case">Difference value</div></th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
@@ -1449,9 +1449,9 @@ function ReconcilePanel({ station }) {
               <tr key={r.id}>
                 <td className="px-2 py-1.5 text-slate-400">{i + 1}</td>
                 <td className="px-2 py-1.5 font-semibold text-slate-700">{r.name}</td>
-                <td className="px-2 py-1.5 text-right text-slate-500">{r.opening || ''}</td>
-                <td className="px-2 py-1.5 text-right text-slate-500">{r.received || ''}</td>
-                <td className="px-2 py-1.5 text-right text-slate-500">{r.total || ''}</td>
+                <td className="px-2 py-1.5 text-right text-slate-500">{r.opening}</td>
+                <td className="px-2 py-1.5 text-right text-slate-500">{r.received}</td>
+                <td className="px-2 py-1.5 text-right text-slate-500">{r.total}</td>
                 <td className="px-2 py-1.5 text-right">
                   <input
                     type="number"
@@ -1460,12 +1460,12 @@ function ReconcilePanel({ station }) {
                     className="w-16 px-2 py-1 rounded border border-gray-300 text-right"
                   />
                 </td>
-                <td className="px-2 py-1.5 text-right text-slate-500">{r.systemClosing || ''}</td>
-                <td className={`px-2 py-1.5 text-right font-semibold ${diffColor(r.diffQty)}`}>{r.diffQty ? signed(r.diffQty) : ''}</td>
-                <td className={`px-2 py-1.5 text-right font-semibold ${diffColor(r.diffMoney)}`}>{r.diffMoney ? signed(r.diffMoney) : ''}</td>
-                <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{r.sold || ''}</td>
-                <td className="px-2 py-1.5 text-right text-slate-500">{r.price ? money(r.price) : ''}</td>
-                <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{r.revenue ? money(r.revenue) : ''}</td>
+                <td className="px-2 py-1.5 text-right text-slate-500">{r.systemClosing}</td>
+                <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{r.sold}</td>
+                <td className="px-2 py-1.5 text-right text-slate-500">{money(r.price)}</td>
+                <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{money(r.revenue)}</td>
+                <td className={`px-2 py-1.5 text-right font-semibold ${diffColor(r.diffQty)}`}>{signed(r.diffQty)}</td>
+                <td className={`px-2 py-1.5 text-right font-semibold ${diffColor(r.diffMoney)}`}>{signed(r.diffMoney)}</td>
               </tr>
             ))}
           </tbody>
@@ -1478,11 +1478,11 @@ function ReconcilePanel({ station }) {
               <td className="px-2 py-2" />
               <td className="px-2 py-2" />
               <td className="px-2 py-2" />
-              <td className={`px-2 py-2 text-right ${diffColor(totalDiffQty)}`}>{signed(totalDiffQty)}</td>
-              <td className={`px-2 py-2 text-right ${diffColor(totalDiffMoney)}`}>{signed(totalDiffMoney)}</td>
-              <td className="px-2 py-2 text-right">{totalSold || ''}</td>
+              <td className="px-2 py-2 text-right">{totalSold}</td>
               <td className="px-2 py-2" />
               <td className="px-2 py-2 text-right">{money(totalSales)}</td>
+              <td className={`px-2 py-2 text-right ${diffColor(totalDiffQty)}`}>{signed(totalDiffQty)}</td>
+              <td className={`px-2 py-2 text-right ${diffColor(totalDiffMoney)}`}>{signed(totalDiffMoney)}</td>
             </tr>
           </tfoot>
         </table>
