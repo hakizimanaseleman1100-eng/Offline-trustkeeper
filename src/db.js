@@ -146,3 +146,16 @@ db.version(9).stores({
 db.version(10).stores({
   customers: 'id, business_id, uname',
 });
+
+/*
+ * version(11): local mirror for debts created at the POS (a customer takes goods
+ * on credit). Primary key is a client-generated uuid ('id') so the same id is
+ * used locally and on the server — recoveries (debt_payments, server-side) can
+ * reference it. synced_status 0/1 (number, never boolean) drives the sync push,
+ * exactly like sales/audit_logs. station_id is indexed for per-station lookups.
+ * Debt recoveries are recorded online from the owner's Debts tab, so they have
+ * no local table.
+ */
+db.version(11).stores({
+  debts: 'id, synced_status, station_id',
+});

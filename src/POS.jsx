@@ -34,6 +34,10 @@ function POS({ currentUser, onLogout }) {
   // closing the tab, so the owner can reconcile against the MTN dashboard.
   const [momoPrompt, setMomoPrompt] = useState(false);
   const [momoRef, setMomoRef] = useState('');
+  // "On credit" (amadeni): collect who owes before closing the tab as a debt.
+  const [debtPrompt, setDebtPrompt] = useState(false);
+  const [debtName, setDebtName] = useState('');
+  const [debtNote, setDebtNote] = useState('');
   const [lastSyncAt, setLastSyncAt] = useState(null);
   const [showDiscount, setShowDiscount] = useState(false);
   // Active coupons belonging to the tab's signed-in customer (loaded when online),
@@ -740,6 +744,26 @@ function POS({ currentUser, onLogout }) {
       );
       await db.active_tabs.update(activeTabId, { status: 'paid' });
 
+      // On credit: record a debt for the (net) total, stamped with the waiter in
+      // charge and the station. It syncs like a sale; recoveries happen later.
+      if (paymentMethod === 'debt') {
+        await db.debts.add({
+          id: crypto.randomUUID?.() ?? `debt-${Date.now()}`,
+          customer_id: activeTab?.customer_id ?? null,
+          customer_name: (debtName || activeTab?.customer_username || activeTab?.name || 'Customer').trim(),
+          amount: cartTotal,
+          staff_id: currentUser?.id ?? null,
+          staff_name: currentUser?.name ?? null,
+          station_id: stationId ?? null,
+          station_name: stationName ?? null,
+          receipt_no,
+          note: debtNote.trim() || null,
+          status: 'open',
+          created_at: Date.now(),
+          synced_status: 0,
+        });
+      }
+
       // Decrement THIS station's local stock right away so the waiter sees the
       // new count immediately. The authoritative server decrement happens at
       // sync; the next stations down-sync reconciles the two. Only lines
@@ -757,7 +781,10 @@ function POS({ currentUser, onLogout }) {
         );
       }
 
-      showToast(`${activeTab?.name ?? 'Tab'} closed — ${receipt_no}`);
+      setDebtPrompt(false);
+      setDebtName('');
+      setDebtNote('');
+      showToast(`${activeTab?.name ?? 'Tab'} ${paymentMethod === 'debt' ? 'on credit' : 'closed'} — ${receipt_no}`);
       closeTabView();
       // Push the just-closed sale straight away if we're online; harmless if
       // offline (it stays queued for the next sync).
@@ -782,12 +809,14 @@ function POS({ currentUser, onLogout }) {
       const unsynced = (await db.sales.where('synced_status').equals(0).toArray()).filter((sale) =>
         paidTabIds.has(sale.tab_id)
       );
+      const unsyncedDebts = await db.debts.where('synced_status').equals(0).toArray();
 
-      if (unsynced.length === 0) {
+      if (unsynced.length === 0 && unsyncedDebts.length === 0) {
         if (!silent) showToast('Sync Complete: 0 records uploaded');
         return;
       }
 
+      if (unsynced.length) {
       const { error } = await supabase.from('hospitality_sales').insert(
         unsynced.map((sale) => ({
           business_id: getBusinessId(),
@@ -852,6 +881,31 @@ function POS({ currentUser, onLogout }) {
         const { error: stockErr } = await supabase.rpc('apply_station_stock', { p_moves: moves });
         if (stockErr) console.error('Station stock update failed:', stockErr.message);
       }
+      } // end if (unsynced.length)
+
+      // Push debts created on this device (upsert by id so a retry is idempotent).
+      if (unsyncedDebts.length) {
+        const { error: debtErr } = await supabase.from('debts').upsert(
+          unsyncedDebts.map((d) => ({
+            id: d.id,
+            business_id: getBusinessId(),
+            customer_id: d.customer_id ?? null,
+            customer_name: d.customer_name,
+            amount: d.amount,
+            staff_id: d.staff_id ?? null,
+            staff_name: d.staff_name ?? null,
+            station_id: d.station_id ?? null,
+            station_name: d.station_name ?? null,
+            receipt_no: d.receipt_no ?? null,
+            note: d.note ?? null,
+            status: d.status ?? 'open',
+            created_at: new Date(d.created_at).toISOString(),
+          })),
+          { onConflict: 'id', ignoreDuplicates: true }
+        );
+        if (debtErr) throw debtErr;
+        await db.debts.bulkUpdate(unsyncedDebts.map((d) => ({ key: d.id, changes: { synced_status: 1 } })));
+      }
 
       const unsyncedLogs = await db.audit_logs.where('synced_status').equals(0).toArray();
       if (unsyncedLogs.length > 0) {
@@ -874,7 +928,7 @@ function POS({ currentUser, onLogout }) {
 
       await db.meta.put({ key: 'last_sync_at', value: Date.now() });
       setLastSyncAt(Date.now());
-      showToast(`Sync Complete: ${unsynced.length} records uploaded`);
+      showToast(`Sync Complete: ${unsynced.length + unsyncedDebts.length} records uploaded`);
     } catch (err) {
       console.error('Sync failed:', err.message, err.details, err.hint, err.code);
       if (!silent) showToast('Sync failed — will retry later');
@@ -1135,21 +1189,64 @@ function POS({ currentUser, onLogout }) {
             </button>
           </div>
         </div>
+      ) : debtPrompt ? (
+        <div className="space-y-3 pt-1">
+          <input
+            type="text"
+            autoFocus
+            placeholder="Who owes? (name / phone)"
+            value={debtName}
+            onChange={(e) => setDebtName(e.target.value)}
+            className="w-full px-4 py-3 rounded-xl border border-gray-300 text-lg"
+          />
+          <input
+            type="text"
+            placeholder="Note (optional)"
+            value={debtNote}
+            onChange={(e) => setDebtNote(e.target.value)}
+            className="w-full px-4 py-3 rounded-xl border border-gray-300 text-base"
+          />
+          <div className="grid grid-cols-2 gap-3">
+            <button onClick={() => setDebtPrompt(false)} className="h-14 rounded-xl font-bold bg-slate-100 text-slate-600 active:scale-95">
+              ← Back
+            </button>
+            <button
+              onClick={() => checkout('debt')}
+              disabled={!debtName.trim()}
+              className="h-14 rounded-xl font-bold bg-amber-600 text-white active:scale-95 disabled:opacity-40"
+            >
+              Confirm debt · {cartTotal.toLocaleString()}
+            </button>
+          </div>
+        </div>
       ) : (
-        <div className="grid grid-cols-2 gap-3 pt-1">
+        <div className="space-y-3 pt-1">
+          <div className="grid grid-cols-2 gap-3">
+            <button
+              onClick={() => checkout('cash')}
+              disabled={cartItems.length === 0}
+              className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-green-600 text-white transition active:scale-95 disabled:opacity-40"
+            >
+              PAY CASH
+            </button>
+            <button
+              onClick={() => setMomoPrompt(true)}
+              disabled={cartItems.length === 0}
+              className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-yellow-400 text-slate-900 transition active:scale-95 disabled:opacity-40"
+            >
+              MOMO
+            </button>
+          </div>
           <button
-            onClick={() => checkout('cash')}
+            onClick={() => {
+              setDebtName(activeTab?.customer_username || activeTab?.name || '');
+              setDebtNote('');
+              setDebtPrompt(true);
+            }}
             disabled={cartItems.length === 0}
-            className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-green-600 text-white transition active:scale-95 disabled:opacity-40"
+            className="w-full h-14 rounded-xl text-base font-bold bg-slate-800 text-white transition active:scale-95 disabled:opacity-40"
           >
-            PAY CASH
-          </button>
-          <button
-            onClick={() => setMomoPrompt(true)}
-            disabled={cartItems.length === 0}
-            className="h-16 rounded-xl text-lg sm:text-xl font-bold bg-yellow-400 text-slate-900 transition active:scale-95 disabled:opacity-40"
-          >
-            MOMO
+            🧾 ON CREDIT (AMADENI)
           </button>
         </div>
       )}

@@ -17,6 +17,7 @@ const NAV_LINKS = [
   { key: 'Expenses', icon: '💵' },
   { key: 'Team', icon: '👥' },
   { key: 'Customers', icon: '🧑' },
+  { key: 'Debts', icon: '📒' },
   { key: 'Order QR', icon: '📱' },
   { key: 'Settings', icon: '⚙️' },
 ];
@@ -1035,13 +1036,14 @@ function ReportsTab() {
       setLoading(true);
       const days = REPORT_RANGES.find((r) => r.key === range).days;
       const since = sinceISO(days);
-      const [salesRes, productsRes] = await Promise.all([
+      const [salesRes, productsRes, debtsRes] = await Promise.all([
         supabase
           .from('hospitality_sales')
           .select('*')
           .eq('business_id', getBusinessId())
           .gte('timestamp', since),
         supabase.from('products').select('id, item_name').eq('business_id', getBusinessId()),
+        supabase.from('debts').select('amount, staff_name').eq('business_id', getBusinessId()).gte('created_at', since),
       ]);
       if (cancelled) return;
 
@@ -1083,6 +1085,17 @@ function ReportsTab() {
         .map(([name, total]) => ({ name, total }))
         .sort((a, b) => b.total - a.total);
 
+      // New debts issued in the period, by the waiter in charge.
+      const debtMap = (debtsRes.data ?? []).reduce((acc, d) => {
+        const name = d.staff_name ?? 'Unattributed';
+        acc[name] = (acc[name] ?? 0) + (d.amount ?? 0);
+        return acc;
+      }, {});
+      const debtsByWaiter = Object.entries(debtMap)
+        .map(([name, total]) => ({ name, total }))
+        .sort((a, b) => b.total - a.total);
+      const debtsTotal = debtsByWaiter.reduce((a, w) => a + w.total, 0);
+
       // Covers = guests served, one guest_count per receipt (not per line).
       const coversByReceipt = {};
       for (const r of sales) {
@@ -1091,7 +1104,7 @@ function ReportsTab() {
       const covers = Object.values(coversByReceipt).reduce((s, n) => s + n, 0);
       const perCover = covers > 0 ? revenue / covers : 0;
 
-      setReport({ revenue, profit, receipts, count: sales.length, byMethod, topItems, staff, covers, perCover });
+      setReport({ revenue, profit, receipts, count: sales.length, byMethod, topItems, staff, covers, perCover, debtsByWaiter, debtsTotal });
       setLoading(false);
     })();
     return () => {
@@ -1167,6 +1180,28 @@ function ReportsTab() {
                       <span className="text-slate-500">{money(s.total)}</span>
                     </li>
                   ))}
+                </ul>
+              )}
+            </div>
+
+            <div className="bg-white rounded-2xl shadow-md p-5">
+              <p className="font-semibold text-slate-700 mb-3">
+                Debts by Waiter <span className="text-slate-400 font-normal text-sm">— new credit issued</span>
+              </p>
+              {(report.debtsByWaiter?.length ?? 0) === 0 ? (
+                <p className="text-slate-400 text-sm">No debts issued in this period.</p>
+              ) : (
+                <ul className="divide-y divide-gray-100">
+                  {report.debtsByWaiter.map((w) => (
+                    <li key={w.name} className="flex justify-between py-2 text-sm">
+                      <span className="text-slate-700">{w.name}</span>
+                      <span className="font-semibold text-amber-600">{money(w.total)}</span>
+                    </li>
+                  ))}
+                  <li className="flex justify-between py-2 text-sm border-t-2 border-slate-200 font-bold">
+                    <span className="text-slate-700">Total</span>
+                    <span className="text-amber-600">{money(report.debtsTotal)}</span>
+                  </li>
                 </ul>
               )}
             </div>
@@ -1333,22 +1368,32 @@ function ReconcilePanel({ station }) {
   const [momoCollected, setMomoCollected] = useState(0); // completed MoMo payments
   const [expensesTotal, setExpensesTotal] = useState(0); // recorded expenses
   const [actual, setActual] = useState(''); // Actual available (Ahari) — counted at close
-  // Debts (amadeni) — populated by the future debt-management feature; zero until then.
-  const [debts] = useState({ recovered: 0, started: 0, outstanding: 0 });
+  // Debts (amadeni) for this station: recovered & new today, plus running outstanding.
+  const [debts, setDebts] = useState({ recovered: 0, started: 0, outstanding: 0 });
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       setLoading(true);
       const since = startOfTodayISO();
-      const [productsRes, stockRes, movesRes, salesRes, expRes] = await Promise.all([
+      const [productsRes, stockRes, movesRes, salesRes, expRes, debtsRes, payRes] = await Promise.all([
         supabase.from('products').select('id, item_name, unit_price, cost_price, active').eq('business_id', getBusinessId()).order('item_name'),
         supabase.from('station_stock').select('*').eq('station_id', station.id),
         supabase.from('stock_movements').select('*').eq('station_id', station.id).gte('created_at', since),
         supabase.from('hospitality_sales').select('payment_method, total_price').eq('station_id', station.id).gte('timestamp', since),
         supabase.from('expenses').select('amount').eq('business_id', getBusinessId()).gte('created_at', since),
+        supabase.from('debts').select('amount, status, created_at').eq('business_id', getBusinessId()).eq('station_id', station.id),
+        supabase.from('debt_payments').select('amount, created_at').eq('business_id', getBusinessId()).eq('station_id', station.id),
       ]);
       if (cancelled) return;
+
+      // Debts (amadeni): new & recovered today, plus the running outstanding balance.
+      const debtRows = debtsRes.data ?? [];
+      const payRows = payRes.data ?? [];
+      const startedToday = debtRows.filter((d) => d.created_at >= since).reduce((a, d) => a + (d.amount ?? 0), 0);
+      const recoveredToday = payRows.filter((p) => p.created_at >= since).reduce((a, p) => a + (p.amount ?? 0), 0);
+      const owed = debtRows.filter((d) => d.status !== 'void').reduce((a, d) => a + (d.amount ?? 0), 0);
+      const paid = payRows.reduce((a, p) => a + (p.amount ?? 0), 0);
 
       const onHand = Object.fromEntries((stockRes.data ?? []).map((r) => [String(r.product_id), Number(r.quantity)]));
       // Movements today: total change (to reconstruct opening) and issues (IBYINJIYE).
@@ -1392,6 +1437,7 @@ function ReconcilePanel({ station }) {
       setCashCollected(Math.round(cashSum));
       setMomoCollected(Math.round(momoSum));
       setExpensesTotal(Math.round(expSum));
+      setDebts({ recovered: Math.round(recoveredToday), started: Math.round(startedToday), outstanding: Math.round(owed - paid) });
       // Default the counted amount to what the system expects; the storeman edits it.
       setActual(String(Math.round(cashSum + momoSum)));
       setLoading(false);
@@ -1768,6 +1814,162 @@ function StationsTab({ notify }) {
           ))
         )}
       </div>
+    </div>
+  );
+}
+
+// Debt management (amadeni): outstanding debts customers took on credit at the
+// POS, each stamped with the waiter in charge. The owner records recoveries
+// (debt_payments) here; a debt settles once fully paid.
+function DebtsTab({ notify, currentUser }) {
+  const [debts, setDebts] = useState([]);
+  const [payments, setPayments] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showSettled, setShowSettled] = useState(false);
+  const [payFor, setPayFor] = useState(null); // debt being recovered
+  const [payAmount, setPayAmount] = useState('');
+  const money = (n) => Math.round(n || 0).toLocaleString();
+
+  const load = async () => {
+    setLoading(true);
+    const [dRes, pRes] = await Promise.all([
+      supabase.from('debts').select('*').eq('business_id', getBusinessId()).order('created_at', { ascending: false }),
+      supabase.from('debt_payments').select('*').eq('business_id', getBusinessId()),
+    ]);
+    if (dRes.error) console.error('Failed to load debts:', dRes.error.message);
+    setDebts(dRes.data ?? []);
+    setPayments(pRes.data ?? []);
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const paidFor = (debtId) => payments.filter((p) => p.debt_id === debtId).reduce((a, p) => a + (p.amount ?? 0), 0);
+  const rows = debts
+    .filter((d) => d.status !== 'void')
+    .map((d) => {
+      const paid = paidFor(d.id);
+      return { ...d, paid, remaining: Math.max(0, (d.amount ?? 0) - paid), settled: d.status === 'settled' || paid >= (d.amount ?? 0) };
+    });
+  const open = rows.filter((r) => !r.settled);
+  const outstanding = open.reduce((a, r) => a + r.remaining, 0);
+  const recoveredAll = payments.reduce((a, p) => a + (p.amount ?? 0), 0);
+  const visible = showSettled ? rows : open;
+
+  const openPay = (d) => {
+    setPayFor(d);
+    setPayAmount(String(Math.round(d.remaining)));
+  };
+
+  const recordPayment = async () => {
+    const amount = Number(payAmount);
+    if (!amount || amount <= 0) return notify('Enter an amount');
+    const capped = Math.min(amount, payFor.remaining);
+    const { error } = await supabase.from('debt_payments').insert({
+      business_id: getBusinessId(),
+      debt_id: payFor.id,
+      amount: capped,
+      staff_id: currentUser?.id ?? null,
+      staff_name: currentUser?.name ?? 'Owner',
+      station_id: payFor.station_id ?? null,
+      station_name: payFor.station_name ?? null,
+    });
+    if (error) return notify(`Could not record payment: ${error.message}`);
+    // Settle the debt once fully paid.
+    if (payFor.paid + capped >= (payFor.amount ?? 0)) {
+      await supabase.from('debts').update({ status: 'settled' }).eq('id', payFor.id);
+    }
+    notify(`Recovered ${money(capped)} from ${payFor.customer_name}`);
+    setPayFor(null);
+    setPayAmount('');
+    load();
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+        <StatCard label="Outstanding" value={`${compactMoney(outstanding)} RWF`} tone={outstanding ? 'red' : 'slate'} sub={`${open.length} open`} />
+        <StatCard label="Recovered" value={`${compactMoney(recoveredAll)} RWF`} tone="emerald" sub="all time" />
+        <StatCard label="Debts" value={rows.length.toLocaleString()} />
+      </div>
+
+      <div className="flex items-center justify-between">
+        <p className="text-slate-500 font-semibold">
+          {showSettled ? 'All debts' : 'Open debts'} <span className="text-slate-400 font-normal">— taken on credit at the POS</span>
+        </p>
+        <button
+          onClick={() => setShowSettled((v) => !v)}
+          className="px-3 py-1.5 rounded-lg text-sm font-semibold bg-slate-100 text-slate-600 active:scale-95"
+        >
+          {showSettled ? 'Hide settled' : 'Show settled'}
+        </button>
+      </div>
+
+      {loading ? (
+        <p className="text-slate-400">Loading…</p>
+      ) : visible.length === 0 ? (
+        <div className="bg-white rounded-2xl shadow-md px-5 py-6 text-slate-400">No {showSettled ? '' : 'open '}debts.</div>
+      ) : (
+        <div className="bg-white rounded-2xl shadow-md divide-y divide-gray-100">
+          {visible.map((d) => (
+            <div key={d.id} className="flex items-center justify-between gap-3 px-5 py-4">
+              <div className="min-w-0">
+                <p className={`font-semibold truncate ${d.settled ? 'text-slate-400 line-through' : 'text-slate-800'}`}>{d.customer_name}</p>
+                <p className="text-xs text-slate-400 truncate">
+                  {new Date(d.created_at).toLocaleDateString()} · 👤 {d.staff_name || '—'}
+                  {d.station_name ? ` · ${d.station_name}` : ''}
+                  {d.note ? ` · ${d.note}` : ''}
+                </p>
+              </div>
+              <div className="shrink-0 text-right">
+                <p className="font-bold text-slate-900 tabular-nums">{money(d.remaining)} RWF</p>
+                {d.paid > 0 && !d.settled && <p className="text-[11px] text-slate-400 tabular-nums">of {money(d.amount)}</p>}
+                {d.settled && <p className="text-[11px] text-emerald-600 font-semibold">Settled</p>}
+              </div>
+              {!d.settled && (
+                <button
+                  onClick={() => openPay(d)}
+                  className="shrink-0 px-3 py-1.5 rounded-lg text-sm font-semibold bg-emerald-500 text-white active:scale-95"
+                >
+                  Record payment
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Record-payment modal */}
+      {payFor && (
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center p-0 sm:p-4" onClick={() => setPayFor(null)}>
+          <div className="bg-white w-full sm:max-w-sm rounded-t-2xl sm:rounded-2xl p-5 space-y-4" onClick={(e) => e.stopPropagation()}>
+            <div>
+              <p className="font-bold text-slate-800">Record payment</p>
+              <p className="text-sm text-slate-400 truncate">
+                {payFor.customer_name} — {money(payFor.remaining)} RWF outstanding
+              </p>
+            </div>
+            <input
+              type="number"
+              inputMode="numeric"
+              autoFocus
+              value={payAmount}
+              onChange={(e) => setPayAmount(e.target.value)}
+              className="w-full px-4 py-2.5 rounded-lg border border-gray-300 tabular-nums text-right"
+            />
+            <div className="flex gap-2">
+              <button onClick={() => setPayFor(null)} className="flex-1 py-2.5 rounded-lg bg-slate-100 text-slate-600 font-semibold active:scale-95">
+                Cancel
+              </button>
+              <button onClick={recordPayment} className="flex-1 py-2.5 rounded-lg bg-emerald-500 text-white font-semibold active:scale-95">
+                Record
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2478,6 +2680,7 @@ function OwnerDashboard({ currentUser, onLogout }) {
         {activeLink === 'Expenses' && <ExpensesTab notify={notify} />}
         {activeLink === 'Team' && <TeamTab notify={notify} />}
         {activeLink === 'Customers' && <CustomersTab notify={notify} />}
+        {activeLink === 'Debts' && <DebtsTab notify={notify} currentUser={currentUser} />}
         {activeLink === 'Order QR' && <PortalQrTab notify={notify} />}
         {activeLink === 'Settings' && <SettingsTab notify={notify} />}
         {activeLink === 'Reports' && <ReportsTab />}
