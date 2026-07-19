@@ -1370,6 +1370,7 @@ function ReconcilePanel({ station }) {
   const [actual, setActual] = useState(''); // Actual available (Ahari) — counted at close
   // Debts (amadeni) for this station: recovered & new today, plus running outstanding.
   const [debts, setDebts] = useState({ recovered: 0, started: 0, outstanding: 0 });
+  const [pdfBusy, setPdfBusy] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -1481,6 +1482,108 @@ function ReconcilePanel({ station }) {
   const stockAtPrice = computed.reduce((a, r) => a + r.closingVal * r.price, 0);
   const expectedGross = stockAtPrice - stockAtCost;
 
+  // Build the whole reconciliation as a PDF (loaded on demand). Returns the doc
+  // plus a filename, so the same document can be downloaded or shared.
+  const buildReconciliationPdf = async () => {
+    const { jsPDF } = await import('jspdf');
+    const autoTable = (await import('jspdf-autotable')).default;
+    const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+    const pageW = doc.internal.pageSize.getWidth();
+    const venue = (await db.meta.get('business'))?.value?.name || 'Reconciliation';
+    const dateStr = new Date().toLocaleDateString();
+
+    doc.setFontSize(16);
+    doc.text(venue, 40, 42);
+    doc.setFontSize(10);
+    doc.setTextColor(110);
+    doc.text(`Isesengura / Reconciliation — ${station.name}`, 40, 60);
+    doc.text(dateStr, pageW - 40, 42, { align: 'right' });
+    doc.setTextColor(0);
+
+    autoTable(doc, {
+      startY: 74,
+      head: [['N°', 'IBICURUZWA', 'STOCK YATANGIRANYE', 'IBYINJIYE', 'TOTAL', 'STOCK IRAYE', 'SYSTEM', 'IBYACURUJWE', 'IBICIRO', 'AYACURUJWE', 'ITANDUKANIRO', 'ITANDUKANIRO (RWF)']],
+      body: computed.map((r, i) => [
+        i + 1, r.name, r.opening, r.received, r.total, r.closingVal, r.systemClosing, r.sold, money(r.price), money(r.revenue), signed(r.diffQty), signed(r.diffMoney),
+      ]),
+      foot: [['', 'IGITERANYO', '', '', '', '', '', totalSold, '', money(totalSales), signed(totalDiffQty), signed(totalDiffMoney)]],
+      theme: 'grid',
+      styles: { fontSize: 8, cellPadding: 3, overflow: 'linebreak' },
+      headStyles: { fillColor: [30, 41, 59], fontSize: 7, halign: 'right' },
+      footStyles: { fillColor: [241, 245, 249], textColor: 20, fontStyle: 'bold', halign: 'right' },
+      columnStyles: { 0: { halign: 'left' }, 1: { halign: 'left' }, 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'right' }, 7: { halign: 'right' }, 8: { halign: 'right' }, 9: { halign: 'right' }, 10: { halign: 'right' }, 11: { halign: 'right' } },
+      bodyStyles: { halign: 'right' },
+    });
+
+    const sumY = doc.lastAutoTable.finalY + 20;
+    const rwf = (n) => `${money(n)} RWF`;
+    const summary = (left, width, title, rows) =>
+      autoTable(doc, {
+        startY: sumY,
+        margin: { left },
+        tableWidth: width,
+        head: [[title, '']],
+        body: rows,
+        theme: 'grid',
+        styles: { fontSize: 8, cellPadding: 3 },
+        headStyles: { fillColor: [30, 41, 59] },
+        columnStyles: { 1: { halign: 'right' } },
+      });
+
+    summary(40, 250, 'VERSEMENT', [
+      ['Total Sales (Ayacurujwe)', rwf(salesTotal)],
+      ['Cash Collected', rwf(cashCollected)],
+      ['MoMo Collected', rwf(momoCollected)],
+      ['Actual available (Ahari)', rwf(actualAvailable)],
+      ['Difference', `${cashDifference > 0 ? '+' : ''}${rwf(cashDifference)}`],
+      ['Daily Expenses', rwf(expensesTotal)],
+      ['Profit Before Tax', rwf(profit)],
+    ]);
+    summary(300, 250, 'AGACIRO KA STOCK IHARI', [
+      ['At cost (Ikiguzi)', rwf(stockAtCost)],
+      ['At selling price (Igiciro)', rwf(stockAtPrice)],
+      ['Expected gross profit', rwf(expectedGross)],
+    ]);
+    summary(560, 240, 'AMADENI (Debts)', [
+      ['Recovered (Yishyuwe)', rwf(debts.recovered)],
+      ['New today (Mashya)', rwf(debts.started)],
+      ['Outstanding (Asigaye)', rwf(debts.outstanding)],
+    ]);
+
+    const safe = (s) => String(s).replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '');
+    return { doc, filename: `reconciliation-${safe(station.name)}-${new Date().toISOString().slice(0, 10)}.pdf` };
+  };
+
+  const downloadPdf = async () => {
+    setPdfBusy(true);
+    try {
+      const { doc, filename } = await buildReconciliationPdf();
+      doc.save(filename);
+    } catch (err) {
+      console.error('PDF failed:', err);
+      window.alert('Could not build the PDF.');
+    } finally {
+      setPdfBusy(false);
+    }
+  };
+
+  const sharePdf = async () => {
+    setPdfBusy(true);
+    try {
+      const { doc, filename } = await buildReconciliationPdf();
+      const file = new File([doc.output('blob')], filename, { type: 'application/pdf' });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: filename });
+      } else {
+        doc.save(filename); // desktop / unsupported — fall back to a download
+      }
+    } catch (err) {
+      if (err?.name !== 'AbortError') console.error('Share failed:', err);
+    } finally {
+      setPdfBusy(false);
+    }
+  };
+
   const numInput = (value, onChange, extra = '') => (
     <input
       type="number"
@@ -1492,6 +1595,24 @@ function ReconcilePanel({ station }) {
 
   return (
     <div className="space-y-4">
+      {/* Export the whole reconciliation report as a PDF (download or share). */}
+      <div className="flex justify-end gap-2">
+        <button
+          onClick={downloadPdf}
+          disabled={pdfBusy}
+          className="px-4 py-2 rounded-lg text-sm font-semibold bg-slate-900 text-white active:scale-95 disabled:opacity-50"
+        >
+          {pdfBusy ? 'Preparing…' : '⬇ Download PDF'}
+        </button>
+        <button
+          onClick={sharePdf}
+          disabled={pdfBusy}
+          className="px-4 py-2 rounded-lg text-sm font-semibold bg-amber-500 text-white active:scale-95 disabled:opacity-50"
+        >
+          ↗ Share
+        </button>
+      </div>
+
       <div className="overflow-x-auto bg-white rounded-xl shadow-md">
         <table className="w-full text-left text-sm whitespace-nowrap">
           <thead className="bg-slate-100 text-slate-600 text-[11px]">
