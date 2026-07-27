@@ -1354,10 +1354,12 @@ function SalesTab({ notify, currentUser }) {
 }
 
 // End-of-day reconciliation for one station, laid out like the stock sheet
-// Rwandan bars already use: N° · IBICURUZWA · STOCK YATANGIRANYE · IBYINJIYE ·
-// TOTAL · STOCK IRAYE · IBYACURUJWE · IBICIRO · AYACURUJWE, then the VERSEMENT
-// footer. STOCK IRAYE (closing) is a live physical count; sold and revenue
-// derive from it, so the storeman is accountable for stock and cash.
+// Rwandan bars already use. IMPORTANT: sold quantity and revenue come from the
+// RECORDED sales (the single source of truth) — never derived from the stock
+// count — so the table's AYACURUJWE total always equals VERSEMENT and shrinkage
+// can never masquerade as revenue. The physical count (STOCK IRAYE) is compared
+// to the sales-expected closing to surface a variance, valued at COST (the real
+// loss). Items that aren't stock-tracked (food, rooms) still show their sales.
 function ReconcilePanel({ station }) {
   const [loading, setLoading] = useState(true);
   const [rows, setRows] = useState([]); // {id, name, price, opening, received, onHand}
@@ -1366,6 +1368,7 @@ function ReconcilePanel({ station }) {
   const [salesTotal, setSalesTotal] = useState(0); // actual POS sales (matches the dashboard)
   const [cashCollected, setCashCollected] = useState(0); // completed cash payments
   const [momoCollected, setMomoCollected] = useState(0); // completed MoMo payments
+  const [creditCollected, setCreditCollected] = useState(0); // sold on credit (amadeni)
   const [expensesTotal, setExpensesTotal] = useState(0); // recorded expenses
   const [actual, setActual] = useState(''); // Actual available (Ahari) — counted at close
   // Debts (amadeni) for this station: recovered & new today, plus running outstanding.
@@ -1381,7 +1384,7 @@ function ReconcilePanel({ station }) {
         supabase.from('products').select('id, item_name, unit_price, cost_price, active').eq('business_id', getBusinessId()).order('item_name'),
         supabase.from('station_stock').select('*').eq('station_id', station.id),
         supabase.from('stock_movements').select('*').eq('station_id', station.id).gte('created_at', since),
-        supabase.from('hospitality_sales').select('payment_method, total_price').eq('station_id', station.id).gte('timestamp', since),
+        supabase.from('hospitality_sales').select('item_id, quantity, total_price, payment_method').eq('station_id', station.id).gte('timestamp', since),
         supabase.from('expenses').select('amount').eq('business_id', getBusinessId()).gte('created_at', since),
         supabase.from('debts').select('amount, status, created_at').eq('business_id', getBusinessId()).eq('station_id', station.id),
         supabase.from('debt_payments').select('amount, created_at').eq('business_id', getBusinessId()).eq('station_id', station.id),
@@ -1406,41 +1409,60 @@ function ReconcilePanel({ station }) {
         if (m.reason === 'issue') issued[k] = (issued[k] ?? 0) + Number(m.delta);
       }
 
+      // Sales are the money source of truth: per-item quantity + net revenue, and
+      // the split by payment method. Revenue NEVER comes from the stock count.
+      const soldQty = {}, itemRev = {};
+      let cashSum = 0, momoSum = 0, creditSum = 0, salesSum = 0;
+      for (const s of salesRes.data ?? []) {
+        const amt = s.total_price ?? 0;
+        salesSum += amt;
+        if (s.payment_method === 'cash') cashSum += amt;
+        else if (s.payment_method === 'momo') momoSum += amt;
+        else if (s.payment_method === 'debt') creditSum += amt;
+        const id = String(s.item_id);
+        soldQty[id] = (soldQty[id] ?? 0) + (s.quantity ?? 1);
+        itemRev[id] = (itemRev[id] ?? 0) + amt;
+      }
+      const expSum = (expRes.data ?? []).reduce((a, e) => a + (e.amount ?? 0), 0);
+
+      // A row per product that is either stocked at this station OR sold today.
+      // Stock columns apply only to stocked items; sold/revenue always come from
+      // the recorded sales, so a sale is never dropped from the totals (e.g. food
+      // and rooms that aren't stock-tracked still show their revenue).
       const list = (productsRes.data ?? [])
-        .filter((p) => p.active !== false)
         .map((p) => {
           const id = String(p.id);
+          const tracked = onHand[id] !== undefined;
           const oh = onHand[id] ?? 0;
           return {
             id,
             name: p.item_name,
             price: Number(p.unit_price ?? 0),
             cost: Number(p.cost_price ?? 0),
-            received: issued[id] ?? 0,
-            onHand: oh,
-            opening: oh - (deltaSum[id] ?? 0), // start-of-day = now minus today's movement
+            tracked,
+            received: tracked ? issued[id] ?? 0 : 0,
+            opening: tracked ? oh - (deltaSum[id] ?? 0) : 0,
+            sold: soldQty[id] ?? 0,
+            revenue: itemRev[id] ?? 0,
           };
-        });
-
-      let cashSum = 0, momoSum = 0, salesSum = 0;
-      for (const s of salesRes.data ?? []) {
-        const amt = s.total_price ?? 0;
-        salesSum += amt;
-        if (s.payment_method === 'cash') cashSum += amt;
-        else if (s.payment_method === 'momo') momoSum += amt;
-      }
-      const expSum = (expRes.data ?? []).reduce((a, e) => a + (e.amount ?? 0), 0);
+        })
+        .filter((r) => r.tracked || r.sold > 0 || r.revenue > 0);
 
       setRows(list);
-      // Closing defaults to system on-hand; the storeman overwrites with the count.
-      setClosing(Object.fromEntries(list.map((r) => [r.id, String(r.onHand)])));
+      // Counted stock defaults to the sales-expected closing (opening + in − sold);
+      // the storeman overwrites it with the physical count. It only drives the
+      // shrinkage variance now — it can no longer change the revenue figure.
+      setClosing(
+        Object.fromEntries(list.filter((r) => r.tracked).map((r) => [r.id, String(r.opening + r.received - r.sold)]))
+      );
       setSalesTotal(Math.round(salesSum));
       setCashCollected(Math.round(cashSum));
       setMomoCollected(Math.round(momoSum));
+      setCreditCollected(Math.round(creditSum));
       setExpensesTotal(Math.round(expSum));
       setDebts({ recovered: Math.round(recoveredToday), started: Math.round(startedToday), outstanding: Math.round(owed - paid) });
-      // Default the counted amount to what the system expects; the storeman edits it.
-      setActual(String(Math.round(cashSum + momoSum)));
+      // Cash that should be in the drawer = cash sales − expenses paid from it.
+      setActual(String(Math.round(cashSum - expSum)));
       setLoading(false);
     })();
     return () => {
@@ -1452,34 +1474,34 @@ function ReconcilePanel({ station }) {
 
   if (loading) return <p className="text-slate-400">Loading…</p>;
 
-  // Live totals derived from the (editable) closing counts. The system closing
-  // is what the POS thinks is left (station stock after sales); the difference
-  // is the physical count minus that — negative = a shortage (missing stock).
+  // Sold quantity and revenue are the RECORDED sales (authoritative). For stocked
+  // items the physical count is compared to the sales-expected closing to surface
+  // shrinkage — valued at COST (the real loss), never added to revenue.
   const computed = rows.map((r) => {
-    const closingVal = Number(closing[r.id] ?? r.onHand) || 0;
     const total = r.opening + r.received;
-    const sold = Math.max(0, total - closingVal);
-    const systemClosing = r.onHand;
-    const diffQty = closingVal - systemClosing;
-    return { ...r, total, closingVal, sold, revenue: sold * r.price, systemClosing, diffQty, diffMoney: diffQty * r.price };
+    const expected = total - r.sold; // opening + in − sold
+    const countedVal = r.tracked ? Number(closing[r.id] ?? expected) || 0 : null;
+    const varianceQty = r.tracked ? countedVal - expected : 0;
+    const varianceCost = varianceQty * r.cost;
+    return { ...r, total, expected, countedVal, varianceQty, varianceCost };
   });
-  const totalSales = computed.reduce((a, r) => a + r.revenue, 0); // stock-derived, for the table
   const totalSold = computed.reduce((a, r) => a + r.sold, 0);
-  const totalDiffQty = computed.reduce((a, r) => a + r.diffQty, 0);
-  const totalDiffMoney = computed.reduce((a, r) => a + r.diffMoney, 0);
+  const totalRevenue = computed.reduce((a, r) => a + r.revenue, 0); // equals salesTotal
+  const totalVarQty = computed.reduce((a, r) => a + r.varianceQty, 0);
+  const totalVarCost = computed.reduce((a, r) => a + r.varianceCost, 0);
   const signed = (n) => `${n > 0 ? '+' : ''}${money(n)}`;
   const diffColor = (n) => (n < 0 ? 'text-red-600' : n > 0 ? 'text-emerald-600' : 'text-slate-300');
 
-  // VERSEMENT: what the system expects to have been collected vs what was counted.
-  const expectedCollected = cashCollected + momoCollected;
+  // Cash-up: cash that should be in the drawer (cash sales − expenses) vs counted.
+  const cashExpected = cashCollected - expensesTotal;
   const actualAvailable = Number(actual) || 0;
-  const cashDifference = actualAvailable - expectedCollected;
+  const cashDifference = actualAvailable - cashExpected;
   const profit = salesTotal - expensesTotal;
 
-  // Value of the stock still on hand (the physical closing count), at cost and at
-  // selling price; the gap is the gross profit expected once it's all sold.
-  const stockAtCost = computed.reduce((a, r) => a + r.closingVal * r.cost, 0);
-  const stockAtPrice = computed.reduce((a, r) => a + r.closingVal * r.price, 0);
+  // Value of the stock still on hand (the physical count), at cost and at selling
+  // price; the gap is the gross profit expected once it's all sold.
+  const stockAtCost = computed.reduce((a, r) => a + (r.tracked ? r.countedVal * r.cost : 0), 0);
+  const stockAtPrice = computed.reduce((a, r) => a + (r.tracked ? r.countedVal * r.price : 0), 0);
   const expectedGross = stockAtPrice - stockAtCost;
 
   // Build the whole reconciliation as a PDF (loaded on demand). Returns the doc
@@ -1502,11 +1524,15 @@ function ReconcilePanel({ station }) {
 
     autoTable(doc, {
       startY: 74,
-      head: [['N°', 'IBICURUZWA', 'STOCK YATANGIRANYE', 'IBYINJIYE', 'TOTAL', 'STOCK IRAYE', 'SYSTEM', 'IBYACURUJWE', 'IBICIRO', 'AYACURUJWE', 'ITANDUKANIRO', 'ITANDUKANIRO (RWF)']],
+      head: [['N°', 'IBICURUZWA', 'STOCK YATANGIRANYE', 'IBYINJIYE', 'TOTAL', 'IBYACURUJWE', 'STOCK IRAYE', 'TEGEREJWE', 'IBICIRO', 'AYACURUJWE', 'ITANDUKANIRO', 'ITANDUKANIRO (RWF)']],
       body: computed.map((r, i) => [
-        i + 1, r.name, r.opening, r.received, r.total, r.closingVal, r.systemClosing, r.sold, money(r.price), money(r.revenue), signed(r.diffQty), signed(r.diffMoney),
+        i + 1, r.name,
+        r.tracked ? r.opening : '—', r.tracked ? r.received : '—', r.tracked ? r.total : '—',
+        r.sold, r.tracked ? r.countedVal : '—', r.tracked ? r.expected : '—',
+        money(r.price), money(r.revenue),
+        r.tracked ? signed(r.varianceQty) : '—', r.tracked ? signed(r.varianceCost) : '—',
       ]),
-      foot: [['', 'IGITERANYO', '', '', '', '', '', totalSold, '', money(totalSales), signed(totalDiffQty), signed(totalDiffMoney)]],
+      foot: [['', 'IGITERANYO', '', '', '', totalSold, '', '', '', money(totalRevenue), signed(totalVarQty), signed(totalVarCost)]],
       theme: 'grid',
       styles: { fontSize: 8, cellPadding: 3, overflow: 'linebreak' },
       headStyles: { fillColor: [30, 41, 59], fontSize: 7, halign: 'right' },
@@ -1531,12 +1557,14 @@ function ReconcilePanel({ station }) {
       });
 
     summary(40, 250, 'VERSEMENT', [
-      ['Total Sales (Ayacurujwe)', rwf(salesTotal)],
-      ['Cash Collected', rwf(cashCollected)],
-      ['MoMo Collected', rwf(momoCollected)],
+      ['Recorded sales (Ayacurujwe)', rwf(salesTotal)],
+      ['   Cash sales', rwf(cashCollected)],
+      ['   MoMo sales', rwf(momoCollected)],
+      ['   Credit (Amadeni)', rwf(creditCollected)],
+      ['Daily Expenses', rwf(expensesTotal)],
+      ['Cash expected (drawer)', rwf(cashExpected)],
       ['Actual available (Ahari)', rwf(actualAvailable)],
       ['Difference', `${cashDifference > 0 ? '+' : ''}${rwf(cashDifference)}`],
-      ['Daily Expenses', rwf(expensesTotal)],
       ['Profit Before Tax', rwf(profit)],
     ]);
     summary(300, 250, 'AGACIRO KA STOCK IHARI', [
@@ -1622,37 +1650,44 @@ function ReconcilePanel({ station }) {
               <th className="px-2 py-2 text-right">STOCK YATANGIRANYE<div className="font-normal text-slate-400 normal-case">Opening</div></th>
               <th className="px-2 py-2 text-right">IBYINJIYE<div className="font-normal text-slate-400 normal-case">In</div></th>
               <th className="px-2 py-2 text-right">TOTAL</th>
-              <th className="px-2 py-2 text-right">STOCK IRAYE<div className="font-normal text-slate-400 normal-case">Closing count</div></th>
-              <th className="px-2 py-2 text-right">SYSTEM<div className="font-normal text-slate-400 normal-case">System closing</div></th>
-              <th className="px-2 py-2 text-right">IBYACURUJWE<div className="font-normal text-slate-400 normal-case">Sold</div></th>
+              <th className="px-2 py-2 text-right">IBYACURUJWE<div className="font-normal text-slate-400 normal-case">Sold (recorded)</div></th>
+              <th className="px-2 py-2 text-right">STOCK IRAYE<div className="font-normal text-slate-400 normal-case">Counted</div></th>
+              <th className="px-2 py-2 text-right">TEGEREJWE<div className="font-normal text-slate-400 normal-case">Expected</div></th>
               <th className="px-2 py-2 text-right">IBICIRO<div className="font-normal text-slate-400 normal-case">Price</div></th>
               <th className="px-2 py-2 text-right">AYACURUJWE<div className="font-normal text-slate-400 normal-case">Revenue</div></th>
-              <th className="px-2 py-2 text-right">ITANDUKANIRO<div className="font-normal text-slate-400 normal-case">Difference (qty)</div></th>
-              <th className="px-2 py-2 text-right">ITANDUKANIRO (RWF)<div className="font-normal text-slate-400 normal-case">Difference value</div></th>
+              <th className="px-2 py-2 text-right">ITANDUKANIRO<div className="font-normal text-slate-400 normal-case">Variance (qty)</div></th>
+              <th className="px-2 py-2 text-right">ITANDUKANIRO (RWF)<div className="font-normal text-slate-400 normal-case">at cost</div></th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
             {computed.map((r, i) => (
               <tr key={r.id}>
                 <td className="px-2 py-1.5 text-slate-400">{i + 1}</td>
-                <td className="px-2 py-1.5 font-semibold text-slate-700">{r.name}</td>
-                <td className="px-2 py-1.5 text-right text-slate-500">{r.opening}</td>
-                <td className="px-2 py-1.5 text-right text-slate-500">{r.received}</td>
-                <td className="px-2 py-1.5 text-right text-slate-500">{r.total}</td>
-                <td className="px-2 py-1.5 text-right">
-                  <input
-                    type="number"
-                    value={closing[r.id] ?? ''}
-                    onChange={(e) => setClosing({ ...closing, [r.id]: e.target.value })}
-                    className="w-16 px-2 py-1 rounded border border-gray-300 text-right"
-                  />
+                <td className="px-2 py-1.5 font-semibold text-slate-700">
+                  {r.name}
+                  {!r.tracked && <span className="ml-1 text-[10px] font-normal text-slate-400">(not stocked)</span>}
                 </td>
-                <td className="px-2 py-1.5 text-right text-slate-500">{r.systemClosing}</td>
+                <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.opening : '—'}</td>
+                <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.received : '—'}</td>
+                <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.total : '—'}</td>
                 <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{r.sold}</td>
+                <td className="px-2 py-1.5 text-right">
+                  {r.tracked ? (
+                    <input
+                      type="number"
+                      value={closing[r.id] ?? ''}
+                      onChange={(e) => setClosing({ ...closing, [r.id]: e.target.value })}
+                      className="w-16 px-2 py-1 rounded border border-gray-300 text-right"
+                    />
+                  ) : (
+                    <span className="text-slate-300">—</span>
+                  )}
+                </td>
+                <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.expected : '—'}</td>
                 <td className="px-2 py-1.5 text-right text-slate-500">{money(r.price)}</td>
                 <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{money(r.revenue)}</td>
-                <td className={`px-2 py-1.5 text-right font-semibold ${diffColor(r.diffQty)}`}>{signed(r.diffQty)}</td>
-                <td className={`px-2 py-1.5 text-right font-semibold ${diffColor(r.diffMoney)}`}>{signed(r.diffMoney)}</td>
+                <td className={`px-2 py-1.5 text-right font-semibold ${r.tracked ? diffColor(r.varianceQty) : 'text-slate-300'}`}>{r.tracked ? signed(r.varianceQty) : '—'}</td>
+                <td className={`px-2 py-1.5 text-right font-semibold ${r.tracked ? diffColor(r.varianceCost) : 'text-slate-300'}`}>{r.tracked ? signed(r.varianceCost) : '—'}</td>
               </tr>
             ))}
           </tbody>
@@ -1663,13 +1698,13 @@ function ReconcilePanel({ station }) {
               <td className="px-2 py-2" />
               <td className="px-2 py-2" />
               <td className="px-2 py-2" />
-              <td className="px-2 py-2" />
-              <td className="px-2 py-2" />
               <td className="px-2 py-2 text-right">{totalSold}</td>
               <td className="px-2 py-2" />
-              <td className="px-2 py-2 text-right">{money(totalSales)}</td>
-              <td className={`px-2 py-2 text-right ${diffColor(totalDiffQty)}`}>{signed(totalDiffQty)}</td>
-              <td className={`px-2 py-2 text-right ${diffColor(totalDiffMoney)}`}>{signed(totalDiffMoney)}</td>
+              <td className="px-2 py-2" />
+              <td className="px-2 py-2" />
+              <td className="px-2 py-2 text-right">{money(totalRevenue)}</td>
+              <td className={`px-2 py-2 text-right ${diffColor(totalVarQty)}`}>{signed(totalVarQty)}</td>
+              <td className={`px-2 py-2 text-right ${diffColor(totalVarCost)}`}>{signed(totalVarCost)}</td>
             </tr>
           </tfoot>
         </table>
@@ -1680,19 +1715,33 @@ function ReconcilePanel({ station }) {
       <div className="bg-white rounded-xl shadow-md p-4 w-full lg:max-w-md">
         <p className="font-extrabold text-slate-800 mb-3">VERSEMENT <span className="text-slate-400 font-normal text-sm">— end of day</span></p>
         <div className="space-y-2 text-sm">
+          {/* Recorded sales = the money truth (matches the table's AYACURUJWE total). */}
           <div className="flex justify-between items-center">
-            <span className="text-slate-600">Total Sales (Ayacurujwe)</span>
+            <span className="text-slate-700 font-semibold">Recorded sales (Ayacurujwe)</span>
             <span className="font-bold text-slate-900">{money(salesTotal)} RWF</span>
           </div>
-          <div className="flex justify-between items-center">
-            <span className="text-slate-600">Cash Collected</span>
-            <span className="font-semibold text-slate-800">{money(cashCollected)} RWF</span>
+          <div className="flex justify-between items-center pl-3">
+            <span className="text-slate-500">Cash sales</span>
+            <span className="text-slate-700">{money(cashCollected)} RWF</span>
           </div>
-          <div className="flex justify-between items-center">
-            <span className="text-slate-600">MoMo Collected</span>
-            <span className="font-semibold text-slate-800">{money(momoCollected)} RWF</span>
+          <div className="flex justify-between items-center pl-3">
+            <span className="text-slate-500">MoMo sales</span>
+            <span className="text-slate-700">{money(momoCollected)} RWF</span>
+          </div>
+          <div className="flex justify-between items-center pl-3">
+            <span className="text-slate-500">Credit — Amadeni</span>
+            <span className="text-slate-700">{money(creditCollected)} RWF</span>
           </div>
           <div className="flex justify-between items-center border-t border-gray-100 pt-2">
+            <span className="text-slate-600">Daily Expenses</span>
+            <span className="font-semibold text-slate-800">{money(expensesTotal)} RWF</span>
+          </div>
+          {/* Cash-up: what the drawer should hold vs what was counted. */}
+          <div className="flex justify-between items-center border-t border-gray-100 pt-2">
+            <span className="text-slate-600">Cash expected <span className="text-slate-400 text-xs">(cash − expenses)</span></span>
+            <span className="font-semibold text-slate-800">{money(cashExpected)} RWF</span>
+          </div>
+          <div className="flex justify-between items-center">
             <span className="text-slate-600">Actual available (Ahari)</span>
             {numInput(actual, setActual)}
           </div>
@@ -1701,10 +1750,6 @@ function ReconcilePanel({ station }) {
             <span className={`font-bold ${cashDifference === 0 ? 'text-emerald-600' : 'text-red-600'}`}>
               {cashDifference > 0 ? '+' : ''}{money(cashDifference)} RWF
             </span>
-          </div>
-          <div className="flex justify-between items-center border-t border-gray-100 pt-2">
-            <span className="text-slate-600">Daily Expenses</span>
-            <span className="font-semibold text-slate-800">{money(expensesTotal)} RWF</span>
           </div>
           <div className="flex justify-between items-center border-t border-gray-100 pt-2">
             <span className="text-slate-700 font-semibold">Profit Before Tax</span>
