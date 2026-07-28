@@ -48,6 +48,12 @@ function startOfTodayISO() {
   return d.toISOString();
 }
 
+// Local calendar date as YYYY-MM-DD (the "business day" a reconciliation is filed under).
+function ymd(d) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
 // Start-of-day ISO for a rolling window: sinceISO(1) = today, sinceISO(7) =
 // midnight 6 days ago (i.e. a 7-day window including today).
 function sinceISO(days) {
@@ -1360,8 +1366,12 @@ function SalesTab({ notify, currentUser }) {
 // can never masquerade as revenue. The physical count (STOCK IRAYE) is compared
 // to the sales-expected closing to surface a variance, valued at COST (the real
 // loss). Items that aren't stock-tracked (food, rooms) still show their sales.
-function ReconcilePanel({ station }) {
+function ReconcilePanel({ station, currentUser }) {
   const [loading, setLoading] = useState(true);
+  const [day, setDay] = useState(ymd(new Date())); // the business day being reconciled
+  const [savedRec, setSavedRec] = useState(null); // saved snapshot for this station+day (if any)
+  const [history, setHistory] = useState([]); // recent saved reconciliations for this station
+  const [saving, setSaving] = useState(false);
   const [rows, setRows] = useState([]); // {id, name, price, opening, received, onHand}
   const [closing, setClosing] = useState({}); // product_id -> physical count (string)
   // VERSEMENT figures come from real data (read-only); only the counted cash is typed.
@@ -1379,25 +1389,35 @@ function ReconcilePanel({ station }) {
     let cancelled = false;
     (async () => {
       setLoading(true);
-      const since = startOfTodayISO();
-      const [productsRes, stockRes, movesRes, salesRes, expRes, debtsRes, payRes] = await Promise.all([
-        supabase.from('products').select('id, item_name, unit_price, cost_price, active').eq('business_id', getBusinessId()).order('item_name'),
+      // Window for the selected business day (local midnight to next midnight).
+      const dayStart = new Date(`${day}T00:00:00`);
+      const start = dayStart.toISOString();
+      const end = new Date(dayStart.getTime() + 86400000).toISOString();
+      const bid = getBusinessId();
+      const [productsRes, stockRes, movesRes, salesRes, expRes, debtsRes, payRes, recRes, histRes] = await Promise.all([
+        supabase.from('products').select('id, item_name, unit_price, cost_price, active').eq('business_id', bid).order('item_name'),
         supabase.from('station_stock').select('*').eq('station_id', station.id),
-        supabase.from('stock_movements').select('*').eq('station_id', station.id).gte('created_at', since),
-        supabase.from('hospitality_sales').select('item_id, quantity, total_price, payment_method').eq('station_id', station.id).gte('timestamp', since),
-        supabase.from('expenses').select('amount').eq('business_id', getBusinessId()).gte('created_at', since),
-        supabase.from('debts').select('amount, status, created_at').eq('business_id', getBusinessId()).eq('station_id', station.id),
-        supabase.from('debt_payments').select('amount, created_at').eq('business_id', getBusinessId()).eq('station_id', station.id),
+        supabase.from('stock_movements').select('*').eq('station_id', station.id).gte('created_at', start).lt('created_at', end),
+        supabase.from('hospitality_sales').select('item_id, quantity, total_price, payment_method').eq('station_id', station.id).gte('timestamp', start).lt('timestamp', end),
+        supabase.from('expenses').select('amount').eq('business_id', bid).gte('created_at', start).lt('created_at', end),
+        supabase.from('debts').select('amount, status, created_at').eq('business_id', bid).eq('station_id', station.id),
+        supabase.from('debt_payments').select('amount, created_at').eq('business_id', bid).eq('station_id', station.id),
+        supabase.from('reconciliations').select('*').eq('business_id', bid).eq('station_id', station.id).eq('business_day', day).maybeSingle(),
+        supabase.from('reconciliations').select('business_day, submitted_by, submitted_at, sales_total, cash_difference, shrinkage_cost').eq('business_id', bid).eq('station_id', station.id).order('business_day', { ascending: false }).limit(20),
       ]);
       if (cancelled) return;
 
-      // Debts (amadeni): new & recovered today, plus the running outstanding balance.
+      setSavedRec(recRes.data ?? null);
+      setHistory(histRes.data ?? []);
+
+      // Debts (amadeni): new & recovered on the day, and the outstanding balance
+      // as at the end of that day.
       const debtRows = debtsRes.data ?? [];
       const payRows = payRes.data ?? [];
-      const startedToday = debtRows.filter((d) => d.created_at >= since).reduce((a, d) => a + (d.amount ?? 0), 0);
-      const recoveredToday = payRows.filter((p) => p.created_at >= since).reduce((a, p) => a + (p.amount ?? 0), 0);
-      const owed = debtRows.filter((d) => d.status !== 'void').reduce((a, d) => a + (d.amount ?? 0), 0);
-      const paid = payRows.reduce((a, p) => a + (p.amount ?? 0), 0);
+      const startedToday = debtRows.filter((d) => d.created_at >= start && d.created_at < end).reduce((a, d) => a + (d.amount ?? 0), 0);
+      const recoveredToday = payRows.filter((p) => p.created_at >= start && p.created_at < end).reduce((a, p) => a + (p.amount ?? 0), 0);
+      const owed = debtRows.filter((d) => d.status !== 'void' && d.created_at < end).reduce((a, d) => a + (d.amount ?? 0), 0);
+      const paid = payRows.filter((p) => p.created_at < end).reduce((a, p) => a + (p.amount ?? 0), 0);
 
       const onHand = Object.fromEntries((stockRes.data ?? []).map((r) => [String(r.product_id), Number(r.quantity)]));
       // Movements today: total change (to reconstruct opening) and issues (IBYINJIYE).
@@ -1449,26 +1469,30 @@ function ReconcilePanel({ station }) {
         .filter((r) => r.tracked || r.sold > 0 || r.revenue > 0);
 
       setRows(list);
-      // Counted stock defaults to the sales-expected closing (opening + in − sold);
-      // the storeman overwrites it with the physical count. It only drives the
-      // shrinkage variance now — it can no longer change the revenue figure.
-      setClosing(
-        Object.fromEntries(list.filter((r) => r.tracked).map((r) => [r.id, String(r.opening + r.received - r.sold)]))
-      );
+      const saved = recRes.data;
+      // Counted stock: from the saved snapshot if one exists (so re-opening a day
+      // shows the recorded counts), otherwise defaults to the sales-expected
+      // closing (opening + in − sold). It only drives the shrinkage variance —
+      // it can no longer change the revenue figure.
+      if (saved?.data?.lines) {
+        setClosing(Object.fromEntries(saved.data.lines.filter((l) => l.tracked).map((l) => [l.id, String(l.counted)])));
+      } else {
+        setClosing(Object.fromEntries(list.filter((r) => r.tracked).map((r) => [r.id, String(r.opening + r.received - r.sold)])));
+      }
       setSalesTotal(Math.round(salesSum));
       setCashCollected(Math.round(cashSum));
       setMomoCollected(Math.round(momoSum));
       setCreditCollected(Math.round(creditSum));
       setExpensesTotal(Math.round(expSum));
       setDebts({ recovered: Math.round(recoveredToday), started: Math.round(startedToday), outstanding: Math.round(owed - paid) });
-      // Cash that should be in the drawer = cash sales − expenses paid from it.
-      setActual(String(Math.round(cashSum - expSum)));
+      // Counted cash: saved value if present, else the expected (cash − expenses).
+      setActual(saved?.data?.cashCounted != null ? String(saved.data.cashCounted) : String(Math.round(cashSum - expSum)));
       setLoading(false);
     })();
     return () => {
       cancelled = true;
     };
-  }, [station.id]);
+  }, [station.id, day]);
 
   const money = (n) => Math.round(n).toLocaleString();
 
@@ -1504,6 +1528,60 @@ function ReconcilePanel({ station }) {
   const stockAtPrice = computed.reduce((a, r) => a + (r.tracked ? r.countedVal * r.price : 0), 0);
   const expectedGross = stockAtPrice - stockAtCost;
 
+  const isToday = day === ymd(new Date());
+  const canEdit = isToday; // past days are read-only saved records
+
+  // One shape the table + cards render from: live figures for today, or the
+  // saved snapshot for a past day (a faithful record for investigation).
+  const liveView = {
+    lines: computed.map((r) => ({
+      id: r.id, name: r.name, tracked: r.tracked,
+      opening: r.opening, received: r.received, total: r.total,
+      sold: r.sold, counted: r.countedVal, expected: r.expected,
+      price: r.price, revenue: r.revenue, varianceQty: r.varianceQty, varianceCost: r.varianceCost,
+    })),
+    totals: { sold: totalSold, revenue: totalRevenue, varianceQty: totalVarQty, varianceCost: totalVarCost },
+    sales: { total: salesTotal, cash: cashCollected, momo: momoCollected, credit: creditCollected },
+    expenses: expensesTotal, cashExpected, cashCounted: actualAvailable, cashDifference, profit,
+    stock: { atCost: stockAtCost, atPrice: stockAtPrice, expectedGross },
+    debts,
+  };
+  const view = !isToday && savedRec ? savedRec.data : liveView;
+  const noRecord = !isToday && !savedRec; // a past day with nothing saved
+
+  const refreshHistory = async () => {
+    const { data } = await supabase
+      .from('reconciliations')
+      .select('business_day, submitted_by, submitted_at, sales_total, cash_difference, shrinkage_cost')
+      .eq('business_id', getBusinessId()).eq('station_id', station.id)
+      .order('business_day', { ascending: false }).limit(20);
+    setHistory(data ?? []);
+  };
+
+  // Save the day's reconciliation as a dated snapshot (upsert per station+day),
+  // stamped with who submitted it — so the owner can pull it up later.
+  const saveReconciliation = async () => {
+    setSaving(true);
+    const row = {
+      business_id: getBusinessId(),
+      station_id: station.id,
+      station_name: station.name,
+      business_day: day,
+      submitted_by: currentUser?.name ?? 'Owner',
+      submitted_at: new Date().toISOString(),
+      sales_total: liveView.sales.total,
+      cash_counted: liveView.cashCounted,
+      cash_difference: liveView.cashDifference,
+      shrinkage_cost: liveView.totals.varianceCost,
+      data: liveView,
+    };
+    const { error } = await supabase.from('reconciliations').upsert(row, { onConflict: 'business_id,station_id,business_day' });
+    setSaving(false);
+    if (error) return window.alert(`Could not save: ${error.message}`);
+    setSavedRec(row);
+    refreshHistory();
+  };
+
   // Build the whole reconciliation as a PDF (loaded on demand). Returns the doc
   // plus a filename, so the same document can be downloaded or shared.
   const buildReconciliationPdf = async () => {
@@ -1519,20 +1597,21 @@ function ReconcilePanel({ station }) {
     doc.setFontSize(10);
     doc.setTextColor(110);
     doc.text(`Isesengura / Reconciliation — ${station.name}`, 40, 60);
-    doc.text(dateStr, pageW - 40, 42, { align: 'right' });
+    doc.text(day, pageW - 40, 42, { align: 'right' });
+    if (savedRec) doc.text(`Saved by ${savedRec.submitted_by ?? '—'}`, pageW - 40, 58, { align: 'right' });
     doc.setTextColor(0);
 
     autoTable(doc, {
       startY: 74,
       head: [['N°', 'IBICURUZWA', 'STOCK YATANGIRANYE', 'IBYINJIYE', 'TOTAL', 'IBYACURUJWE', 'STOCK IRAYE', 'TEGEREJWE', 'IBICIRO', 'AYACURUJWE', 'ITANDUKANIRO', 'ITANDUKANIRO (RWF)']],
-      body: computed.map((r, i) => [
+      body: view.lines.map((r, i) => [
         i + 1, r.name,
         r.tracked ? r.opening : '—', r.tracked ? r.received : '—', r.tracked ? r.total : '—',
-        r.sold, r.tracked ? r.countedVal : '—', r.tracked ? r.expected : '—',
+        r.sold, r.tracked ? r.counted : '—', r.tracked ? r.expected : '—',
         money(r.price), money(r.revenue),
         r.tracked ? signed(r.varianceQty) : '—', r.tracked ? signed(r.varianceCost) : '—',
       ]),
-      foot: [['', 'IGITERANYO', '', '', '', totalSold, '', '', '', money(totalRevenue), signed(totalVarQty), signed(totalVarCost)]],
+      foot: [['', 'IGITERANYO', '', '', '', view.totals.sold, '', '', '', money(view.totals.revenue), signed(view.totals.varianceQty), signed(view.totals.varianceCost)]],
       theme: 'grid',
       styles: { fontSize: 8, cellPadding: 3, overflow: 'linebreak' },
       headStyles: { fillColor: [30, 41, 59], fontSize: 7, halign: 'right' },
@@ -1557,25 +1636,25 @@ function ReconcilePanel({ station }) {
       });
 
     summary(40, 250, 'VERSEMENT', [
-      ['Recorded sales (Ayacurujwe)', rwf(salesTotal)],
-      ['   Cash sales', rwf(cashCollected)],
-      ['   MoMo sales', rwf(momoCollected)],
-      ['   Credit (Amadeni)', rwf(creditCollected)],
-      ['Daily Expenses', rwf(expensesTotal)],
-      ['Cash expected (drawer)', rwf(cashExpected)],
-      ['Actual available (Ahari)', rwf(actualAvailable)],
-      ['Difference', `${cashDifference > 0 ? '+' : ''}${rwf(cashDifference)}`],
-      ['Profit Before Tax', rwf(profit)],
+      ['Recorded sales (Ayacurujwe)', rwf(view.sales.total)],
+      ['   Cash sales', rwf(view.sales.cash)],
+      ['   MoMo sales', rwf(view.sales.momo)],
+      ['   Credit (Amadeni)', rwf(view.sales.credit)],
+      ['Daily Expenses', rwf(view.expenses)],
+      ['Cash expected (drawer)', rwf(view.cashExpected)],
+      ['Actual available (Ahari)', rwf(view.cashCounted)],
+      ['Difference', `${view.cashDifference > 0 ? '+' : ''}${rwf(view.cashDifference)}`],
+      ['Profit Before Tax', rwf(view.profit)],
     ]);
     summary(300, 250, 'AGACIRO KA STOCK IHARI', [
-      ['At cost (Ikiguzi)', rwf(stockAtCost)],
-      ['At selling price (Igiciro)', rwf(stockAtPrice)],
-      ['Expected gross profit', rwf(expectedGross)],
+      ['At cost (Ikiguzi)', rwf(view.stock.atCost)],
+      ['At selling price (Igiciro)', rwf(view.stock.atPrice)],
+      ['Expected gross profit', rwf(view.stock.expectedGross)],
     ]);
     summary(560, 240, 'AMADENI (Debts)', [
-      ['Recovered (Yishyuwe)', rwf(debts.recovered)],
-      ['New today (Mashya)', rwf(debts.started)],
-      ['Outstanding (Asigaye)', rwf(debts.outstanding)],
+      ['Recovered (Yishyuwe)', rwf(view.debts.recovered)],
+      ['New (Mashya)', rwf(view.debts.started)],
+      ['Outstanding (Asigaye)', rwf(view.debts.outstanding)],
     ]);
 
     const safe = (s) => String(s).replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '');
@@ -1623,24 +1702,54 @@ function ReconcilePanel({ station }) {
 
   return (
     <div className="space-y-4">
-      {/* Export the whole reconciliation report as a PDF (download or share). */}
-      <div className="flex justify-end gap-2">
-        <button
-          onClick={downloadPdf}
-          disabled={pdfBusy}
-          className="px-4 py-2 rounded-lg text-sm font-semibold bg-slate-900 text-white active:scale-95 disabled:opacity-50"
-        >
-          {pdfBusy ? 'Preparing…' : '⬇ Download PDF'}
-        </button>
-        <button
-          onClick={sharePdf}
-          disabled={pdfBusy}
-          className="px-4 py-2 rounded-lg text-sm font-semibold bg-amber-500 text-white active:scale-95 disabled:opacity-50"
-        >
-          ↗ Share
-        </button>
+      {/* Business day + save + export. A reconciliation is a dated record. */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2 flex-wrap">
+          <label className="text-sm text-slate-500">Date</label>
+          <input
+            type="date"
+            value={day}
+            max={ymd(new Date())}
+            onChange={(e) => setDay(e.target.value || ymd(new Date()))}
+            className="px-3 py-2 rounded-lg border border-gray-300 text-sm"
+          />
+          {savedRec && (
+            <span className="text-xs text-slate-400">
+              Saved by <span className="font-semibold text-slate-600">{savedRec.submitted_by ?? '—'}</span> ·{' '}
+              {new Date(savedRec.submitted_at).toLocaleString()}
+            </span>
+          )}
+          {!isToday && <span className="text-xs font-semibold text-amber-600">Past day — read only</span>}
+        </div>
+        <div className="flex gap-2">
+          {canEdit && (
+            <button
+              onClick={saveReconciliation}
+              disabled={saving}
+              className="px-4 py-2 rounded-lg text-sm font-semibold bg-emerald-600 text-white active:scale-95 disabled:opacity-50"
+            >
+              {saving ? 'Saving…' : savedRec ? '✔ Update saved' : '✔ Save reconciliation'}
+            </button>
+          )}
+          <button onClick={downloadPdf} disabled={pdfBusy || noRecord} className="px-4 py-2 rounded-lg text-sm font-semibold bg-slate-900 text-white active:scale-95 disabled:opacity-50">
+            {pdfBusy ? 'Preparing…' : '⬇ PDF'}
+          </button>
+          <button onClick={sharePdf} disabled={pdfBusy || noRecord} className="px-4 py-2 rounded-lg text-sm font-semibold bg-amber-500 text-white active:scale-95 disabled:opacity-50">
+            ↗ Share
+          </button>
+        </div>
       </div>
 
+      {noRecord ? (
+        <div className="bg-white rounded-xl shadow-md p-6 text-slate-500">
+          <p className="font-semibold text-slate-700">No reconciliation was saved for {day}.</p>
+          <p className="text-sm mt-1">
+            Recorded sales that day: <span className="font-bold text-slate-800">{money(view.sales.total)} RWF</span>. The end-of-day stock
+            count and cash-up weren’t saved, so only the recorded totals are available.
+          </p>
+        </div>
+      ) : (
+      <>
       <div className="overflow-x-auto bg-white rounded-xl shadow-md">
         <table className="w-full text-left text-sm whitespace-nowrap">
           <thead className="bg-slate-100 text-slate-600 text-[11px]">
@@ -1660,7 +1769,7 @@ function ReconcilePanel({ station }) {
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
-            {computed.map((r, i) => (
+            {view.lines.map((r, i) => (
               <tr key={r.id}>
                 <td className="px-2 py-1.5 text-slate-400">{i + 1}</td>
                 <td className="px-2 py-1.5 font-semibold text-slate-700">
@@ -1672,7 +1781,9 @@ function ReconcilePanel({ station }) {
                 <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.total : '—'}</td>
                 <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{r.sold}</td>
                 <td className="px-2 py-1.5 text-right">
-                  {r.tracked ? (
+                  {!r.tracked ? (
+                    <span className="text-slate-300">—</span>
+                  ) : canEdit ? (
                     <input
                       type="number"
                       value={closing[r.id] ?? ''}
@@ -1680,7 +1791,7 @@ function ReconcilePanel({ station }) {
                       className="w-16 px-2 py-1 rounded border border-gray-300 text-right"
                     />
                   ) : (
-                    <span className="text-slate-300">—</span>
+                    <span className="font-semibold text-slate-700">{r.counted}</span>
                   )}
                 </td>
                 <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.expected : '—'}</td>
@@ -1698,62 +1809,62 @@ function ReconcilePanel({ station }) {
               <td className="px-2 py-2" />
               <td className="px-2 py-2" />
               <td className="px-2 py-2" />
-              <td className="px-2 py-2 text-right">{totalSold}</td>
+              <td className="px-2 py-2 text-right">{view.totals.sold}</td>
               <td className="px-2 py-2" />
               <td className="px-2 py-2" />
               <td className="px-2 py-2" />
-              <td className="px-2 py-2 text-right">{money(totalRevenue)}</td>
-              <td className={`px-2 py-2 text-right ${diffColor(totalVarQty)}`}>{signed(totalVarQty)}</td>
-              <td className={`px-2 py-2 text-right ${diffColor(totalVarCost)}`}>{signed(totalVarCost)}</td>
+              <td className="px-2 py-2 text-right">{money(view.totals.revenue)}</td>
+              <td className={`px-2 py-2 text-right ${diffColor(view.totals.varianceQty)}`}>{signed(view.totals.varianceQty)}</td>
+              <td className={`px-2 py-2 text-right ${diffColor(view.totals.varianceCost)}`}>{signed(view.totals.varianceCost)}</td>
             </tr>
           </tfoot>
         </table>
       </div>
 
       <div className="flex flex-col lg:flex-row gap-4 lg:items-start">
-      {/* VERSEMENT — end-of-day reconciliation */}
+      {/* VERSEMENT — end-of-day cash-up */}
       <div className="bg-white rounded-xl shadow-md p-4 w-full lg:max-w-md">
         <p className="font-extrabold text-slate-800 mb-3">VERSEMENT <span className="text-slate-400 font-normal text-sm">— end of day</span></p>
         <div className="space-y-2 text-sm">
           {/* Recorded sales = the money truth (matches the table's AYACURUJWE total). */}
           <div className="flex justify-between items-center">
             <span className="text-slate-700 font-semibold">Recorded sales (Ayacurujwe)</span>
-            <span className="font-bold text-slate-900">{money(salesTotal)} RWF</span>
+            <span className="font-bold text-slate-900">{money(view.sales.total)} RWF</span>
           </div>
           <div className="flex justify-between items-center pl-3">
             <span className="text-slate-500">Cash sales</span>
-            <span className="text-slate-700">{money(cashCollected)} RWF</span>
+            <span className="text-slate-700">{money(view.sales.cash)} RWF</span>
           </div>
           <div className="flex justify-between items-center pl-3">
             <span className="text-slate-500">MoMo sales</span>
-            <span className="text-slate-700">{money(momoCollected)} RWF</span>
+            <span className="text-slate-700">{money(view.sales.momo)} RWF</span>
           </div>
           <div className="flex justify-between items-center pl-3">
             <span className="text-slate-500">Credit — Amadeni</span>
-            <span className="text-slate-700">{money(creditCollected)} RWF</span>
+            <span className="text-slate-700">{money(view.sales.credit)} RWF</span>
           </div>
           <div className="flex justify-between items-center border-t border-gray-100 pt-2">
             <span className="text-slate-600">Daily Expenses</span>
-            <span className="font-semibold text-slate-800">{money(expensesTotal)} RWF</span>
+            <span className="font-semibold text-slate-800">{money(view.expenses)} RWF</span>
           </div>
           {/* Cash-up: what the drawer should hold vs what was counted. */}
           <div className="flex justify-between items-center border-t border-gray-100 pt-2">
             <span className="text-slate-600">Cash expected <span className="text-slate-400 text-xs">(cash − expenses)</span></span>
-            <span className="font-semibold text-slate-800">{money(cashExpected)} RWF</span>
+            <span className="font-semibold text-slate-800">{money(view.cashExpected)} RWF</span>
           </div>
           <div className="flex justify-between items-center">
             <span className="text-slate-600">Actual available (Ahari)</span>
-            {numInput(actual, setActual)}
+            {canEdit ? numInput(actual, setActual) : <span className="font-semibold text-slate-800">{money(view.cashCounted)} RWF</span>}
           </div>
           <div className="flex justify-between items-center">
             <span className="text-slate-600">Difference</span>
-            <span className={`font-bold ${cashDifference === 0 ? 'text-emerald-600' : 'text-red-600'}`}>
-              {cashDifference > 0 ? '+' : ''}{money(cashDifference)} RWF
+            <span className={`font-bold ${view.cashDifference === 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+              {view.cashDifference > 0 ? '+' : ''}{money(view.cashDifference)} RWF
             </span>
           </div>
           <div className="flex justify-between items-center border-t border-gray-100 pt-2">
             <span className="text-slate-700 font-semibold">Profit Before Tax</span>
-            <span className="font-extrabold text-emerald-600">{money(profit)} RWF</span>
+            <span className="font-extrabold text-emerald-600">{money(view.profit)} RWF</span>
           </div>
         </div>
       </div>
@@ -1768,21 +1879,20 @@ function ReconcilePanel({ station }) {
           <div className="space-y-2 text-sm">
             <div className="flex justify-between items-center">
               <span className="text-slate-600">At cost (Ikiguzi)</span>
-              <span className="font-semibold text-slate-800">{money(stockAtCost)} RWF</span>
+              <span className="font-semibold text-slate-800">{money(view.stock.atCost)} RWF</span>
             </div>
             <div className="flex justify-between items-center">
               <span className="text-slate-600">At selling price (Igiciro)</span>
-              <span className="font-semibold text-slate-800">{money(stockAtPrice)} RWF</span>
+              <span className="font-semibold text-slate-800">{money(view.stock.atPrice)} RWF</span>
             </div>
             <div className="flex justify-between items-center border-t border-gray-100 pt-2">
               <span className="text-slate-700 font-semibold">Expected gross profit</span>
-              <span className="font-extrabold text-emerald-600">{money(expectedGross)} RWF</span>
+              <span className="font-extrabold text-emerald-600">{money(view.stock.expectedGross)} RWF</span>
             </div>
           </div>
         </div>
 
-        {/* AMADENI — debts. Figures come from the (future) debt-management
-            feature; until then they read zero. */}
+        {/* AMADENI — debts for this station */}
         <div className="bg-white rounded-xl shadow-md p-4">
           <p className="font-extrabold text-slate-800 mb-3">
             AMADENI <span className="text-slate-400 font-normal text-sm">— debts</span>
@@ -1790,20 +1900,45 @@ function ReconcilePanel({ station }) {
           <div className="space-y-2 text-sm">
             <div className="flex justify-between items-center">
               <span className="text-slate-600">Recovered (Yishyuwe)</span>
-              <span className="font-semibold text-emerald-600">{money(debts.recovered)} RWF</span>
+              <span className="font-semibold text-emerald-600">{money(view.debts.recovered)} RWF</span>
             </div>
             <div className="flex justify-between items-center">
-              <span className="text-slate-600">New today (Mashya)</span>
-              <span className="font-semibold text-slate-800">{money(debts.started)} RWF</span>
+              <span className="text-slate-600">New (Mashya)</span>
+              <span className="font-semibold text-slate-800">{money(view.debts.started)} RWF</span>
             </div>
             <div className="flex justify-between items-center border-t border-gray-100 pt-2">
               <span className="text-slate-700 font-semibold">Outstanding (Asigaye)</span>
-              <span className="font-extrabold text-amber-600">{money(debts.outstanding)} RWF</span>
+              <span className="font-extrabold text-amber-600">{money(view.debts.outstanding)} RWF</span>
             </div>
           </div>
         </div>
       </div>
       </div>
+      </>
+      )}
+
+      {/* History — open a past day's saved reconciliation for investigation. */}
+      {history.length > 0 && (
+        <div className="bg-white rounded-xl shadow-md p-4">
+          <p className="font-semibold text-slate-700 mb-1">Saved reconciliations <span className="text-slate-400 font-normal text-sm">— tap a day to open it</span></p>
+          <div className="divide-y divide-gray-100">
+            {history.map((h) => (
+              <button
+                key={h.business_day}
+                onClick={() => setDay(h.business_day)}
+                className={`w-full flex items-center gap-3 py-2 text-sm text-left rounded-lg px-2 ${h.business_day === day ? 'bg-amber-50' : 'hover:bg-slate-50'}`}
+              >
+                <span className="font-semibold text-slate-700 w-24 shrink-0">{h.business_day}</span>
+                <span className="text-slate-400 text-xs truncate flex-1">👤 {h.submitted_by ?? '—'}</span>
+                <span className="text-slate-500 tabular-nums">{money(h.sales_total ?? 0)} RWF</span>
+                <span className={`text-xs font-semibold w-24 text-right tabular-nums ${(h.cash_difference ?? 0) < 0 ? 'text-red-600' : (h.cash_difference ?? 0) > 0 ? 'text-emerald-600' : 'text-slate-400'}`}>
+                  cash {(h.cash_difference ?? 0) > 0 ? '+' : ''}{money(h.cash_difference ?? 0)}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1811,7 +1946,7 @@ function ReconcilePanel({ station }) {
 // Dedicated daily reconciliation view — picks a station (auto for single-station
 // venues) and shows its stock sheet + VERSEMENT. This is the storeman's main
 // end-of-day screen, so it's a top-level tab rather than buried under Stations.
-function ReconcileTab() {
+function ReconcileTab({ currentUser }) {
   const [stations, setStations] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
 
@@ -1851,7 +1986,7 @@ function ReconcileTab() {
           ))}
         </div>
       )}
-      <ReconcilePanel key={selected.id} station={selected} />
+      <ReconcilePanel key={selected.id} station={selected} currentUser={currentUser} />
     </div>
   );
 }
@@ -2840,7 +2975,7 @@ function OwnerDashboard({ currentUser, onLogout }) {
 
         {activeLink === 'Dashboard' && <DashboardHome cashFlow={cashFlow} loading={cashFlowLoading} />}
         {activeLink === 'Sales' && <SalesTab notify={notify} currentUser={currentUser} />}
-        {activeLink === 'Reconcile' && <ReconcileTab />}
+        {activeLink === 'Reconcile' && <ReconcileTab currentUser={currentUser} />}
         {activeLink === 'Stations' && <StationsTab notify={notify} />}
         {activeLink === 'Inventory' && <InventoryTab notify={notify} />}
         {activeLink === 'Expenses' && <ExpensesTab notify={notify} />}

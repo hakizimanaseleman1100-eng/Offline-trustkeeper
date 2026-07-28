@@ -52,6 +52,7 @@ paste the file → **Run**. Every migration is **idempotent** (guarded with
 | `0021_public_menu.sql` | Adds the `get_public_menu(business_id)` RPC (SECURITY DEFINER, granted to `anon`) returning display-safe menu fields, so a guest who scans a table/room QR on their own phone can load the menu without a venue login. Never exposes `cost_price`. |
 | `0022_portal_accounts.sql` | Adds `businesses.app_url` (public link the table QR codes point to) and anon-safe customer account RPCs — `register_customer`, `signin_customer`, `reset_customer_password` (all SECURITY DEFINER, granted to `anon`) — so a guest can register/sign in/reset from their own phone. Functions only ever see the salted hash, never a plaintext password. |
 | `0023_debts.sql` | Debt management (amadeni): `debts` (credit taken at the POS, stamped with the waiter in charge + station + customer) and `debt_payments` (recoveries). Both tenant-scoped. Powers the Reconcile AMADENI card, the owner Debts tab, and the Reports "Debts by Waiter" breakdown. |
+| `0024_reconciliations.sql` | Saved end-of-day reconciliations — one per station per `business_day`, stamped with `submitted_by` / `submitted_at`, the full sheet snapshotted in `data` (jsonb) plus summary columns. Lets the owner reopen past reconciliations (read-only) for investigation. |
 
 After running `0001`, the app's PIN login and per-waiter accountability work
 end-to-end. Until then, the app falls back to a local-only default owner
