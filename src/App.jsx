@@ -203,7 +203,10 @@ function App() {
     return <ClientOrder onExit={logout} guestPortal={!!portal} initialDetails={portal?.table ?? ''} />;
   }
 
-  if (currentUser.role === 'OWNER' || currentUser.role === 'MANAGER') {
+  // Owner, manager and storeman all use the dashboard — which tabs they see is
+  // gated per role (see permissions.js). Waiters sell at the POS; kitchen sees
+  // the kitchen display.
+  if (['OWNER', 'MANAGER', 'STOREMAN'].includes(currentUser.role)) {
     return <OwnerDashboard currentUser={currentUser} onLogout={logout} />;
   }
 

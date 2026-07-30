@@ -4,8 +4,9 @@ import { db } from './db';
 import { supabase } from './supabaseClient';
 import { getBusinessId } from './session';
 import { hashPin } from './auth';
+import { allowedTabs, canOpenTab, roleLabel, ROLES } from './permissions';
 
-const STAFF_ROLES = ['WAITER', 'KITCHEN', 'MANAGER', 'OWNER'];
+const STAFF_ROLES = ROLES; // assignable roles for the Team tab
 
 const NAV_LINKS = [
   { key: 'Dashboard', icon: '📊' },
@@ -27,8 +28,6 @@ const NAV_LINKS = [
 // always lists everything. Reconcile (the daily end-of-day count) is primary;
 // Stations (setup) moves to More.
 const MOBILE_PRIMARY = ['Dashboard', 'Sales', 'Reconcile', 'Reports'];
-const primaryLinks = NAV_LINKS.filter((l) => MOBILE_PRIMARY.includes(l.key));
-const overflowLinks = NAV_LINKS.filter((l) => !MOBILE_PRIMARY.includes(l.key));
 const EXPENSE_CATEGORIES = ['Utilities', 'Supplies', 'Maintenance', 'Salaries', 'Other'];
 
 // Rwanda RRA/EBM VAT tax categories. VAT is a single 18% standard rate, so the
@@ -938,7 +937,7 @@ function TeamTab({ notify }) {
         >
           {STAFF_ROLES.map((r) => (
             <option key={r} value={r}>
-              {r.charAt(0) + r.slice(1).toLowerCase()}
+              {roleLabel(r)}
             </option>
           ))}
         </select>
@@ -2882,7 +2881,14 @@ function CustomersTab({ notify }) {
 }
 
 function OwnerDashboard({ currentUser, onLogout }) {
-  const [activeLink, setActiveLink] = useState('Dashboard');
+  const role = currentUser?.role ?? 'OWNER';
+  // Only the tabs this role may open, in NAV_LINKS order.
+  const navLinks = NAV_LINKS.filter((l) => canOpenTab(role, l.key));
+  // Mobile: if few tabs, show them all; otherwise 4 primary + a More sheet.
+  const primary = navLinks.length <= 5 ? navLinks : navLinks.filter((l) => MOBILE_PRIMARY.includes(l.key));
+  const overflow = navLinks.filter((l) => !primary.includes(l));
+
+  const [activeLink, setActiveLink] = useState(() => (canOpenTab(role, 'Dashboard') ? 'Dashboard' : navLinks[0]?.key ?? 'Dashboard'));
   const [moreOpen, setMoreOpen] = useState(false);
   const [notice, setNotice] = useState('');
   const [cashFlow, setCashFlow] = useState({ salesTotal: 0, expensesTotal: 0, net: 0 });
@@ -2938,11 +2944,14 @@ function OwnerDashboard({ currentUser, onLogout }) {
 
       {/* Desktop sidebar — full text nav, hidden on mobile in favor of the icon bar below */}
       <aside className="hidden md:flex md:flex-col w-64 bg-slate-900 text-white shrink-0">
-        <div className="px-6 py-5 text-2xl font-extrabold tracking-tight border-b border-slate-800">
-          Sovereign OS
+        <div className="px-6 py-5 border-b border-slate-800">
+          <div className="text-2xl font-extrabold tracking-tight">Sovereign OS</div>
+          <div className="text-xs text-slate-400 mt-1 truncate">
+            {currentUser?.name ?? 'Owner'} · <span className="text-amber-400 font-semibold">{roleLabel(role)}</span>
+          </div>
         </div>
         <nav className="flex-1 py-4">
-          {NAV_LINKS.map(({ key, icon }) => (
+          {navLinks.map(({ key, icon }) => (
             <button
               key={key}
               onClick={() => setActiveLink(key)}
@@ -2973,18 +2982,25 @@ function OwnerDashboard({ currentUser, onLogout }) {
           <div className="mb-6 px-4 py-3 rounded-lg bg-slate-900 text-white inline-block">{notice}</div>
         )}
 
-        {activeLink === 'Dashboard' && <DashboardHome cashFlow={cashFlow} loading={cashFlowLoading} />}
-        {activeLink === 'Sales' && <SalesTab notify={notify} currentUser={currentUser} />}
-        {activeLink === 'Reconcile' && <ReconcileTab currentUser={currentUser} />}
-        {activeLink === 'Stations' && <StationsTab notify={notify} />}
-        {activeLink === 'Inventory' && <InventoryTab notify={notify} />}
-        {activeLink === 'Expenses' && <ExpensesTab notify={notify} />}
-        {activeLink === 'Team' && <TeamTab notify={notify} />}
-        {activeLink === 'Customers' && <CustomersTab notify={notify} />}
-        {activeLink === 'Debts' && <DebtsTab notify={notify} currentUser={currentUser} />}
-        {activeLink === 'Order QR' && <PortalQrTab notify={notify} />}
-        {activeLink === 'Settings' && <SettingsTab notify={notify} />}
-        {activeLink === 'Reports' && <ReportsTab />}
+        {/* Defense in depth: never render a tab this role isn't allowed to open. */}
+        {!canOpenTab(role, activeLink) ? (
+          <p className="text-slate-400">You don’t have access to this section.</p>
+        ) : (
+          <>
+            {activeLink === 'Dashboard' && <DashboardHome cashFlow={cashFlow} loading={cashFlowLoading} />}
+            {activeLink === 'Sales' && <SalesTab notify={notify} currentUser={currentUser} />}
+            {activeLink === 'Reconcile' && <ReconcileTab currentUser={currentUser} />}
+            {activeLink === 'Stations' && <StationsTab notify={notify} />}
+            {activeLink === 'Inventory' && <InventoryTab notify={notify} />}
+            {activeLink === 'Expenses' && <ExpensesTab notify={notify} />}
+            {activeLink === 'Team' && <TeamTab notify={notify} />}
+            {activeLink === 'Customers' && <CustomersTab notify={notify} />}
+            {activeLink === 'Debts' && <DebtsTab notify={notify} currentUser={currentUser} />}
+            {activeLink === 'Order QR' && <PortalQrTab notify={notify} />}
+            {activeLink === 'Settings' && <SettingsTab notify={notify} />}
+            {activeLink === 'Reports' && <ReportsTab />}
+          </>
+        )}
       </main>
 
       {/* Mobile "More" sheet — the overflow views live here so the bottom bar
@@ -2994,7 +3010,7 @@ function OwnerDashboard({ currentUser, onLogout }) {
           <div className="absolute inset-0 bg-black/40" />
           <div onClick={(e) => e.stopPropagation()} className="relative bg-white rounded-t-3xl shadow-xl pb-4">
             <div className="w-10 h-1.5 bg-gray-200 rounded-full mx-auto mt-3 mb-1" />
-            {overflowLinks.map(({ key, icon }) => (
+            {overflow.map(({ key, icon }) => (
               <button
                 key={key}
                 onClick={() => { setActiveLink(key); setMoreOpen(false); }}
@@ -3012,7 +3028,7 @@ function OwnerDashboard({ currentUser, onLogout }) {
 
       {/* Mobile bottom bar — four most-used views plus a More menu */}
       <nav className="md:hidden fixed bottom-0 inset-x-0 bg-slate-900 border-t border-slate-800 flex justify-around py-2 z-10">
-        {primaryLinks.map(({ key, icon }) => (
+        {primary.map(({ key, icon }) => (
           <button
             key={key}
             onClick={() => { setActiveLink(key); setMoreOpen(false); }}
@@ -3024,15 +3040,17 @@ function OwnerDashboard({ currentUser, onLogout }) {
             {key}
           </button>
         ))}
-        <button
-          onClick={() => setMoreOpen((o) => !o)}
-          className={`flex flex-col items-center gap-0.5 px-2 py-1 rounded-lg text-[11px] font-semibold transition ${
-            moreOpen || overflowLinks.some((l) => l.key === activeLink) ? 'text-amber-400' : 'text-slate-400'
-          }`}
-        >
-          <span className="text-xl leading-none">☰</span>
-          More
-        </button>
+        {overflow.length > 0 && (
+          <button
+            onClick={() => setMoreOpen((o) => !o)}
+            className={`flex flex-col items-center gap-0.5 px-2 py-1 rounded-lg text-[11px] font-semibold transition ${
+              moreOpen || overflow.some((l) => l.key === activeLink) ? 'text-amber-400' : 'text-slate-400'
+            }`}
+          >
+            <span className="text-xl leading-none">☰</span>
+            More
+          </button>
+        )}
       </nav>
     </div>
   );

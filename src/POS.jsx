@@ -3,6 +3,7 @@ import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './db';
 import { supabase } from './supabaseClient';
 import { getBusinessId } from './session';
+import { can } from './permissions';
 import QrScanner from './QrScanner';
 import { getDeviceId, nextReceiptNo } from './receipts';
 import { decodeOrder } from './orderCode';
@@ -20,6 +21,10 @@ function relativeTime(ms) {
 }
 
 function POS({ currentUser, onLogout }) {
+  // Loss-prone actions (discount, void a whole tab) need a manager/owner — the
+  // usual POS separation of duties. A plain waiter can sell but not comp/void.
+  const canDiscount = can(currentUser?.role, 'pos.discount');
+  const canVoid = can(currentUser?.role, 'pos.void');
   const [activeTabId, setActiveTabId] = useState(null);
   const [selectedCategory, setSelectedCategory] = useState('All');
   const [searchQuery, setSearchQuery] = useState('');
@@ -1058,20 +1063,22 @@ function POS({ currentUser, onLogout }) {
           </span>
           <span className="text-[10px] font-semibold text-slate-500">Details</span>
         </button>
-        <button
-          onClick={() => setShowDiscount((open) => !open)}
-          aria-label="Discount"
-          className="flex flex-col items-center gap-0.5 active:scale-95"
-        >
-          <span
-            className={`w-11 h-11 rounded-full flex items-center justify-center text-lg ${
-              discountAmount > 0 || showDiscount ? 'bg-amber-500 text-white' : 'bg-slate-100 text-slate-600'
-            }`}
+        {canDiscount && (
+          <button
+            onClick={() => setShowDiscount((open) => !open)}
+            aria-label="Discount"
+            className="flex flex-col items-center gap-0.5 active:scale-95"
           >
-            🏷️
-          </span>
-          <span className="text-[10px] font-semibold text-slate-500">Discount</span>
-        </button>
+            <span
+              className={`w-11 h-11 rounded-full flex items-center justify-center text-lg ${
+                discountAmount > 0 || showDiscount ? 'bg-amber-500 text-white' : 'bg-slate-100 text-slate-600'
+              }`}
+            >
+              🏷️
+            </span>
+            <span className="text-[10px] font-semibold text-slate-500">Discount</span>
+          </button>
+        )}
       </div>
 
       {showDiscount && (
@@ -1390,13 +1397,15 @@ function POS({ currentUser, onLogout }) {
                 )}
               </div>
               <span className="text-lg lg:text-2xl font-bold text-slate-800 shrink-0">{cartTotal.toLocaleString()} RWF</span>
-              <button
-                onClick={cancelTab}
-                aria-label="Void tab"
-                className="w-9 h-9 lg:w-11 lg:h-11 shrink-0 rounded-full text-slate-400 text-base lg:text-lg flex items-center justify-center active:scale-95"
-              >
-                🗑️
-              </button>
+              {canVoid && (
+                <button
+                  onClick={cancelTab}
+                  aria-label="Void tab"
+                  className="w-9 h-9 lg:w-11 lg:h-11 shrink-0 rounded-full text-slate-400 text-base lg:text-lg flex items-center justify-center active:scale-95"
+                >
+                  🗑️
+                </button>
+              )}
             </div>
 
             <div className="lg:flex lg:gap-6 lg:items-start">
