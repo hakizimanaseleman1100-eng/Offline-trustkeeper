@@ -1,10 +1,9 @@
 import { supabase } from './supabaseClient';
 
 // The business (tenant) this device is operating as. Cached in localStorage so
-// it's available synchronously on load and offline. Defaults to the legacy id
-// so the existing single venue keeps working before it has signed up.
-const LEGACY_BUSINESS_ID = 'biz_123';
-let businessId = localStorage.getItem('business_id') || LEGACY_BUSINESS_ID;
+// it's available synchronously on load and offline. No legacy fallback — a
+// device with no cached business id must sign in while online once.
+let businessId = localStorage.getItem('business_id') || null;
 
 export function getBusinessId() {
   return businessId;
@@ -15,7 +14,7 @@ export function setBusinessId(id) {
   localStorage.setItem('business_id', id);
 }
 export function clearBusiness() {
-  businessId = LEGACY_BUSINESS_ID;
+  businessId = null;
   localStorage.removeItem('business_id');
 }
 

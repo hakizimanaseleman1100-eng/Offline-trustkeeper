@@ -4,9 +4,7 @@ import { db } from './db';
 import { supabase } from './supabaseClient';
 import { getBusinessId } from './session';
 import { can } from './permissions';
-import QrScanner from './QrScanner';
 import { getDeviceId, nextReceiptNo } from './receipts';
-import { decodeOrder } from './orderCode';
 
 // "5m ago" style label for the last successful sync.
 function relativeTime(ms) {
@@ -45,16 +43,12 @@ function POS({ currentUser, onLogout }) {
   const [debtNote, setDebtNote] = useState('');
   const [lastSyncAt, setLastSyncAt] = useState(null);
   const [showDiscount, setShowDiscount] = useState(false);
-  // Active coupons belonging to the tab's signed-in customer (loaded when online),
-  // offered as one-tap discounts at the till.
-  const [tabCoupons, setTabCoupons] = useState([]);
   // The station this session sells from. Normally the logged-in staff's
   // assigned station; if unassigned, the waiter picks one (kept on the device).
   const [sessionStation, setSessionStation] = useState(null);
   // Room item awaiting a nights count before it's added to the tab.
   const [roomPrompt, setRoomPrompt] = useState(null);
   const [nightsInput, setNightsInput] = useState('1');
-  const [scanning, setScanning] = useState(false); // self-service QR scanner open
   // Even-split calculator on the bill: how many ways to divide the total.
   const [splitWays, setSplitWays] = useState(1);
 
@@ -103,29 +97,6 @@ function POS({ currentUser, onLogout }) {
     [activeTabId]
   );
 
-  // Pull the tab customer's active coupons when online, so the waiter can redeem
-  // one as a bill discount. No connection just means no coupons are offered —
-  // the till still works and manual discounts are unaffected.
-  const tabCustomerId = activeTab?.customer_id ?? null;
-  useEffect(() => {
-    if (!tabCustomerId || !navigator.onLine) {
-      setTabCoupons([]);
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      const { data, error } = await supabase
-        .from('customer_coupons')
-        .select('*')
-        .eq('business_id', getBusinessId())
-        .eq('customer_id', tabCustomerId)
-        .eq('status', 'active');
-      if (!cancelled && !error) setTabCoupons(data ?? []);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [tabCustomerId]);
 
   // Which station this device is selling from. Staff assignment wins; otherwise
   // a device-remembered choice (sessionStation). Null = no station set up yet,
@@ -241,132 +212,6 @@ function POS({ currentUser, onLogout }) {
     setSearchQuery('');
   };
 
-  // A self-service QR was scanned. It's just a request until accepted here: we
-  // verify it's for THIS venue, refuse a duplicate scan, then create a real tab
-  // with the items (priced from the current menu). Stock/sync happen normally
-  // when the waiter serves & bills — never from the customer's device.
-  const handleScannedOrder = async (text) => {
-    setScanning(false);
-    let payload;
-    try {
-      payload = decodeOrder(text);
-    } catch {
-      showToast('Not a valid order code');
-      return;
-    }
-    // The venue isn't re-checked here — a scan can only ever match products in
-    // THIS venue's menu (resolved below), so a foreign order just resolves to
-    // nothing. The order is created automatically from what we can price.
-    const seen = JSON.parse(localStorage.getItem('scanned_oids') || '[]');
-    if (payload.oid && seen.includes(payload.oid)) {
-      showToast('This order was already scanned');
-      return;
-    }
-    const orderItems = Array.isArray(payload.items) ? payload.items : [];
-    if (orderItems.length === 0) {
-      showToast('Empty order');
-      return;
-    }
-
-    // Resolve each requested item against the current menu by id or name, so a
-    // stray id type/format can't drop an item. Price always comes from the
-    // live menu, never from the QR.
-    const inv = await db.inventory.toArray();
-    const byId = new Map(inv.map((p) => [String(p.id), p]));
-    const byName = new Map(inv.map((p) => [String(p.item_name).trim().toLowerCase(), p]));
-
-    // The detail (table/name) groups a customer's repeat orders: if an open tab
-    // already carries the same detail, this order stacks onto it (as the tab's
-    // current, unsent round) instead of opening a separate tab.
-    const detail = String(payload.details ?? '').trim();
-    const cust = payload.cust ?? null; // { id, u } when the customer was signed in
-    let existingTab = null;
-    if (detail) {
-      existingTab = await db.active_tabs
-        .where('status')
-        .equals('open')
-        .filter((t) => (t.client_ref ?? '').trim().toLowerCase() === detail.toLowerCase())
-        .first();
-    }
-
-    let targetId;
-    let createdNew = false;
-    if (existingTab) {
-      targetId = existingTab.id;
-    } else {
-      const tabNumber = (await db.active_tabs.count()) + 1;
-      targetId = await db.active_tabs.add({
-        name: detail || `Tab ${tabNumber}`,
-        client_ref: detail || null,
-        customer_id: cust?.id ?? null,
-        customer_username: cust?.u ?? null,
-        created_at: Date.now(),
-        status: 'open',
-        current_round: 1,
-      });
-      createdNew = true;
-    }
-
-    const tab = await db.active_tabs.get(targetId);
-    const round = tab.current_round ?? 1;
-
-    let added = 0;
-    let skipped = 0;
-    for (const it of orderItems) {
-      const prod = byId.get(String(it.id)) || byName.get(String(it.n ?? '').trim().toLowerCase());
-      if (!prod) {
-        skipped++;
-        continue;
-      }
-      const qty = Math.max(1, Number(it.q) || 1);
-      // Merge with an existing line in the same (unsent) round.
-      const existingLine = await db.sales
-        .where('tab_id')
-        .equals(targetId)
-        .filter((row) => row.item_id === prod.id && (row.round ?? 1) === round)
-        .first();
-      if (existingLine) {
-        const newQty = (existingLine.quantity ?? 1) + qty;
-        await db.sales.update(existingLine.id, { quantity: newQty, total_price: prod.unit_price * newQty });
-      } else {
-        await db.sales.add({
-          item_id: prod.id,
-          tab_id: targetId,
-          round,
-          quantity: qty,
-          total_price: prod.unit_price * qty,
-          cost_price: prod.cost_price,
-          tax_label: prod.tax_label,
-          tax_rate: prod.tax_rate,
-          staff_id: currentUser?.id ?? null,
-          staff_name: currentUser?.name ?? null,
-          customer_id: cust?.id ?? null,
-          customer_username: cust?.u ?? null,
-          timestamp: Date.now(),
-          synced_status: 0,
-        });
-      }
-      added++;
-    }
-
-    if (payload.oid) {
-      seen.push(payload.oid);
-      localStorage.setItem('scanned_oids', JSON.stringify(seen.slice(-300)));
-    }
-    if (added === 0) {
-      if (createdNew) await db.active_tabs.delete(targetId);
-      showToast('None of those items are on this menu');
-      return;
-    }
-    setActiveTabId(targetId);
-    setSelectedCategory('All');
-    setSearchQuery('');
-    if (existingTab) {
-      showToast(`Added ${added} item(s) to ${tab.name}`);
-    } else {
-      showToast(skipped ? `New order — ${skipped} item(s) unavailable` : `New order — ${added} item(s)`);
-    }
-  };
 
   // A waiter can optionally rename the tab later, from the Customer Details
   // panel — renaming isn't a precondition for opening a tab and serving.
@@ -415,25 +260,6 @@ function POS({ currentUser, onLogout }) {
     }
   };
 
-  // Redeem a customer coupon as this tab's bill discount. Marked 'redeemed' on
-  // the server at the moment it's applied, so it can't be used twice (even from
-  // another till). Requires connection — coupons only load when online anyway.
-  const redeemCoupon = async (coupon) => {
-    const nextDiscount = coupon.kind === 'percent' ? { mode: 'percent', value: coupon.value } : { mode: 'amount', value: coupon.value };
-    const { error } = await supabase
-      .from('customer_coupons')
-      .update({ status: 'redeemed', redeemed_at: new Date().toISOString() })
-      .eq('id', coupon.id)
-      .eq('status', 'active'); // guard against a double redeem
-    if (error) {
-      showToast('Could not apply coupon');
-      return;
-    }
-    await setTabDiscount(nextDiscount);
-    setTabCoupons((list) => list.filter((c) => c.id !== coupon.id));
-    logAudit('COUPON', `Redeemed ${coupon.kind === 'percent' ? coupon.value + '%' : coupon.value + ' RWF'} coupon for ${coupon.customer_username ?? 'customer'}`);
-    showToast('Coupon applied');
-  };
 
   // Quick-access from a tab card on the Home screen — jump straight into the
   // tab's cart or bill instead of opening the tab then hunting for the icon.
@@ -556,6 +382,7 @@ function POS({ currentUser, onLogout }) {
     // Snapshot cost/tax exactly as they are right now — inventory prices and
     // tax rules can change later, but a past sale must keep what was true at sale time.
     await db.sales.add({
+      uid: crypto.randomUUID(),
       item_id: item.id,
       tab_id: activeTabId,
       round: currentRound,
@@ -585,6 +412,7 @@ function POS({ currentUser, onLogout }) {
     const iso = (d) => d.toISOString().slice(0, 10);
 
     await db.sales.add({
+      uid: crypto.randomUUID(),
       item_id: item.id,
       tab_id: activeTabId,
       round: activeTab?.current_round ?? 1,
@@ -657,6 +485,9 @@ function POS({ currentUser, onLogout }) {
       ...taxSummary.map((t) => `VAT ${t.label} (${t.rate}%) incl.: ${Math.round(t.amount).toLocaleString()} RWF`),
       ...(business.momo_code ? ['', `Pay via MoMo: ${business.momo_code}`] : []),
       ...(business.receipt_footer ? ['', business.receipt_footer] : []),
+      '',
+      '** ORDER NOTE — IYI SI FAGITIRE YA EBM **',
+      '(Not an RRA fiscal receipt)',
     ].join('\n');
 
   // Prints in-place using a hidden, print-only section of the page (see the
@@ -822,8 +653,9 @@ function POS({ currentUser, onLogout }) {
       }
 
       if (unsynced.length) {
-      const { error } = await supabase.from('hospitality_sales').insert(
+      const { error } = await supabase.from('hospitality_sales').upsert(
         unsynced.map((sale) => ({
+          uid: sale.uid ?? null,
           business_id: getBusinessId(),
           item_id: sale.item_id,
           quantity: sale.quantity ?? 1,
@@ -848,7 +680,8 @@ function POS({ currentUser, onLogout }) {
           customer_id: sale.customer_id ?? null,
           customer_username: sale.customer_username ?? null,
           timestamp: new Date(sale.timestamp).toISOString(),
-        }))
+        })),
+        { onConflict: 'uid', ignoreDuplicates: true }
       );
       if (error) throw error;
 
@@ -1083,25 +916,7 @@ function POS({ currentUser, onLogout }) {
 
       {showDiscount && (
         <div className="space-y-2">
-          {tabCoupons.length > 0 && (
-            <div className="space-y-1.5">
-              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                {activeTab?.customer_username ? `${activeTab.customer_username}'s coupons` : 'Customer coupons'}
-              </p>
-              <div className="flex flex-wrap gap-2">
-                {tabCoupons.map((cp) => (
-                  <button
-                    key={cp.id}
-                    onClick={() => redeemCoupon(cp)}
-                    className="px-3 h-10 rounded-xl font-semibold text-sm bg-emerald-500 text-white active:scale-95"
-                  >
-                    🎟 {cp.kind === 'percent' ? `${cp.value}% off` : `${Number(cp.value).toLocaleString()} off`}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-          <div className="flex gap-2">
+                    <div className="flex gap-2">
             {[5, 10, 15].map((pct) => (
               <button
                 key={pct}
@@ -1279,19 +1094,24 @@ function POS({ currentUser, onLogout }) {
             <div className="text-[10px] lg:text-xs uppercase tracking-widest text-slate-400">Open Tabs</div>
             <div className="text-base sm:text-xl lg:text-2xl font-bold">{openTabs.length}</div>
           </div>
+          {/* Sync is automatic (after checkout + on reconnect). This is a passive
+              status dot — green: all saved to cloud; amber: queued offline.
+              Tapping it retries, as a support fallback, but staff never need to. */}
           <button
             onClick={() => syncData()}
             disabled={syncing}
-            aria-label="Sync to Cloud"
-            className="relative px-2.5 sm:px-4 lg:px-5 py-1.5 lg:py-2.5 rounded-xl bg-emerald-600 font-semibold text-xs sm:text-sm lg:text-base transition active:scale-95 disabled:opacity-50"
+            aria-label="Sync status"
+            title={unsyncedCount > 0 ? `${unsyncedCount} records waiting for network` : 'All records saved to cloud'}
+            className="relative flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-slate-800 text-xs sm:text-sm font-semibold transition active:scale-95"
           >
-            <span className="sm:hidden">☁</span>
-            <span className="hidden sm:inline">{syncing ? 'Syncing…' : '☁ Sync to Cloud'}</span>
-            {!syncing && unsyncedCount > 0 && (
-              <span className="absolute -top-1.5 -right-1.5 bg-red-500 text-white text-[10px] font-bold rounded-full w-5 h-5 flex items-center justify-center">
-                {unsyncedCount}
-              </span>
-            )}
+            <span
+              className={`w-2.5 h-2.5 rounded-full ${
+                syncing ? 'bg-sky-400 animate-pulse' : unsyncedCount > 0 ? 'bg-amber-400' : 'bg-emerald-400'
+              }`}
+            />
+            <span className="hidden sm:inline text-slate-300">
+              {syncing ? 'Saving…' : unsyncedCount > 0 ? `${unsyncedCount} pending` : 'Saved'}
+            </span>
           </button>
           <button
             onClick={onLogout}
@@ -1370,12 +1190,6 @@ function POS({ currentUser, onLogout }) {
                 className="h-20 sm:h-24 lg:h-28 rounded-2xl text-xl sm:text-2xl lg:text-3xl font-bold bg-amber-500 text-white shadow-md transition active:scale-95"
               >
                 + New Tab
-              </button>
-              <button
-                onClick={() => setScanning(true)}
-                className="h-14 lg:h-16 rounded-2xl text-base lg:text-lg font-bold bg-white text-slate-700 shadow-md transition active:scale-95"
-              >
-                📷 Scan self-service order
               </button>
             </div>
           </div>
@@ -1750,9 +1564,6 @@ function POS({ currentUser, onLogout }) {
         </div>
       )}
 
-      {/* Self-service QR scanner */}
-      {scanning && <QrScanner onResult={handleScannedOrder} onClose={() => setScanning(false)} />}
-
       {/* Toast */}
       {toast && (
         <div className="fixed bottom-24 left-1/2 -translate-x-1/2 bg-slate-900 text-white px-6 py-3 rounded-full shadow-xl text-lg z-10">
@@ -1812,6 +1623,10 @@ function POS({ currentUser, onLogout }) {
           <p className="text-center text-xs mt-3 pt-3 border-t border-dashed border-black">Pay via MoMo: {business.momo_code}</p>
         )}
         {business.receipt_footer && <p className="text-center text-xs mt-2">{business.receipt_footer}</p>}
+        <p className="text-center text-xs font-bold mt-3 pt-2 border-t border-black uppercase">
+          Order note — Iyi si fagitire ya EBM
+        </p>
+        <p className="text-center text-[10px]">(Not an RRA fiscal receipt)</p>
       </div>
     )}
     </>

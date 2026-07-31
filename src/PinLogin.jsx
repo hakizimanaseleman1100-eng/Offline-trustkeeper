@@ -4,7 +4,7 @@ import { hashPin } from './auth';
 
 // Full-screen PIN pad. Auto-verifies once 4 digits are entered — no separate
 // "enter" tap. On success it hands the matched staff row back to the parent.
-function PinLogin({ onSuccess, onSignOutVenue, onSelfService }) {
+function PinLogin({ onSuccess, onSignOutVenue }) {
   const [pin, setPin] = useState('');
   const [error, setError] = useState('');
   const [checking, setChecking] = useState(false);
@@ -86,14 +86,6 @@ function PinLogin({ onSuccess, onSignOutVenue, onSelfService }) {
         </button>
       </div>
 
-      {onSelfService && (
-        <button
-          onClick={onSelfService}
-          className="mt-2 px-6 py-3 rounded-2xl bg-slate-800 text-white font-bold active:scale-95"
-        >
-          🙋 Self-service — order here
-        </button>
-      )}
 
       {onSignOutVenue && (
         <button onClick={onSignOutVenue} className="text-slate-500 text-xs font-semibold underline mt-2">

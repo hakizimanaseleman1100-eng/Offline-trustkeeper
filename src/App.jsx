@@ -4,10 +4,9 @@ import { supabase } from './supabaseClient';
 import POS from './POS';
 import OwnerDashboard from './OwnerDashboard';
 import KitchenDisplay from './KitchenDisplay';
-import ClientOrder from './ClientOrder';
 import PinLogin from './PinLogin';
 import BusinessAuth from './BusinessAuth';
-import { getBusinessId, setBusinessId, currentSession, resolveBusinessId, ensureBusiness, signOutBusiness } from './session';
+import { getBusinessId, currentSession, resolveBusinessId, ensureBusiness, signOutBusiness } from './session';
 import { hashPin, DEFAULT_OWNER_ID, DEFAULT_OWNER_PIN } from './auth';
 
 // Down-syncs the product catalog from Supabase into the local Dexie mirror.
@@ -113,7 +112,6 @@ function App() {
   const [checking, setChecking] = useState(true); // resolving the venue session
   const [authed, setAuthed] = useState(false); // venue account signed in (or cached offline)
   const [ready, setReady] = useState(false); // local mirrors loaded
-  const [portal, setPortal] = useState(null); // { table } when a guest entered via a table/room QR
 
   // Down-syncs everything for the resolved business, then reveals the app.
   const bootstrap = async () => {
@@ -128,22 +126,6 @@ function App() {
 
   useEffect(() => {
     (async () => {
-      // Table/room QR: ?s=<business>&t=<table>. A guest scanned it on their own
-      // phone, so there's no venue login — drop straight into read-only
-      // self-service for that venue, with the table pre-filled. No bootstrap
-      // (the menu loads via a public RPC in ClientOrder, not the RLS sync).
-      const params = new URLSearchParams(window.location.search);
-      const s = params.get('s');
-      if (s) {
-        setBusinessId(s);
-        setPortal({ table: params.get('t') || '' });
-        setCurrentUser({ role: 'CLIENT', name: 'Self-service' });
-        setAuthed(true);
-        setReady(true);
-        setChecking(false);
-        return;
-      }
-
       const session = await currentSession();
       if (session) {
         // Attach to a business: existing profile, or create/adopt one.
@@ -194,13 +176,8 @@ function App() {
       <PinLogin
         onSuccess={setCurrentUser}
         onSignOutVenue={signOutVenue}
-        onSelfService={() => setCurrentUser({ role: 'CLIENT', name: 'Self-service' })}
       />
     );
-  }
-
-  if (currentUser.role === 'CLIENT') {
-    return <ClientOrder onExit={logout} guestPortal={!!portal} initialDetails={portal?.table ?? ''} />;
   }
 
   // Owner, manager and storeman all use the dashboard — which tabs they see is
