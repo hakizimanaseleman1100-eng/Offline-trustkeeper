@@ -3,7 +3,7 @@ import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './db';
 import { supabase } from './supabaseClient';
 import { getBusinessId } from './session';
-import { hashPin } from './auth';
+import { hashPin, pinProblem } from './auth';
 import { allowedTabs, canOpenTab, roleLabel, ROLES } from './permissions';
 
 const STAFF_ROLES = ROLES; // assignable roles for the Team tab
@@ -875,8 +875,10 @@ function TeamTab({ notify }) {
 
   const handleAddStaff = async (e) => {
     e.preventDefault();
-    if (!/^\d{4}$/.test(pin)) {
-      notify('PIN must be exactly 4 digits');
+    // Same rule as the owner PIN: no 1234/0000-style credentials anywhere.
+    const problem = pinProblem(pin);
+    if (problem) {
+      notify(problem);
       return;
     }
     const pin_hash = await hashPin(pin);
@@ -908,6 +910,18 @@ function TeamTab({ notify }) {
   };
 
   const setActive = async (member, active) => {
+    // Never leave the venue without an owner: with no active OWNER the app
+    // falls back to the "create owner PIN" screen, which anyone holding the
+    // device could then complete.
+    if (!active && member.role === 'OWNER') {
+      const otherOwners = staff.filter(
+        (s) => s.role === 'OWNER' && s.active !== false && s.id !== member.id
+      ).length;
+      if (otherOwners === 0) {
+        notify('Add another owner first — a venue must always have one active owner');
+        return;
+      }
+    }
     const { error } = await supabase.from('staff').update({ active }).eq('id', member.id);
     if (error) {
       notify(active ? `Could not re-activate: ${error.message}` : `Could not deactivate: ${error.message}`);

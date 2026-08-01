@@ -99,10 +99,10 @@ db.version(6).stores({
 
 /*
  * version(7): local mirror of the Supabase `staff` table for PIN login.
- * - Primary key is a plain 'id' holding the SAME id as the Supabase row
- *   (a uuid), or the fixed 'local-default-owner' id for the offline
- *   bootstrap owner — the app must resolve staff_id the same way whether a
- *   row came from the server or was seeded locally.
+ * - Primary key is a plain 'id' holding the SAME id as the Supabase row (a
+ *   uuid) — every staff account, including the owner, is created server-side
+ *   (see OwnerPinSetup / the Team tab) and mirrored here. Nothing is seeded
+ *   locally: old builds seeded a default-PIN owner, which was a backdoor.
  * - pin_hash is indexed so login is a single .where('pin_hash') lookup.
  *   `active` is stored but not indexed (IndexedDB can't index booleans);
  *   it's checked in JS after the hash match.

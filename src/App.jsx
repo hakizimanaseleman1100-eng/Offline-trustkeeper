@@ -6,8 +6,9 @@ import OwnerDashboard from './OwnerDashboard';
 import KitchenDisplay from './KitchenDisplay';
 import PinLogin from './PinLogin';
 import BusinessAuth from './BusinessAuth';
+import OwnerPinSetup from './OwnerPinSetup';
 import { getBusinessId, currentSession, resolveBusinessId, ensureBusiness, signOutBusiness } from './session';
-import { hashPin, DEFAULT_OWNER_ID, DEFAULT_OWNER_PIN } from './auth';
+import { LEGACY_DEFAULT_OWNER_ID } from './auth';
 
 // Down-syncs the product catalog from Supabase into the local Dexie mirror.
 // Inventory is fully server-owned now — this replaces the local copy wholesale
@@ -30,11 +31,13 @@ async function syncInventory() {
   }
 }
 
-// Mirrors the staff list locally so PIN login works offline. Seeds a local-only
-// default owner (PIN 1234) whenever there is NO real OWNER account yet — not
-// just when the table is empty. That way adding a waiter first doesn't lock the
-// business out of the dashboard; the default owner stays available until a real
-// OWNER is created in the Team tab, at which point it stops being seeded.
+// Mirrors the staff list locally so PIN login works offline, and returns
+// whether the venue has a usable OWNER account.
+//
+// NOTHING is seeded here. Older builds seeded a local "default owner" with a
+// well-known PIN so the dashboard was never locked out — that was a backdoor
+// into every venue's money screens, and it is gone: any stale seeded row is
+// deleted below, and a venue with no OWNER is sent to OwnerPinSetup instead.
 async function syncStaff() {
   try {
     const { data, error } = await supabase
@@ -50,19 +53,15 @@ async function syncStaff() {
     console.error('Staff down-sync skipped:', err.message);
   }
 
-  const hasOwner = await db.staff
+  // Kill the old default-PIN owner even on devices that are offline (where the
+  // clear() above never ran). Deleting by its fixed id is enough — it only ever
+  // existed locally, so no server row is affected.
+  await db.staff.delete(LEGACY_DEFAULT_OWNER_ID);
+
+  const owners = await db.staff
     .filter((s) => s.role === 'OWNER' && s.active !== false)
     .count();
-  if (!hasOwner) {
-    await db.staff.put({
-      id: DEFAULT_OWNER_ID,
-      business_id: getBusinessId(),
-      name: 'Owner',
-      pin_hash: await hashPin(DEFAULT_OWNER_PIN),
-      role: 'OWNER',
-      active: true,
-    });
-  }
+  return owners > 0;
 }
 
 // Mirrors stations and per-station stock so the POS can show/deduct the right
@@ -112,6 +111,7 @@ function App() {
   const [checking, setChecking] = useState(true); // resolving the venue session
   const [authed, setAuthed] = useState(false); // venue account signed in (or cached offline)
   const [ready, setReady] = useState(false); // local mirrors loaded
+  const [hasOwner, setHasOwner] = useState(true); // venue has a real OWNER PIN
 
   // Down-syncs everything for the resolved business, then reveals the app.
   const bootstrap = async () => {
@@ -120,7 +120,7 @@ function App() {
       await syncStations();
       await syncBusiness();
     }
-    await syncStaff();
+    setHasOwner(await syncStaff());
     setReady(true);
   };
 
@@ -157,6 +157,7 @@ function App() {
     setCurrentUser(null);
     setReady(false);
     setAuthed(false);
+    setHasOwner(true); // re-evaluated by the next bootstrap
   };
 
   if (checking) {
@@ -169,6 +170,19 @@ function App() {
 
   if (!ready) {
     return <div className="min-h-screen bg-slate-900" />;
+  }
+
+  // No owner account yet (fresh venue, or a device that carried the old default
+  // owner): the venue must create its own PIN before anyone can get in.
+  if (!hasOwner) {
+    return (
+      <OwnerPinSetup
+        onCreated={(owner) => {
+          setHasOwner(true);
+          setCurrentUser(owner);
+        }}
+      />
+    );
   }
 
   if (!currentUser) {

@@ -74,8 +74,19 @@ SC-2 low-end Android + flaky 2G (offline-first, sale NEVER blocks).
 ## Current state (branch mvp-ship, ahead of main)
 
 DONE:
-- Cut: customer portal, coupons, QR self-order, ClientOrder/QrScanner/orderCode
-  removed from build; biz_123 legacy fallback deleted (src/config.js removed).
+- Cut (customer-facing half only): ClientOrder/QrScanner/orderCode removed from
+  the build; biz_123 legacy fallback deleted (src/config.js removed).
+  NOT yet cut — the OWNER-side remnants still ship: the "Order QR" tab
+  (PortalQrTab, OwnerDashboard.jsx ~2282, prints QR codes to a portal that no
+  longer exists), coupon granting inside CustomersTab (~2610-2860), the loyalty
+  threshold/reward fields in SettingsTab, and the `qrcode` dependency.
+- No default credentials: PIN 1234 bootstrap owner deleted. A venue with no
+  active OWNER lands on OwnerPinSetup.jsx (server-side staff insert, requires
+  network once); App.jsx deletes any stale 'local-default-owner' row even
+  offline; pinProblem() in auth.js rejects repeated/sequential PINs for owner
+  AND staff; Team tab refuses to deactivate the last active OWNER.
+- Migration 0026: staff_role_check widened to allow STOREMAN (the client has
+  offered the role since the RBAC commit, the DB rejected it — 23514).
 - EBM disclaimer on billText() (SMS/share) and print block in src/POS.jsx.
 - PWA + persistent storage wired (vite.config.js, src/main.jsx).
 - Idempotent sales sync: uid stamped at db.sales.add (2 sites in POS.jsx),
@@ -96,8 +107,8 @@ VERIFY (may still be pending):
 
 ## Task queue (in order — do not reorder without reason)
 
-1. Kill the default owner PIN 1234 backdoor: force owner PIN creation at
-   venue signup (touches BusinessAuth/staff seeding). No default credentials.
+1. DONE (see Current state). Follow-up when convenient: cut the owner-side
+   portal/coupon/loyalty remnants listed above + drop `qrcode`.
 2. Unified outbox module: one shared sync engine (ordering + retry) used by
    sales, debts, debt_payments, stock moves, audit logs. Stock RPC failures
    currently only console.error after sales push — must retry in order.
