@@ -1379,6 +1379,46 @@ function SalesTab({ notify, currentUser }) {
 // can never masquerade as revenue. The physical count (STOCK IRAYE) is compared
 // to the sales-expected closing to surface a variance, valued at COST (the real
 // loss). Items that aren't stock-tracked (food, rooms) still show their sales.
+// Debt figures for one station's business day: recovered & new that day, the
+// outstanding balance as at its end, and any reconciliation shortfall debts
+// already recorded for it. Pulled out of the panel so it can be re-run on its
+// own after a shortfall is saved, without re-fetching stock, sales and products.
+async function loadDebtFigures(bid, stationId, day) {
+  const dayStart = new Date(`${day}T00:00:00`);
+  const start = dayStart.toISOString();
+  const end = new Date(dayStart.getTime() + 86400000).toISOString();
+
+  const [debtsRes, payRes] = await Promise.all([
+    supabase
+      .from('debts')
+      .select('id, amount, status, created_at, customer_name, source, business_day')
+      .eq('business_id', bid)
+      .eq('station_id', stationId),
+    supabase
+      .from('debt_payments')
+      .select('amount, created_at')
+      .eq('business_id', bid)
+      .eq('station_id', stationId),
+  ]);
+
+  const debtRows = debtsRes.data ?? [];
+  const payRows = payRes.data ?? [];
+  const started = debtRows.filter((d) => d.created_at >= start && d.created_at < end).reduce((a, d) => a + (d.amount ?? 0), 0);
+  const recovered = payRows.filter((p) => p.created_at >= start && p.created_at < end).reduce((a, p) => a + (p.amount ?? 0), 0);
+  const owed = debtRows.filter((d) => d.status !== 'void' && d.created_at < end).reduce((a, d) => a + (d.amount ?? 0), 0);
+  const paid = payRows.filter((p) => p.created_at < end).reduce((a, p) => a + (p.amount ?? 0), 0);
+
+  return {
+    recovered: Math.round(recovered),
+    started: Math.round(started),
+    outstanding: Math.round(owed - paid),
+    // Shortfalls already booked against this day — what the Save gate checks.
+    shortfallDebts: debtRows.filter(
+      (d) => d.source === 'reconciliation' && d.business_day === day && d.status !== 'void'
+    ),
+  };
+}
+
 function ReconcilePanel({ station, currentUser }) {
   const [loading, setLoading] = useState(true);
   const [day, setDay] = useState(ymd(new Date())); // the business day being reconciled
@@ -1396,6 +1436,9 @@ function ReconcilePanel({ station, currentUser }) {
   const [actual, setActual] = useState(''); // Actual available (Ahari) — counted at close
   // Debts (amadeni) for this station: recovered & new today, plus running outstanding.
   const [debts, setDebts] = useState({ recovered: 0, started: 0, outstanding: 0 });
+  const [shortfallDebts, setShortfallDebts] = useState([]); // shortfalls booked against this day
+  const [oweName, setOweName] = useState(currentUser?.name ?? ''); // who owes the shortfall
+  const [debtBusy, setDebtBusy] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
 
   useEffect(() => {
@@ -1407,14 +1450,13 @@ function ReconcilePanel({ station, currentUser }) {
       const start = dayStart.toISOString();
       const end = new Date(dayStart.getTime() + 86400000).toISOString();
       const bid = getBusinessId();
-      const [productsRes, stockRes, movesRes, salesRes, expRes, debtsRes, payRes, recRes, histRes] = await Promise.all([
+      const [productsRes, stockRes, movesRes, salesRes, expRes, debtFigures, recRes, histRes] = await Promise.all([
         supabase.from('products').select('id, item_name, unit_price, cost_price, active').eq('business_id', bid).order('item_name'),
         supabase.from('station_stock').select('*').eq('station_id', station.id),
         supabase.from('stock_movements').select('*').eq('station_id', station.id).gte('created_at', start).lt('created_at', end),
         supabase.from('hospitality_sales').select('item_id, quantity, total_price, payment_method').eq('station_id', station.id).gte('timestamp', start).lt('timestamp', end),
         supabase.from('expenses').select('amount').eq('business_id', bid).gte('created_at', start).lt('created_at', end),
-        supabase.from('debts').select('amount, status, created_at').eq('business_id', bid).eq('station_id', station.id),
-        supabase.from('debt_payments').select('amount, created_at').eq('business_id', bid).eq('station_id', station.id),
+        loadDebtFigures(bid, station.id, day),
         supabase.from('reconciliations').select('*').eq('business_id', bid).eq('station_id', station.id).eq('business_day', day).maybeSingle(),
         supabase.from('reconciliations').select('business_day, submitted_by, submitted_at, sales_total, cash_difference, shrinkage_cost').eq('business_id', bid).eq('station_id', station.id).order('business_day', { ascending: false }).limit(20),
       ]);
@@ -1423,14 +1465,8 @@ function ReconcilePanel({ station, currentUser }) {
       setSavedRec(recRes.data ?? null);
       setHistory(histRes.data ?? []);
 
-      // Debts (amadeni): new & recovered on the day, and the outstanding balance
-      // as at the end of that day.
-      const debtRows = debtsRes.data ?? [];
-      const payRows = payRes.data ?? [];
-      const startedToday = debtRows.filter((d) => d.created_at >= start && d.created_at < end).reduce((a, d) => a + (d.amount ?? 0), 0);
-      const recoveredToday = payRows.filter((p) => p.created_at >= start && p.created_at < end).reduce((a, p) => a + (p.amount ?? 0), 0);
-      const owed = debtRows.filter((d) => d.status !== 'void' && d.created_at < end).reduce((a, d) => a + (d.amount ?? 0), 0);
-      const paid = payRows.filter((p) => p.created_at < end).reduce((a, p) => a + (p.amount ?? 0), 0);
+      const { shortfallDebts: shortfalls, ...debtTotals } = debtFigures;
+      const recoveredToday = debtTotals.recovered;
 
       const onHand = Object.fromEntries((stockRes.data ?? []).map((r) => [String(r.product_id), Number(r.quantity)]));
       // Movements today: total change (to reconstruct opening) and issues (IBYINJIYE).
@@ -1497,9 +1533,18 @@ function ReconcilePanel({ station, currentUser }) {
       setMomoCollected(Math.round(momoSum));
       setCreditCollected(Math.round(creditSum));
       setExpensesTotal(Math.round(expSum));
-      setDebts({ recovered: Math.round(recoveredToday), started: Math.round(startedToday), outstanding: Math.round(owed - paid) });
-      // Counted cash: saved value if present, else the expected (cash − expenses).
-      setActual(saved?.data?.cashCounted != null ? String(saved.data.cashCounted) : String(Math.round(cashSum - expSum)));
+      setDebts(debtTotals);
+      setShortfallDebts(shortfalls);
+      // Prefer the name already on record for this day; otherwise keep whoever
+      // is signed in (the state's initial value).
+      if (shortfalls[0]?.customer_name) setOweName(shortfalls[0].customer_name);
+      // Counted takings: saved value if present, else the Expected Total
+      // (cash + MoMo + amadeni recovered − expenses).
+      setActual(
+        saved?.data?.cashCounted != null
+          ? String(saved.data.cashCounted)
+          : String(Math.round(cashSum + momoSum + recoveredToday - expSum))
+      );
       setLoading(false);
     })();
     return () => {
@@ -1529,11 +1574,25 @@ function ReconcilePanel({ station, currentUser }) {
   const signed = (n) => `${n > 0 ? '+' : ''}${money(n)}`;
   const diffColor = (n) => (n < 0 ? 'text-red-600' : n > 0 ? 'text-emerald-600' : 'text-slate-300');
 
-  // Cash-up: cash that should be in the drawer (cash sales − expenses) vs counted.
-  const cashExpected = cashCollected - expensesTotal;
+  // Expected Total — every franc the owner should receive for the day, whatever
+  // channel it came through:
+  //   cash sales + MoMo sales + amadeni recovered − expenses paid out of takings
+  // Credit sales are excluded on purpose: they are in Recorded sales (the sale
+  // happened) but no money arrived today — it arrives on the day the debt is
+  // recovered, and shows up in the amadeni line then. Counting both would bill
+  // the waiter twice for the same bottle.
+  const expectedTotal = cashCollected + momoCollected + debts.recovered - expensesTotal;
   const actualAvailable = Number(actual) || 0;
-  const cashDifference = actualAvailable - cashExpected;
+  const cashDifference = actualAvailable - expectedTotal;
   const profit = salesTotal - expensesTotal;
+
+  // A short cash-up is not a rounding error — it is money someone owes the
+  // venue, so it must land in the amadeni ledger before the day can be closed.
+  // A SURPLUS is left alone: nobody owes it, and inventing a debt for it would
+  // corrupt the ledger. It still shows as a difference to be explained.
+  const shortfall = Math.max(0, -cashDifference);
+  const shortfallSaved = shortfallDebts.reduce((a, d) => a + Number(d.amount ?? 0), 0);
+  const unsavedShortfall = Math.max(0, Math.round(shortfall - shortfallSaved));
 
   // Value of the stock still on hand (the physical count), at cost and at selling
   // price; the gap is the gross profit expected once it's all sold.
@@ -1555,9 +1614,13 @@ function ReconcilePanel({ station, currentUser }) {
     })),
     totals: { sold: totalSold, revenue: totalRevenue, varianceQty: totalVarQty, varianceCost: totalVarCost },
     sales: { total: salesTotal, cash: cashCollected, momo: momoCollected, credit: creditCollected },
-    expenses: expensesTotal, cashExpected, cashCounted: actualAvailable, cashDifference, profit,
+    // cashCounted / cashDifference keep their names — the reconciliations table
+    // mirrors them as cash_counted / cash_difference.
+    expenses: expensesTotal, expectedTotal, cashCounted: actualAvailable, cashDifference, profit,
     stock: { atCost: stockAtCost, atPrice: stockAtPrice, expectedGross },
     debts,
+    // Who answered for a shortfall on this day — part of the permanent record.
+    shortfall: { amount: shortfallSaved, owedBy: shortfallDebts.map((d) => d.customer_name) },
   };
   const view = !isToday && savedRec ? savedRec.data : liveView;
   const noRecord = !isToday && !savedRec; // a past day with nothing saved
@@ -1571,9 +1634,52 @@ function ReconcilePanel({ station, currentUser }) {
     setHistory(data ?? []);
   };
 
+  // Book the missing money as a debt (amadeni) against whoever is answerable
+  // for it, tagged to this station + business day so re-opening the day knows
+  // it has already been recorded. Same table the POS writes credit sales to, so
+  // recovery works exactly like any other debt.
+  const saveShortfallAsDebt = async () => {
+    const amount = unsavedShortfall;
+    if (amount <= 0) return;
+    const name = oweName.trim();
+    if (!name) return window.alert('Enter who owes this shortfall');
+
+    setDebtBusy(true);
+    const { error } = await supabase.from('debts').insert({
+      business_id: getBusinessId(),
+      customer_name: name,
+      amount,
+      staff_id: currentUser?.id ?? null,
+      staff_name: currentUser?.name ?? null,
+      station_id: station.id,
+      station_name: station.name,
+      note: `Cash shortfall at reconciliation — ${day}`,
+      status: 'open',
+      source: 'reconciliation',
+      business_day: day,
+    });
+    if (error) {
+      setDebtBusy(false);
+      return window.alert(`Could not save the debt: ${error.message}`);
+    }
+
+    // Re-read so the amadeni card, the outstanding balance and the Save gate all
+    // reflect the new debt from the server rather than an optimistic guess.
+    const figures = await loadDebtFigures(getBusinessId(), station.id, day);
+    const { shortfallDebts: shortfalls, ...totals } = figures;
+    setDebts(totals);
+    setShortfallDebts(shortfalls);
+    setDebtBusy(false);
+  };
+
   // Save the day's reconciliation as a dated snapshot (upsert per station+day),
   // stamped with who submitted it — so the owner can pull it up later.
   const saveReconciliation = async () => {
+    if (unsavedShortfall > 0) {
+      return window.alert(
+        `Record the missing ${money(unsavedShortfall)} RWF as a debt first — a day cannot be closed with money unaccounted for.`
+      );
+    }
     setSaving(true);
     const row = {
       business_id: getBusinessId(),
@@ -1653,8 +1759,9 @@ function ReconcilePanel({ station, currentUser }) {
       ['   Cash sales', rwf(view.sales.cash)],
       ['   MoMo sales', rwf(view.sales.momo)],
       ['   Credit (Amadeni)', rwf(view.sales.credit)],
+      ['Amadeni recovered today', rwf(view.debts?.recovered ?? 0)],
       ['Daily Expenses', rwf(view.expenses)],
-      ['Cash expected (drawer)', rwf(view.cashExpected)],
+      ['EXPECTED TOTAL (cash + MoMo + amadeni - expenses)', rwf(view.expectedTotal ?? view.cashExpected ?? 0)],
       ['Actual available (Ahari)', rwf(view.cashCounted)],
       ['Difference', `${view.cashDifference > 0 ? '+' : ''}${rwf(view.cashDifference)}`],
       ['Profit Before Tax', rwf(view.profit)],
@@ -1668,6 +1775,9 @@ function ReconcilePanel({ station, currentUser }) {
       ['Recovered (Yishyuwe)', rwf(view.debts.recovered)],
       ['New (Mashya)', rwf(view.debts.started)],
       ['Outstanding (Asigaye)', rwf(view.debts.outstanding)],
+      ...(view.shortfall?.amount
+        ? [[`Shortfall owed by ${view.shortfall.owedBy.join(', ')}`, rwf(view.shortfall.amount)]]
+        : []),
     ]);
 
     const safe = (s) => String(s).replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '');
@@ -1738,7 +1848,8 @@ function ReconcilePanel({ station, currentUser }) {
           {canEdit && (
             <button
               onClick={saveReconciliation}
-              disabled={saving}
+              disabled={saving || unsavedShortfall > 0}
+              title={unsavedShortfall > 0 ? `Record the missing ${money(unsavedShortfall)} RWF as a debt first` : undefined}
               className="px-4 py-2 rounded-lg text-sm font-semibold bg-emerald-600 text-white active:scale-95 disabled:opacity-50"
             >
               {saving ? 'Saving…' : savedRec ? '✔ Update saved' : '✔ Save reconciliation'}
@@ -1853,17 +1964,30 @@ function ReconcilePanel({ station, currentUser }) {
             <span className="text-slate-700">{money(view.sales.momo)} RWF</span>
           </div>
           <div className="flex justify-between items-center pl-3">
-            <span className="text-slate-500">Credit — Amadeni</span>
+            <span className="text-slate-500">
+              Credit — Amadeni <span className="text-slate-400 text-xs">(no money today)</span>
+            </span>
             <span className="text-slate-700">{money(view.sales.credit)} RWF</span>
           </div>
+          {/* Amadeni recovered today is cash that arrived without a sale behind
+              it, so it belongs in the drawer even though it is not in Recorded
+              sales (the sale was counted on the day the debt was taken). */}
           <div className="flex justify-between items-center border-t border-gray-100 pt-2">
-            <span className="text-slate-600">Daily Expenses</span>
-            <span className="font-semibold text-slate-800">{money(view.expenses)} RWF</span>
+            <span className="text-slate-600">Amadeni recovered <span className="text-slate-400 text-xs">(today)</span></span>
+            <span className="font-semibold text-slate-800">+{money(view.debts?.recovered ?? 0)} RWF</span>
           </div>
-          {/* Cash-up: what the drawer should hold vs what was counted. */}
+          <div className="flex justify-between items-center">
+            <span className="text-slate-600">Daily Expenses</span>
+            <span className="font-semibold text-slate-800">−{money(view.expenses)} RWF</span>
+          </div>
+          {/* Expected Total: everything the owner should receive today, vs what
+              was actually handed over. Older saved days stored this as
+              `cashExpected` (cash only) — fall back so history still renders. */}
           <div className="flex justify-between items-center border-t border-gray-100 pt-2">
-            <span className="text-slate-600">Cash expected <span className="text-slate-400 text-xs">(cash − expenses)</span></span>
-            <span className="font-semibold text-slate-800">{money(view.cashExpected)} RWF</span>
+            <span className="text-slate-800 font-semibold">
+              Expected Total <span className="text-slate-400 text-xs font-normal">(cash + MoMo + amadeni − expenses)</span>
+            </span>
+            <span className="font-bold text-slate-900">{money(view.expectedTotal ?? view.cashExpected ?? 0)} RWF</span>
           </div>
           <div className="flex justify-between items-center">
             <span className="text-slate-600">Actual available (Ahari)</span>
@@ -1875,6 +1999,40 @@ function ReconcilePanel({ station, currentUser }) {
               {view.cashDifference > 0 ? '+' : ''}{money(view.cashDifference)} RWF
             </span>
           </div>
+          {/* Shortfalls already booked against this day, so re-opening it shows
+              the money was accounted for rather than looking unresolved. */}
+          {shortfallDebts.length > 0 && (
+            <div className="flex justify-between items-center pl-3">
+              <span className="text-slate-500">
+                Recorded as debt <span className="text-slate-400 text-xs">({shortfallDebts.map((d) => d.customer_name).join(', ')})</span>
+              </span>
+              <span className="text-slate-700">{money(shortfallSaved)} RWF</span>
+            </div>
+          )}
+
+          {/* A shortfall must become a debt before the day can be closed —
+              otherwise missing money quietly disappears into a saved sheet. */}
+          {canEdit && unsavedShortfall > 0 && (
+            <div className="border border-red-200 bg-red-50 rounded-lg p-3 space-y-2">
+              <p className="text-red-700 font-semibold text-sm">
+                {money(unsavedShortfall)} RWF is missing — record who owes it before saving.
+              </p>
+              <input
+                value={oweName}
+                onChange={(e) => setOweName(e.target.value)}
+                placeholder="Who owes it (e.g. Jean, barman)"
+                className="w-full px-3 py-2 rounded-lg border border-red-200 text-sm"
+              />
+              <button
+                onClick={saveShortfallAsDebt}
+                disabled={debtBusy}
+                className="w-full py-2 rounded-lg bg-red-600 text-white text-sm font-semibold active:scale-95 disabled:opacity-50"
+              >
+                {debtBusy ? 'Saving…' : `Save ${money(unsavedShortfall)} RWF as debt`}
+              </button>
+            </div>
+          )}
+
           <div className="flex justify-between items-center border-t border-gray-100 pt-2">
             <span className="text-slate-700 font-semibold">Profit Before Tax</span>
             <span className="font-extrabold text-emerald-600">{money(view.profit)} RWF</span>
