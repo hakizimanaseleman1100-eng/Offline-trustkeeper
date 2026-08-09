@@ -112,6 +112,7 @@ function App() {
   const [authed, setAuthed] = useState(false); // venue account signed in (or cached offline)
   const [ready, setReady] = useState(false); // local mirrors loaded
   const [hasOwner, setHasOwner] = useState(true); // venue has a real OWNER PIN
+  const [hasSession, setHasSession] = useState(false); // LIVE Supabase session (not just a cached business)
 
   // Down-syncs everything for the resolved business, then reveals the app.
   const bootstrap = async () => {
@@ -131,6 +132,7 @@ function App() {
         // Attach to a business: existing profile, or create/adopt one.
         const bid = (await resolveBusinessId()) || (await ensureBusiness('My Venue'));
         void bid;
+        setHasSession(true);
         setAuthed(true);
         await bootstrap();
       } else if (localStorage.getItem('business_id')) {
@@ -145,6 +147,7 @@ function App() {
 
   // Called by BusinessAuth once the venue is signed in and its business resolved.
   const onVenueReady = async () => {
+    setHasSession(true);
     setAuthed(true);
     await bootstrap();
     setChecking(false);
@@ -157,6 +160,7 @@ function App() {
     setCurrentUser(null);
     setReady(false);
     setAuthed(false);
+    setHasSession(false);
     setHasOwner(true); // re-evaluated by the next bootstrap
   };
 
@@ -174,13 +178,22 @@ function App() {
 
   // No owner account yet (fresh venue, or a device that carried the old default
   // owner): the venue must create its own PIN before anyone can get in.
+  //
+  // Creating it is a WRITE to `staff`, which migration 0013 grants to
+  // `authenticated` only. A device can be "authed" here on nothing but a cached
+  // business_id (see the bootstrap effect), and on that path the staff
+  // down-sync silently failed too — so the local mirror may just be empty
+  // rather than the venue genuinely having no owner. Send them to sign in
+  // instead of to a setup screen whose insert would come back 42501.
   if (!hasOwner) {
+    if (!hasSession) return <BusinessAuth onReady={onVenueReady} />;
     return (
       <OwnerPinSetup
         onCreated={(owner) => {
           setHasOwner(true);
           setCurrentUser(owner);
         }}
+        onSignOutVenue={signOutVenue}
       />
     );
   }

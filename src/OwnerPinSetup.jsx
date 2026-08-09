@@ -15,7 +15,7 @@ import { getBusinessId } from './session';
 // the server row is what every other device will sync. That makes this the one
 // step of the app that legitimately requires network — a venue is online at
 // signup anyway (Supabase Auth), and selling still never blocks on network.
-function OwnerPinSetup({ onCreated }) {
+function OwnerPinSetup({ onCreated, onSignOutVenue }) {
   const [name, setName] = useState('');
   const [pin, setPin] = useState('');
   const [confirm, setConfirm] = useState('');
@@ -35,6 +35,15 @@ function OwnerPinSetup({ onCreated }) {
 
     setBusy(true);
     try {
+      // `staff` is granted to `authenticated` only (migration 0013), so an
+      // expired venue session would make this insert fail as `anon` with a bare
+      // "permission denied for table staff". Check first and say so plainly.
+      const { data: sess } = await supabase.auth.getSession();
+      if (!sess.session) {
+        setError('Your venue session has expired. Sign in to the venue again, then set the PIN.');
+        return;
+      }
+
       const pin_hash = await hashPin(pin);
       const { data, error: err } = await supabase
         .from('staff')
@@ -49,12 +58,23 @@ function OwnerPinSetup({ onCreated }) {
         .single();
 
       if (err) {
-        // The (business_id, pin_hash) unique index on active staff is the real
-        // guard against two people sharing a PIN; surface it in plain words.
+        // 23505: the (business_id, pin_hash) unique index on active staff — the
+        // real guard against two people sharing a PIN.
+        // 42501 covers two different failures, told apart only by the message:
+        // "permission denied for table staff" = the write landed as `anon` (the
+        // grant is to `authenticated` only), vs "row-level security policy" =
+        // signed in, but the account resolves to a different business or none.
+        const denied =
+          err.code === '42501' &&
+          (/row-level security/i.test(err.message)
+            ? 'Signed in, but this account is not linked to a venue. Sign out and sign in again.'
+            : 'This device is not signed in to the venue. Sign out and sign in again.');
+
         setError(
-          err.code === '23505'
-            ? 'That PIN is already used by another staff member — pick another'
-            : `Could not create the owner PIN: ${err.message}`
+          denied ||
+            (err.code === '23505'
+              ? 'That PIN is already used by another staff member — pick another'
+              : `Could not create the owner PIN: ${err.message}`)
         );
         return;
       }
@@ -121,6 +141,14 @@ function OwnerPinSetup({ onCreated }) {
         Write it down somewhere safe. If you forget it, a new owner PIN can only be created from the
         Team tab by someone already signed in.
       </p>
+
+      {/* Escape hatch: a device whose venue session lapsed cannot write to
+          `staff`. Signing out and back in is the fix, so never trap them here. */}
+      {onSignOutVenue && (
+        <button onClick={onSignOutVenue} className="text-slate-500 text-xs font-semibold underline">
+          Sign out of venue
+        </button>
+      )}
     </div>
   );
 }
