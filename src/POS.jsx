@@ -5,6 +5,9 @@ import { supabase } from './supabaseClient';
 import { getBusinessId } from './session';
 import { can } from './permissions';
 import { getDeviceId, nextReceiptNo } from './receipts';
+import { buildRoundPayload, encodeHandover, decodeHandover, applyHandover } from './handover';
+import QrScanner from './QrScanner';
+import RoundQr from './RoundQr';
 
 // "5m ago" style label for the last successful sync.
 function relativeTime(ms) {
@@ -51,6 +54,15 @@ function POS({ currentUser, onLogout }) {
   const [nightsInput, setNightsInput] = useState('1');
   // Even-split calculator on the bill: how many ways to divide the total.
   const [splitWays, setSplitWays] = useState(1);
+
+  // Waiter phone vs barman counter. A WAITER takes the order at the table and
+  // hands each round to the barman as a QR; the barman issues the stock and
+  // confirms the payment, because he is the one accountable for both. So the
+  // waiter's phone has no payment buttons and never pushes a sale — his rows
+  // are an order draft, and the barman's device is the single writer of money.
+  const handoverMode = currentUser?.role === 'WAITER';
+  const [roundQr, setRoundQr] = useState(null); // the round being shown at the counter
+  const [scanning, setScanning] = useState(false); // barman's camera open
 
   const showToast = (message, duration = 2500) => {
     setToast(message);
@@ -202,10 +214,16 @@ function POS({ currentUser, onLogout }) {
   const createTab = async () => {
     const tabNumber = (await db.active_tabs.count()) + 1;
     const id = await db.active_tabs.add({
+      // uid is the tab's identity ACROSS devices: it is what makes round 2 from
+      // the waiter's phone land on the tab the barman opened for round 1. The
+      // auto-increment id is local to this phone and cannot travel.
+      uid: crypto.randomUUID(),
       name: `Tab ${tabNumber}`,
       created_at: Date.now(),
       status: 'open',
       current_round: 1,
+      waiter_id: currentUser?.id ?? null,
+      waiter_name: currentUser?.name ?? null,
     });
     setActiveTabId(id);
     setSelectedCategory('All');
@@ -433,10 +451,65 @@ function POS({ currentUser, onLogout }) {
 
   const sendRound = async () => {
     const currentRound = activeTab?.current_round ?? 1;
-    const roundLines = (roundsMap[currentRound] ?? []).map((row) => ({
+    const roundRows = roundsMap[currentRound] ?? [];
+    const roundLines = roundRows.map((row) => ({
       name: row.name,
       quantity: row.quantity ?? 1,
     }));
+
+    // Waiter phone: the round travels to the barman as a QR he scans at the
+    // counter. The id is minted ONCE here and kept, so re-showing this round
+    // shows the same code — the barman's device rejects the second scan rather
+    // than issuing the bottles again.
+    if (handoverMode && roundRows.length > 0) {
+      let tabUid = activeTab?.uid;
+      if (!tabUid) {
+        // A tab opened before this build had no cross-device identity.
+        tabUid = crypto.randomUUID();
+        await db.active_tabs.update(activeTabId, { uid: tabUid });
+      }
+
+      const existing = await db.handovers
+        .where('tab_uid')
+        .equals(tabUid)
+        .filter((h) => h.round === currentRound)
+        .first();
+
+      const payload =
+        existing?.payload ??
+        buildRoundPayload({
+          tabUid,
+          tabName: activeTab?.name,
+          round: currentRound,
+          waiter: currentUser,
+          lines: roundRows.map((row) => ({
+            item_id: row.item_id,
+            quantity: row.quantity ?? 1,
+            // Unit price, not the line total — the barman multiplies by qty.
+            unit_price: Math.round((row.total_price ?? 0) / (row.quantity || 1)),
+            name: row.name,
+          })),
+        });
+
+      if (!existing) {
+        await db.handovers.add({
+          id: payload.h,
+          tab_uid: tabUid,
+          round: currentRound,
+          payload,
+          created_at: Date.now(),
+        });
+      }
+
+      await db.active_tabs.update(activeTabId, { current_round: currentRound + 1 });
+      setRoundQr({
+        round: currentRound,
+        code: encodeHandover(payload),
+        lines: payload.l.map((l) => ({ name: l.n, quantity: l.q, unit_price: l.p })),
+        total: payload.l.reduce((s, l) => s + l.q * l.p, 0),
+      });
+      return;
+    }
 
     // Push a live ticket to the kitchen/bar display. Best-effort: if we're
     // offline the round is still marked sent locally; the kitchen just won't
@@ -631,10 +704,64 @@ function POS({ currentUser, onLogout }) {
     }
   };
 
+  // Barman: a waiter's round arrives from the camera. Everything about this is
+  // hostile-input handling — the text comes from whatever was in frame — so the
+  // payload is validated before a single bottle moves.
+  const receiveRound = async (text) => {
+    setScanning(false);
+    const { payload, error } = decodeHandover(text);
+    if (error) return showToast(error, 4000);
+
+    try {
+      const result = await applyHandover(payload, { barman: currentUser });
+      if (result.duplicate) {
+        return showToast('Already received — this round is on the tab', 3500);
+      }
+      // Fire the kitchen ticket from HERE, not from the waiter's phone: the
+      // round only becomes real when the counter accepts it, and this is the
+      // device that knows it did. Best-effort, exactly like sendRound.
+      try {
+        await supabase.from('kitchen_tickets').insert({
+          business_id: getBusinessId(),
+          tab_id: result.tabId,
+          tab_name: result.tabName ?? null,
+          round: payload.round,
+          items: payload.lines.map((l) => ({ name: l.name, quantity: l.quantity })),
+          staff_name: payload.waiter.name || null,
+        });
+      } catch (err) {
+        console.error('Kitchen ticket not sent:', err.message);
+      }
+
+      showToast(`Round ${payload.round} received · ${result.total.toLocaleString()} RWF`, 3500);
+      setActiveTabId(result.tabId); // open it so the bottles can be issued
+    } catch (err) {
+      console.error('Handover failed:', err);
+      showToast('Could not add that round — try again');
+    }
+  };
+
+  // Waiter clearing a finished table off his phone. Deliberately NOT 'paid':
+  // only the barman's device settles money, and the sync push keys off 'paid'.
+  // The tab stays on the phone as a record of what he handed over.
+  const handOverTab = async () => {
+    await db.active_tabs.update(activeTabId, { status: 'handed', handed_at: Date.now() });
+    showToast('Handed over to the barman');
+    closeTabView();
+  };
+
   // silent=true for automatic (online-event) runs so they don't spam toasts.
   const syncData = async ({ silent = false } = {}) => {
     if (!navigator.onLine) {
       if (!silent) showToast('Offline — will sync when connected');
+      return;
+    }
+    // A waiter's phone never uploads sales: the same round exists on the
+    // barman's device, and two devices pushing the same beer would double the
+    // venue's revenue. His tabs are handed over, never paid, so this is belt
+    // and braces on top of the 'paid' filter below.
+    if (handoverMode) {
+      if (!silent) showToast('Orders are recorded by the barman');
       return;
     }
     setSyncing(true);
@@ -1041,6 +1168,21 @@ function POS({ currentUser, onLogout }) {
             </button>
           </div>
         </div>
+      ) : handoverMode ? (
+        /* Waiter's phone: money is confirmed by the barman, so there are no
+           payment buttons here at all. Sending the round IS the handover. */
+        <div className="space-y-3 pt-1">
+          <p className="text-center text-sm text-slate-500 px-2">
+            Send each round to the barman. He issues the drinks and takes the payment.
+          </p>
+          <button
+            onClick={handOverTab}
+            disabled={cartItems.length === 0}
+            className="w-full h-14 rounded-xl text-base font-bold bg-slate-800 text-white transition active:scale-95 disabled:opacity-40"
+          >
+            ✓ Done — all rounds handed over
+          </button>
+        </div>
       ) : (
         <div className="space-y-3 pt-1">
           <div className="grid grid-cols-2 gap-3">
@@ -1191,6 +1333,16 @@ function POS({ currentUser, onLogout }) {
               >
                 + New Tab
               </button>
+              {/* The counter's half of the handover. Not shown on a waiter's
+                  phone — he shows codes, he doesn't receive them. */}
+              {!handoverMode && (
+                <button
+                  onClick={() => setScanning(true)}
+                  className="h-16 lg:h-20 rounded-2xl text-base lg:text-xl font-bold bg-sky-600 text-white shadow-md transition active:scale-95"
+                >
+                  📷 Scan waiter round
+                </button>
+              )}
             </div>
           </div>
         ) : (
@@ -1562,6 +1714,17 @@ function POS({ currentUser, onLogout }) {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Waiter: the round's code, held up at the counter. Barman: the camera. */}
+      {roundQr && <RoundQr {...roundQr} onClose={() => { setRoundQr(null); closeTabView(); }} />}
+      {scanning && (
+        <QrScanner
+          onResult={receiveRound}
+          onClose={() => setScanning(false)}
+          title="Scan the waiter’s round"
+          hint="One code per round — the waiter shows a new one each time."
+        />
       )}
 
       {/* Toast */}

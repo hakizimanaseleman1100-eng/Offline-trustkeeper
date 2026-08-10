@@ -159,3 +159,31 @@ db.version(10).stores({
 db.version(11).stores({
   debts: 'id, synced_status, station_id',
 });
+
+/*
+ * version(12): waiter → barman handover, offline, over QR.
+ *
+ * The real floor workflow: the waiter takes the order at the table on his own
+ * phone, walks to the counter, and the BARMAN issues the stock and later
+ * confirms the payment — he is the one accountable for both. Two phones with no
+ * network cannot reach each other through Supabase, so the round travels as a
+ * QR code the waiter shows and the barman scans. Orders arrive in rounds, so a
+ * code carries ONE round's increment, never the whole tab (re-scanning a tab
+ * would re-issue bottles that already left the counter).
+ *
+ * - active_tabs gains an indexed `uid`: a client-generated uuid that is stable
+ *   ACROSS devices, so round 2 lands on the same tab the barman opened for
+ *   round 1. The auto-increment `id` is device-local and cannot do that job.
+ * - handovers (waiter side): every round this device has emitted, so the same
+ *   QR can be re-shown without minting a new id — showing it twice must not
+ *   let the barman receive it twice.
+ * - received_rounds (barman side): the idempotency ledger, keyed by the
+ *   handover id. A second scan of the same code is a no-op with a clear
+ *   message, which matters because the natural reaction to an unsure scan is
+ *   to scan again.
+ */
+db.version(12).stores({
+  active_tabs: '++id, name, created_at, status, uid',
+  handovers: 'id, tab_uid, created_at',
+  received_rounds: 'id, tab_uid, received_at',
+});
