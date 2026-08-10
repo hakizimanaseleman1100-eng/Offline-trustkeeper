@@ -9,6 +9,7 @@ import BusinessAuth from './BusinessAuth';
 import OwnerPinSetup from './OwnerPinSetup';
 import { getBusinessId, currentSession, resolveBusinessId, ensureBusiness, signOutBusiness } from './session';
 import { LEGACY_DEFAULT_OWNER_ID } from './auth';
+import { allowedTabs, canSell, landingFor } from './permissions';
 
 // Down-syncs the product catalog from Supabase into the local Dexie mirror.
 // Inventory is fully server-owned now — this replaces the local copy wholesale
@@ -113,6 +114,9 @@ function App() {
   const [ready, setReady] = useState(false); // local mirrors loaded
   const [hasOwner, setHasOwner] = useState(true); // venue has a real OWNER PIN
   const [hasSession, setHasSession] = useState(false); // LIVE Supabase session (not just a cached business)
+  // Which surface the signed-in staff member is looking at. Seeded from their
+  // role at PIN login (landingFor), then theirs to change.
+  const [view, setView] = useState('POS');
 
   // Down-syncs everything for the resolved business, then reveals the app.
   const bootstrap = async () => {
@@ -144,6 +148,11 @@ function App() {
       setChecking(false);
     })();
   }, []);
+
+  // A fresh PIN login lands on that role's home surface.
+  useEffect(() => {
+    if (currentUser) setView(landingFor(currentUser.role));
+  }, [currentUser]);
 
   // Called by BusinessAuth once the venue is signed in and its business resolved.
   const onVenueReady = async () => {
@@ -207,18 +216,33 @@ function App() {
     );
   }
 
-  // Owner, manager and storeman all use the dashboard — which tabs they see is
-  // gated per role (see permissions.js). Waiters sell at the POS; kitchen sees
-  // the kitchen display.
-  if (['OWNER', 'MANAGER', 'STOREMAN'].includes(currentUser.role)) {
-    return <OwnerDashboard currentUser={currentUser} onLogout={logout} />;
-  }
-
   if (currentUser.role === 'KITCHEN') {
     return <KitchenDisplay currentUser={currentUser} onLogout={logout} />;
   }
 
-  return <POS currentUser={currentUser} onLogout={logout} />;
+  // Most roles need BOTH surfaces, so the app keeps one view state rather than
+  // deciding once from the role. The barman sells all evening and reconciles at
+  // the end of it; the owner does the reverse. They land on whichever is their
+  // day's work (permissions.js) and switch when they need the other.
+  const canSwitchToDashboard = allowedTabs(currentUser.role).length > 0;
+
+  if (view === 'DASHBOARD' && canSwitchToDashboard) {
+    return (
+      <OwnerDashboard
+        currentUser={currentUser}
+        onLogout={logout}
+        onOpenPos={canSell(currentUser.role) ? () => setView('POS') : null}
+      />
+    );
+  }
+
+  return (
+    <POS
+      currentUser={currentUser}
+      onLogout={logout}
+      onOpenDashboard={canSwitchToDashboard ? () => setView('DASHBOARD') : null}
+    />
+  );
 }
 
 export default App;

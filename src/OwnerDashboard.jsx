@@ -3127,7 +3127,7 @@ function CustomersTab({ notify }) {
   );
 }
 
-function OwnerDashboard({ currentUser, onLogout }) {
+function OwnerDashboard({ currentUser, onLogout, onOpenPos }) {
   const role = currentUser?.role ?? 'OWNER';
   // Only the tabs this role may open, in NAV_LINKS order.
   const navLinks = NAV_LINKS.filter((l) => canOpenTab(role, l.key));
@@ -3181,12 +3181,23 @@ function OwnerDashboard({ currentUser, onLogout }) {
       {/* Mobile top bar — sidebar is hidden below md, so logout needs a home here */}
       <header className="md:hidden bg-slate-900 text-white px-4 py-4 flex justify-between items-center shrink-0">
         <span className="text-xl font-extrabold tracking-tight">Sovereign OS</span>
-        <button
-          onClick={onLogout}
-          className="px-3 py-2 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95"
-        >
-          Logout
-        </button>
+        <div className="flex gap-2">
+          {/* Back to the till. The barman lives here, not on the dashboard. */}
+          {onOpenPos && (
+            <button
+              onClick={onOpenPos}
+              className="px-3 py-2 rounded-lg bg-amber-500 text-sm font-semibold active:scale-95"
+            >
+              🛒 Sell
+            </button>
+          )}
+          <button
+            onClick={onLogout}
+            className="px-3 py-2 rounded-lg bg-slate-700 text-sm font-semibold active:scale-95"
+          >
+            Logout
+          </button>
+        </div>
       </header>
 
       {/* Desktop sidebar — full text nav, hidden on mobile in favor of the icon bar below */}
@@ -3213,6 +3224,14 @@ function OwnerDashboard({ currentUser, onLogout }) {
             </button>
           ))}
         </nav>
+        {onOpenPos && (
+          <button
+            onClick={onOpenPos}
+            className="px-6 py-4 text-left text-sm font-semibold text-amber-400 border-t border-slate-800 hover:bg-slate-800/50"
+          >
+            🛒 Back to selling
+          </button>
+        )}
         <button
           onClick={onLogout}
           className="px-6 py-4 text-left text-sm font-semibold text-slate-400 border-t border-slate-800 hover:bg-slate-800/50"

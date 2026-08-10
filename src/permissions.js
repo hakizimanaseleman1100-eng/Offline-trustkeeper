@@ -21,17 +21,27 @@ export function roleLabel(role) {
 }
 
 // The home screen a role lands on after PIN login.
+//
+// The STOREMAN / barman lands on the POS, not the dashboard: he is the one who
+// actually sells. He receives waiters' rounds at the counter, issues the stock
+// and takes the money — his dashboard tabs (Reconcile, Inventory, Expenses) are
+// end-of-day work he switches to, not where his shift is spent.
 export function landingFor(role) {
   switch (role) {
     case 'OWNER':
     case 'MANAGER':
-    case 'STOREMAN':
       return 'DASHBOARD';
     case 'KITCHEN':
       return 'KITCHEN';
     default:
-      return 'POS'; // WAITER (and any unknown role) sells at the POS
+      return 'POS'; // WAITER, STOREMAN (and any unknown role) sell at the POS
   }
+}
+
+// Who may open the till at all. Everyone except the kitchen, which only ever
+// needs the ticket display.
+export function canSell(role) {
+  return role !== 'KITCHEN';
 }
 
 // Dashboard tabs each role may open. Separation of duties:

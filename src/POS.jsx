@@ -22,7 +22,7 @@ function relativeTime(ms) {
   return `${Math.round(hrs / 24)}d ago`;
 }
 
-function POS({ currentUser, onLogout }) {
+function POS({ currentUser, onLogout, onOpenDashboard }) {
   // Loss-prone actions (discount, void a whole tab) need a manager/owner — the
   // usual POS separation of duties. A plain waiter can sell but not comp/void.
   const canDiscount = can(currentUser?.role, 'pos.discount');
@@ -1257,6 +1257,19 @@ function POS({ currentUser, onLogout }) {
               {syncing ? 'Saving…' : unsyncedCount > 0 ? `${unsyncedCount} pending` : 'Saved'}
             </span>
           </button>
+          {/* Reconcile / stock / expenses for the roles that have them — the
+              barman's end-of-day work, one tap from the till he spends his
+              shift on. */}
+          {onOpenDashboard && (
+            <button
+              onClick={onOpenDashboard}
+              aria-label="Open dashboard"
+              className="px-2.5 py-1.5 lg:px-5 lg:py-2.5 rounded-xl bg-slate-700 font-semibold text-xs sm:text-sm lg:text-base transition active:scale-95"
+            >
+              <span className="sm:hidden">📊</span>
+              <span className="hidden sm:inline">📊 Dashboard</span>
+            </button>
+          )}
           <button
             onClick={onLogout}
             aria-label="Logout"
