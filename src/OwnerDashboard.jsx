@@ -1436,6 +1436,11 @@ function ReconcilePanel({ station, currentUser }) {
   const [actual, setActual] = useState(''); // Actual available (Ahari) — counted at close
   // Debts (amadeni) for this station: recovered & new today, plus running outstanding.
   const [debts, setDebts] = useState({ recovered: 0, started: 0, outstanding: 0 });
+  // Blind count: the figures the count is judged against stay hidden until it is
+  // submitted, so a count is independent evidence rather than a confirmation of
+  // what the system already believes. Locked = submitted, variances revealed.
+  const [countLocked, setCountLocked] = useState(false);
+  const [recounts, setRecounts] = useState(0); // times the count was reopened AFTER seeing the variance
   const [shortfallDebts, setShortfallDebts] = useState([]); // shortfalls booked against this day
   const [oweName, setOweName] = useState(currentUser?.name ?? ''); // who owes the shortfall
   const [debtBusy, setDebtBusy] = useState(false);
@@ -1466,7 +1471,6 @@ function ReconcilePanel({ station, currentUser }) {
       setHistory(histRes.data ?? []);
 
       const { shortfallDebts: shortfalls, ...debtTotals } = debtFigures;
-      const recoveredToday = debtTotals.recovered;
 
       const onHand = Object.fromEntries((stockRes.data ?? []).map((r) => [String(r.product_id), Number(r.quantity)]));
       // Movements today: total change (to reconstruct opening) and issues (IBYINJIYE).
@@ -1519,15 +1523,19 @@ function ReconcilePanel({ station, currentUser }) {
 
       setRows(list);
       const saved = recRes.data;
-      // Counted stock: from the saved snapshot if one exists (so re-opening a day
-      // shows the recorded counts), otherwise defaults to the sales-expected
-      // closing (opening + in − sold). It only drives the shrinkage variance —
-      // it can no longer change the revenue figure.
-      if (saved?.data?.lines) {
-        setClosing(Object.fromEntries(saved.data.lines.filter((l) => l.tracked).map((l) => [l.id, String(l.counted)])));
-      } else {
-        setClosing(Object.fromEntries(list.filter((r) => r.tracked).map((r) => [r.id, String(r.opening + r.received - r.sold)])));
-      }
+      // Counted stock: from the saved snapshot if one exists (re-opening a day
+      // shows what was recorded), otherwise BLANK. It is never prefilled with
+      // the expected closing — a count that arrives pre-answered proves nothing,
+      // and hiding four missing bottles would be a matter of not touching the
+      // box. The count is typed from the shelf, then checked against expected.
+      setClosing(
+        saved?.data?.lines
+          ? Object.fromEntries(saved.data.lines.filter((l) => l.tracked).map((l) => [l.id, String(l.counted)]))
+          : {}
+      );
+      // A saved day has already been counted, so its figures are visible.
+      setCountLocked(Boolean(saved));
+      setRecounts(saved?.data?.recounts ?? 0);
       setSalesTotal(Math.round(salesSum));
       setCashCollected(Math.round(cashSum));
       setMomoCollected(Math.round(momoSum));
@@ -1538,13 +1546,11 @@ function ReconcilePanel({ station, currentUser }) {
       // Prefer the name already on record for this day; otherwise keep whoever
       // is signed in (the state's initial value).
       if (shortfalls[0]?.customer_name) setOweName(shortfalls[0].customer_name);
-      // Counted takings: saved value if present, else the Expected Total
-      // (cash + MoMo + amadeni recovered − expenses).
-      setActual(
-        saved?.data?.cashCounted != null
-          ? String(saved.data.cashCounted)
-          : String(Math.round(cashSum + momoSum + recoveredToday - expSum))
-      );
+      // Counted takings: saved value if present, else BLANK — same reason as the
+      // stock count above. Prefilling it with the Expected Total made "no
+      // difference" the default answer, which is exactly what a short drawer
+      // wants the sheet to say.
+      setActual(saved?.data?.cashCounted != null ? String(saved.data.cashCounted) : '');
       setLoading(false);
     })();
     return () => {
@@ -1562,10 +1568,14 @@ function ReconcilePanel({ station, currentUser }) {
   const computed = rows.map((r) => {
     const total = r.opening + r.received;
     const expected = total - r.sold; // opening + in − sold
-    const countedVal = r.tracked ? Number(closing[r.id] ?? expected) || 0 : null;
-    const varianceQty = r.tracked ? countedVal - expected : 0;
+    // An uncounted row has no variance — a blank box must never read as zero
+    // stock, which would invent a shrinkage the size of the whole shelf.
+    const raw = closing[r.id];
+    const hasCount = r.tracked && raw !== undefined && String(raw).trim() !== '';
+    const countedVal = hasCount ? Number(raw) || 0 : null;
+    const varianceQty = hasCount ? countedVal - expected : 0;
     const varianceCost = varianceQty * r.cost;
-    return { ...r, total, expected, countedVal, varianceQty, varianceCost };
+    return { ...r, total, expected, hasCount, countedVal, varianceQty, varianceCost };
   });
   const totalSold = computed.reduce((a, r) => a + r.sold, 0);
   const totalRevenue = computed.reduce((a, r) => a + r.revenue, 0); // equals salesTotal
@@ -1603,6 +1613,14 @@ function ReconcilePanel({ station, currentUser }) {
   const isToday = day === ymd(new Date());
   const canEdit = isToday; // past days are read-only saved records
 
+  // Counting is blind for the people being held to account (storeman, manager).
+  // The OWNER is the one the evidence is FOR, so they see variances live — no
+  // point adding a click for someone who cannot defraud themselves. Either way
+  // nothing is prefilled: every count is typed from the shelf and the drawer.
+  const blind = canEdit && !countLocked && currentUser?.role !== 'OWNER';
+  const trackedRows = computed.filter((r) => r.tracked);
+  const countComplete = trackedRows.every((r) => r.hasCount) && String(actual).trim() !== '';
+
   // One shape the table + cards render from: live figures for today, or the
   // saved snapshot for a past day (a faithful record for investigation).
   const liveView = {
@@ -1621,6 +1639,10 @@ function ReconcilePanel({ station, currentUser }) {
     debts,
     // Who answered for a shortfall on this day — part of the permanent record.
     shortfall: { amount: shortfallSaved, owedBy: shortfallDebts.map((d) => d.customer_name) },
+    // How many times the count was reopened after the variance was revealed. A
+    // recount is legitimate (miscounts happen), but the owner should see that it
+    // happened rather than only the final, tidy number.
+    recounts,
   };
   const view = !isToday && savedRec ? savedRec.data : liveView;
   const noRecord = !isToday && !savedRec; // a past day with nothing saved
@@ -1778,6 +1800,7 @@ function ReconcilePanel({ station, currentUser }) {
       ...(view.shortfall?.amount
         ? [[`Shortfall owed by ${view.shortfall.owedBy.join(', ')}`, rwf(view.shortfall.amount)]]
         : []),
+      ...((view.recounts ?? 0) > 0 ? [['Recounts after variance shown', String(view.recounts)]] : []),
     ]);
 
     const safe = (s) => String(s).replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '');
@@ -1843,9 +1866,35 @@ function ReconcilePanel({ station, currentUser }) {
             </span>
           )}
           {!isToday && <span className="text-xs font-semibold text-amber-600">Past day — read only</span>}
+          {(view.recounts ?? 0) > 0 && (
+            <span className="text-xs font-semibold text-amber-600" title="The count was reopened after the variance was shown">
+              ↺ Recounted {view.recounts}× after seeing the variance
+            </span>
+          )}
         </div>
         <div className="flex gap-2">
-          {canEdit && (
+          {/* Blind count: submit locks the counts and reveals what they are
+              judged against. Reopening afterwards is allowed — miscounts are
+              real — but it is counted and saved into the record. */}
+          {blind && (
+            <button
+              onClick={() => setCountLocked(true)}
+              disabled={!countComplete}
+              title={countComplete ? undefined : 'Count every item and the drawer first'}
+              className="px-4 py-2 rounded-lg text-sm font-semibold bg-sky-600 text-white active:scale-95 disabled:opacity-50"
+            >
+              ✔ Submit count
+            </button>
+          )}
+          {canEdit && countLocked && currentUser?.role !== 'OWNER' && (
+            <button
+              onClick={() => { setCountLocked(false); setRecounts((n) => n + 1); }}
+              className="px-4 py-2 rounded-lg text-sm font-semibold bg-slate-200 text-slate-700 active:scale-95"
+            >
+              ↺ Recount
+            </button>
+          )}
+          {canEdit && !blind && (
             <button
               onClick={saveReconciliation}
               disabled={saving || unsavedShortfall > 0}
@@ -1880,16 +1929,20 @@ function ReconcilePanel({ station, currentUser }) {
             <tr>
               <th className="px-2 py-2">N°</th>
               <th className="px-2 py-2">IBICURUZWA<div className="font-normal text-slate-400 normal-case">Item</div></th>
-              <th className="px-2 py-2 text-right">STOCK YATANGIRANYE<div className="font-normal text-slate-400 normal-case">Opening</div></th>
-              <th className="px-2 py-2 text-right">IBYINJIYE<div className="font-normal text-slate-400 normal-case">In</div></th>
-              <th className="px-2 py-2 text-right">TOTAL</th>
-              <th className="px-2 py-2 text-right">IBYACURUJWE<div className="font-normal text-slate-400 normal-case">Sold (recorded)</div></th>
+              {/* Opening, In, Total and Sold are hidden while counting: expected
+                  = opening + in − sold, so leaving them on screen would hand the
+                  counter the answer just as surely as prefilling the box. */}
+              {!blind && <th className="px-2 py-2 text-right">STOCK YATANGIRANYE<div className="font-normal text-slate-400 normal-case">Opening</div></th>}
+              {!blind && <th className="px-2 py-2 text-right">IBYINJIYE<div className="font-normal text-slate-400 normal-case">In</div></th>}
+              {!blind && <th className="px-2 py-2 text-right">TOTAL</th>}
+              {!blind && <th className="px-2 py-2 text-right">IBYACURUJWE<div className="font-normal text-slate-400 normal-case">Sold (recorded)</div></th>}
               <th className="px-2 py-2 text-right">STOCK IRAYE<div className="font-normal text-slate-400 normal-case">Counted</div></th>
-              <th className="px-2 py-2 text-right">TEGEREJWE<div className="font-normal text-slate-400 normal-case">Expected</div></th>
+              {!blind && <th className="px-2 py-2 text-right">TEGEREJWE<div className="font-normal text-slate-400 normal-case">Expected</div></th>}
               <th className="px-2 py-2 text-right">IBICIRO<div className="font-normal text-slate-400 normal-case">Price</div></th>
-              <th className="px-2 py-2 text-right">AYACURUJWE<div className="font-normal text-slate-400 normal-case">Revenue</div></th>
-              <th className="px-2 py-2 text-right">ITANDUKANIRO<div className="font-normal text-slate-400 normal-case">Variance (qty)</div></th>
-              <th className="px-2 py-2 text-right">ITANDUKANIRO (RWF)<div className="font-normal text-slate-400 normal-case">at cost</div></th>
+              {/* Revenue = sold × price, so it leaks `sold` too. */}
+              {!blind && <th className="px-2 py-2 text-right">AYACURUJWE<div className="font-normal text-slate-400 normal-case">Revenue</div></th>}
+              {!blind && <th className="px-2 py-2 text-right">ITANDUKANIRO<div className="font-normal text-slate-400 normal-case">Variance (qty)</div></th>}
+              {!blind && <th className="px-2 py-2 text-right">ITANDUKANIRO (RWF)<div className="font-normal text-slate-400 normal-case">at cost</div></th>}
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
@@ -1900,29 +1953,30 @@ function ReconcilePanel({ station, currentUser }) {
                   {r.name}
                   {!r.tracked && <span className="ml-1 text-[10px] font-normal text-slate-400">(not stocked)</span>}
                 </td>
-                <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.opening : '—'}</td>
-                <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.received : '—'}</td>
-                <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.total : '—'}</td>
-                <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{r.sold}</td>
+                {!blind && <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.opening : '—'}</td>}
+                {!blind && <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.received : '—'}</td>}
+                {!blind && <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.total : '—'}</td>}
+                {!blind && <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{r.sold}</td>}
                 <td className="px-2 py-1.5 text-right">
                   {!r.tracked ? (
                     <span className="text-slate-300">—</span>
-                  ) : canEdit ? (
+                  ) : canEdit && !countLocked ? (
                     <input
                       type="number"
                       value={closing[r.id] ?? ''}
                       onChange={(e) => setClosing({ ...closing, [r.id]: e.target.value })}
+                      placeholder="—"
                       className="w-16 px-2 py-1 rounded border border-gray-300 text-right"
                     />
                   ) : (
                     <span className="font-semibold text-slate-700">{r.counted}</span>
                   )}
                 </td>
-                <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.expected : '—'}</td>
+                {!blind && <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.expected : '—'}</td>}
                 <td className="px-2 py-1.5 text-right text-slate-500">{money(r.price)}</td>
-                <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{money(r.revenue)}</td>
-                <td className={`px-2 py-1.5 text-right font-semibold ${r.tracked ? diffColor(r.varianceQty) : 'text-slate-300'}`}>{r.tracked ? signed(r.varianceQty) : '—'}</td>
-                <td className={`px-2 py-1.5 text-right font-semibold ${r.tracked ? diffColor(r.varianceCost) : 'text-slate-300'}`}>{r.tracked ? signed(r.varianceCost) : '—'}</td>
+                {!blind && <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{money(r.revenue)}</td>}
+                {!blind && <td className={`px-2 py-1.5 text-right font-semibold ${r.tracked ? diffColor(r.varianceQty) : 'text-slate-300'}`}>{r.tracked ? signed(r.varianceQty) : '—'}</td>}
+                {!blind && <td className={`px-2 py-1.5 text-right font-semibold ${r.tracked ? diffColor(r.varianceCost) : 'text-slate-300'}`}>{r.tracked ? signed(r.varianceCost) : '—'}</td>}
               </tr>
             ))}
           </tbody>
@@ -1930,16 +1984,16 @@ function ReconcilePanel({ station, currentUser }) {
             <tr className="font-bold">
               <td className="px-2 py-2" />
               <td className="px-2 py-2">IGITERANYO<div className="font-normal text-slate-400 text-[11px] normal-case">Totals</div></td>
+              {!blind && <td className="px-2 py-2" />}
+              {!blind && <td className="px-2 py-2" />}
+              {!blind && <td className="px-2 py-2" />}
+              {!blind && <td className="px-2 py-2 text-right">{view.totals.sold}</td>}
               <td className="px-2 py-2" />
+              {!blind && <td className="px-2 py-2" />}
               <td className="px-2 py-2" />
-              <td className="px-2 py-2" />
-              <td className="px-2 py-2 text-right">{view.totals.sold}</td>
-              <td className="px-2 py-2" />
-              <td className="px-2 py-2" />
-              <td className="px-2 py-2" />
-              <td className="px-2 py-2 text-right">{money(view.totals.revenue)}</td>
-              <td className={`px-2 py-2 text-right ${diffColor(view.totals.varianceQty)}`}>{signed(view.totals.varianceQty)}</td>
-              <td className={`px-2 py-2 text-right ${diffColor(view.totals.varianceCost)}`}>{signed(view.totals.varianceCost)}</td>
+              {!blind && <td className="px-2 py-2 text-right">{money(view.totals.revenue)}</td>}
+              {!blind && <td className={`px-2 py-2 text-right ${diffColor(view.totals.varianceQty)}`}>{signed(view.totals.varianceQty)}</td>}
+              {!blind && <td className={`px-2 py-2 text-right ${diffColor(view.totals.varianceCost)}`}>{signed(view.totals.varianceCost)}</td>}
             </tr>
           </tfoot>
         </table>
@@ -1950,7 +2004,18 @@ function ReconcilePanel({ station, currentUser }) {
       <div className="bg-white rounded-xl shadow-md p-4 w-full lg:max-w-md">
         <p className="font-extrabold text-slate-800 mb-3">VERSEMENT <span className="text-slate-400 font-normal text-sm">— end of day</span></p>
         <div className="space-y-2 text-sm">
+          {/* While counting, the drawer is counted blind for the same reason the
+              shelf is: cash sales sitting above the input would tell the counter
+              what number makes the difference vanish. */}
+          {blind && (
+            <p className="text-slate-500 text-xs bg-slate-50 rounded-lg p-3">
+              Count the money in the drawer and enter it below. The day’s totals appear once you
+              submit the count.
+            </p>
+          )}
           {/* Recorded sales = the money truth (matches the table's AYACURUJWE total). */}
+          {!blind && (
+          <>
           <div className="flex justify-between items-center">
             <span className="text-slate-700 font-semibold">Recorded sales (Ayacurujwe)</span>
             <span className="font-bold text-slate-900">{money(view.sales.total)} RWF</span>
@@ -1989,19 +2054,27 @@ function ReconcilePanel({ station, currentUser }) {
             </span>
             <span className="font-bold text-slate-900">{money(view.expectedTotal ?? view.cashExpected ?? 0)} RWF</span>
           </div>
+          </>
+          )}
           <div className="flex justify-between items-center">
             <span className="text-slate-600">Actual available (Ahari)</span>
-            {canEdit ? numInput(actual, setActual) : <span className="font-semibold text-slate-800">{money(view.cashCounted)} RWF</span>}
+            {canEdit && !countLocked ? (
+              numInput(actual, setActual)
+            ) : (
+              <span className="font-semibold text-slate-800">{money(view.cashCounted)} RWF</span>
+            )}
           </div>
+          {!blind && (
           <div className="flex justify-between items-center">
             <span className="text-slate-600">Difference</span>
             <span className={`font-bold ${view.cashDifference === 0 ? 'text-emerald-600' : 'text-red-600'}`}>
               {view.cashDifference > 0 ? '+' : ''}{money(view.cashDifference)} RWF
             </span>
           </div>
+          )}
           {/* Shortfalls already booked against this day, so re-opening it shows
               the money was accounted for rather than looking unresolved. */}
-          {shortfallDebts.length > 0 && (
+          {!blind && shortfallDebts.length > 0 && (
             <div className="flex justify-between items-center pl-3">
               <span className="text-slate-500">
                 Recorded as debt <span className="text-slate-400 text-xs">({shortfallDebts.map((d) => d.customer_name).join(', ')})</span>
@@ -2012,7 +2085,7 @@ function ReconcilePanel({ station, currentUser }) {
 
           {/* A shortfall must become a debt before the day can be closed —
               otherwise missing money quietly disappears into a saved sheet. */}
-          {canEdit && unsavedShortfall > 0 && (
+          {canEdit && !blind && unsavedShortfall > 0 && (
             <div className="border border-red-200 bg-red-50 rounded-lg p-3 space-y-2">
               <p className="text-red-700 font-semibold text-sm">
                 {money(unsavedShortfall)} RWF is missing — record who owes it before saving.
@@ -2033,10 +2106,12 @@ function ReconcilePanel({ station, currentUser }) {
             </div>
           )}
 
+          {!blind && (
           <div className="flex justify-between items-center border-t border-gray-100 pt-2">
             <span className="text-slate-700 font-semibold">Profit Before Tax</span>
             <span className="font-extrabold text-emerald-600">{money(view.profit)} RWF</span>
           </div>
+          )}
         </div>
       </div>
 
