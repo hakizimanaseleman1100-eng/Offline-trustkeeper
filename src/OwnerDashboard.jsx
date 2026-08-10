@@ -1445,6 +1445,12 @@ function ReconcilePanel({ station, currentUser }) {
   const [oweName, setOweName] = useState(currentUser?.name ?? ''); // who owes the shortfall
   const [debtBusy, setDebtBusy] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
+  // Restocking is entered HERE, in the IBYINJIYE column, for the whole delivery
+  // at once — not product by product in Inventory. A crate arriving is one trip
+  // down the sheet, which is how the barman already thinks about it.
+  const [stockIn, setStockIn] = useState({}); // product_id -> quantity received today (string)
+  const [stockInBusy, setStockInBusy] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0); // re-read after stock is applied
 
   useEffect(() => {
     let cancelled = false;
@@ -1522,6 +1528,10 @@ function ReconcilePanel({ station, currentUser }) {
         .filter((r) => r.tracked || r.sold > 0 || r.revenue > 0);
 
       setRows(list);
+      // The IBYINJIYE boxes start at what is already recorded for the day, so
+      // saving without touching them changes nothing, and correcting a number
+      // later applies only the difference.
+      setStockIn(Object.fromEntries(list.filter((r) => r.tracked).map((r) => [r.id, String(r.received)])));
       const saved = recRes.data;
       // Counted stock: from the saved snapshot if one exists (re-opening a day
       // shows what was recorded), otherwise BLANK. It is never prefilled with
@@ -1556,7 +1566,7 @@ function ReconcilePanel({ station, currentUser }) {
     return () => {
       cancelled = true;
     };
-  }, [station.id, day]);
+  }, [station.id, day, refreshKey]);
 
   const money = (n) => Math.round(n).toLocaleString();
 
@@ -1656,6 +1666,42 @@ function ReconcilePanel({ station, currentUser }) {
     setHistory(data ?? []);
   };
 
+  // What the typed IBYINJIYE boxes would change, as movements. Only the
+  // DIFFERENCE from what is already recorded is applied, so pressing save twice
+  // is harmless and a correction (12 → 8) posts −4 rather than another 8.
+  const stockInMoves = computed
+    .filter((r) => r.tracked)
+    .map((r) => {
+      const entered = Number(stockIn[r.id]);
+      if (!Number.isFinite(entered) || entered < 0) return null;
+      const delta = Math.round(entered - r.received);
+      return delta === 0 ? null : { row: r, delta };
+    })
+    .filter(Boolean);
+
+  const saveStockIn = async () => {
+    if (stockInMoves.length === 0) return;
+    if (!navigator.onLine) {
+      return window.alert('Stock in needs a connection — it changes the shared stock every device reads.');
+    }
+    setStockInBusy(true);
+    // reason 'issue' is what the sheet reads back as IBYINJIYE; a correction
+    // posts a negative 'issue', which nets to the right figure.
+    const { error } = await supabase.rpc('apply_station_stock', {
+      p_moves: stockInMoves.map(({ row, delta }) => ({
+        station_id: station.id,
+        product_id: row.id,
+        business_id: getBusinessId(),
+        delta,
+        reason: 'issue',
+        staff_name: currentUser?.name ?? null,
+      })),
+    });
+    setStockInBusy(false);
+    if (error) return window.alert(`Could not save stock in: ${error.message}`);
+    setRefreshKey((n) => n + 1); // re-read so opening/expected reflect the delivery
+  };
+
   // Book the missing money as a debt (amadeni) against whoever is answerable
   // for it, tagged to this station + business day so re-opening the day knows
   // it has already been recorded. Same table the POS writes credit sales to, so
@@ -1697,6 +1743,9 @@ function ReconcilePanel({ station, currentUser }) {
   // Save the day's reconciliation as a dated snapshot (upsert per station+day),
   // stamped with who submitted it — so the owner can pull it up later.
   const saveReconciliation = async () => {
+    if (stockInMoves.length > 0) {
+      return window.alert('Save the stock in (IBYINJIYE) first — the expected closing depends on it.');
+    }
     if (unsavedShortfall > 0) {
       return window.alert(
         `Record the missing ${money(unsavedShortfall)} RWF as a debt first — a day cannot be closed with money unaccounted for.`
@@ -1873,14 +1922,31 @@ function ReconcilePanel({ station, currentUser }) {
           )}
         </div>
         <div className="flex gap-2">
+          {/* One save for the whole delivery, rather than a trip into Inventory
+              per product. Only appears when a box actually differs. */}
+          {canEdit && stockInMoves.length > 0 && (
+            <button
+              onClick={saveStockIn}
+              disabled={stockInBusy}
+              className="px-4 py-2 rounded-lg text-sm font-semibold bg-sky-600 text-white active:scale-95 disabled:opacity-50"
+            >
+              {stockInBusy ? 'Saving…' : `📥 Save stock in (${stockInMoves.length})`}
+            </button>
+          )}
           {/* Blind count: submit locks the counts and reveals what they are
               judged against. Reopening afterwards is allowed — miscounts are
               real — but it is counted and saved into the record. */}
           {blind && (
             <button
               onClick={() => setCountLocked(true)}
-              disabled={!countComplete}
-              title={countComplete ? undefined : 'Count every item and the drawer first'}
+              disabled={!countComplete || stockInMoves.length > 0}
+              title={
+                stockInMoves.length > 0
+                  ? 'Save the stock in (IBYINJIYE) first — the variance depends on it'
+                  : countComplete
+                    ? undefined
+                    : 'Count every item and the drawer first'
+              }
               className="px-4 py-2 rounded-lg text-sm font-semibold bg-sky-600 text-white active:scale-95 disabled:opacity-50"
             >
               ✔ Submit count
@@ -1897,8 +1963,14 @@ function ReconcilePanel({ station, currentUser }) {
           {canEdit && !blind && (
             <button
               onClick={saveReconciliation}
-              disabled={saving || unsavedShortfall > 0}
-              title={unsavedShortfall > 0 ? `Record the missing ${money(unsavedShortfall)} RWF as a debt first` : undefined}
+              disabled={saving || unsavedShortfall > 0 || stockInMoves.length > 0}
+              title={
+                stockInMoves.length > 0
+                  ? 'Save the stock in (IBYINJIYE) first'
+                  : unsavedShortfall > 0
+                    ? `Record the missing ${money(unsavedShortfall)} RWF as a debt first`
+                    : undefined
+              }
               className="px-4 py-2 rounded-lg text-sm font-semibold bg-emerald-600 text-white active:scale-95 disabled:opacity-50"
             >
               {saving ? 'Saving…' : savedRec ? '✔ Update saved' : '✔ Save reconciliation'}
@@ -1929,11 +2001,13 @@ function ReconcilePanel({ station, currentUser }) {
             <tr>
               <th className="px-2 py-2">N°</th>
               <th className="px-2 py-2">IBICURUZWA<div className="font-normal text-slate-400 normal-case">Item</div></th>
-              {/* Opening, In, Total and Sold are hidden while counting: expected
-                  = opening + in − sold, so leaving them on screen would hand the
-                  counter the answer just as surely as prefilling the box. */}
+              {/* Opening, Total and Sold are hidden while counting: expected =
+                  opening + in − sold, so leaving them on screen would hand the
+                  counter the answer just as surely as prefilling the box.
+                  IBYINJIYE stays: it is the barman's own entry, and knowing what
+                  came in reveals nothing without the other two terms. */}
               {!blind && <th className="px-2 py-2 text-right">STOCK YATANGIRANYE<div className="font-normal text-slate-400 normal-case">Opening</div></th>}
-              {!blind && <th className="px-2 py-2 text-right">IBYINJIYE<div className="font-normal text-slate-400 normal-case">In</div></th>}
+              <th className="px-2 py-2 text-right">IBYINJIYE<div className="font-normal text-slate-400 normal-case">In — type &amp; save</div></th>
               {!blind && <th className="px-2 py-2 text-right">TOTAL</th>}
               {!blind && <th className="px-2 py-2 text-right">IBYACURUJWE<div className="font-normal text-slate-400 normal-case">Sold (recorded)</div></th>}
               <th className="px-2 py-2 text-right">STOCK IRAYE<div className="font-normal text-slate-400 normal-case">Counted</div></th>
@@ -1954,7 +2028,23 @@ function ReconcilePanel({ station, currentUser }) {
                   {!r.tracked && <span className="ml-1 text-[10px] font-normal text-slate-400">(not stocked)</span>}
                 </td>
                 {!blind && <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.opening : '—'}</td>}
-                {!blind && <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.received : '—'}</td>}
+                <td className="px-2 py-1.5 text-right">
+                  {!r.tracked ? (
+                    <span className="text-slate-300">—</span>
+                  ) : canEdit ? (
+                    <input
+                      type="number"
+                      min="0"
+                      value={stockIn[r.id] ?? ''}
+                      onChange={(e) => setStockIn({ ...stockIn, [r.id]: e.target.value })}
+                      className={`w-16 px-2 py-1 rounded border text-right ${
+                        Number(stockIn[r.id]) !== r.received ? 'border-sky-400 bg-sky-50' : 'border-gray-300'
+                      }`}
+                    />
+                  ) : (
+                    <span className="text-slate-500">{r.received}</span>
+                  )}
+                </td>
                 {!blind && <td className="px-2 py-1.5 text-right text-slate-500">{r.tracked ? r.total : '—'}</td>}
                 {!blind && <td className="px-2 py-1.5 text-right font-semibold text-slate-800">{r.sold}</td>}
                 <td className="px-2 py-1.5 text-right">
@@ -1985,7 +2075,7 @@ function ReconcilePanel({ station, currentUser }) {
               <td className="px-2 py-2" />
               <td className="px-2 py-2">IGITERANYO<div className="font-normal text-slate-400 text-[11px] normal-case">Totals</div></td>
               {!blind && <td className="px-2 py-2" />}
-              {!blind && <td className="px-2 py-2" />}
+              <td className="px-2 py-2" />
               {!blind && <td className="px-2 py-2" />}
               {!blind && <td className="px-2 py-2 text-right">{view.totals.sold}</td>}
               <td className="px-2 py-2" />
