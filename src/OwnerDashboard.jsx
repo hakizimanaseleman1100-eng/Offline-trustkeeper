@@ -177,11 +177,14 @@ function InventoryTab({ notify }) {
     loadStock(selectedStation);
   }, [selectedStation]);
 
-  // One place that adjusts a station's stock (and logs the movement).
+  // One place that adjusts a station's stock (and logs the movement). The uid
+  // makes the movement its own receipt: if the response is lost and the owner
+  // taps again, migration 0028 recognises it and leaves the balance alone.
   const applyStock = async (productId, delta, reason) => {
     const { error } = await supabase.rpc('apply_station_stock', {
       p_moves: [
         {
+          uid: crypto.randomUUID(),
           station_id: selectedStation,
           product_id: String(productId),
           business_id: getBusinessId(),
@@ -1310,6 +1313,7 @@ function SalesTab({ notify, currentUser }) {
         if (!r.station_id) return m;
         const k = `${r.station_id}|${r.item_id}`;
         (m[k] ||= {
+          uid: crypto.randomUUID(),
           station_id: r.station_id,
           product_id: String(r.item_id),
           business_id: getBusinessId(),
@@ -1322,7 +1326,9 @@ function SalesTab({ notify, currentUser }) {
     );
     if (moves.length) {
       const { error: stockErr } = await supabase.rpc('apply_station_stock', { p_moves: moves });
-      if (stockErr) console.error('Station stock restore failed:', stockErr.message);
+      // Not silent any more: a refund whose stock never went back is exactly
+      // the kind of drift that turns into phantom shrinkage tomorrow.
+      if (stockErr) notify(`Refund saved, but stock was not restored: ${stockErr.message}`);
     }
     await supabase.from('audit_logs').insert({
       business_id: getBusinessId(),
@@ -1689,6 +1695,7 @@ function ReconcilePanel({ station, currentUser }) {
     // posts a negative 'issue', which nets to the right figure.
     const { error } = await supabase.rpc('apply_station_stock', {
       p_moves: stockInMoves.map(({ row, delta }) => ({
+        uid: crypto.randomUUID(),
         station_id: station.id,
         product_id: row.id,
         business_id: getBusinessId(),

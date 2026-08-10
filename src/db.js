@@ -187,3 +187,25 @@ db.version(12).stores({
   handovers: 'id, tab_uid, created_at',
   received_rounds: 'id, tab_uid, received_at',
 });
+
+/*
+ * version(13): the unified outbox — one queue for every write that must reach
+ * the server, drained in the order it was raised (see outbox.js).
+ *
+ * Before this, each kind of write had its own ad-hoc push and the stock RPC had
+ * none at all: it was fired after the sales push and its failure only reached
+ * console.error, so a sale could upload while its stock decrement was lost —
+ * phantom shrinkage in the next day's count, blamed on whoever held the keys.
+ *
+ * - '++seq' is the primary key ON PURPOSE: an auto-incrementing integer is the
+ *   queue's order. A sale must reach the server before the stock move that
+ *   depends on it, and insertion order is the only honest expression of that.
+ * - `state` is indexed for the drain query and the pending badge; it is a
+ *   string ('pending' | 'dead'), never a boolean (IndexedDB can't index those).
+ * - `next_try_at` lets a failed item back off without blocking the queue scan.
+ * Successful items are deleted — the domain tables are the record, this is
+ * only the intent to send.
+ */
+db.version(13).stores({
+  outbox: '++seq, state, next_try_at, kind',
+});

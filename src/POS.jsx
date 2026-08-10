@@ -6,6 +6,7 @@ import { getBusinessId } from './session';
 import { can } from './permissions';
 import { getDeviceId, nextReceiptNo } from './receipts';
 import { buildRoundPayload, encodeHandover, decodeHandover, applyHandover } from './handover';
+import { enqueue, drain, pendingCount, deadCount, startOutbox, saleRowForServer } from './outbox';
 import QrScanner from './QrScanner';
 import RoundQr from './RoundQr';
 import WaiterSettlement from './WaiterSettlement';
@@ -90,21 +91,12 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
     {}
   );
 
-  // Lets staff see at a glance whether a sync is actually needed, instead of
-  // tapping "Sync to Cloud" speculatively.
-  const unsyncedCount = useLiveQuery(
-    async () => {
-      const paidTabIds = new Set(
-        (await db.active_tabs.where('status').equals('paid').toArray()).map((tab) => tab.id)
-      );
-      const unsynced = (await db.sales.where('synced_status').equals(0).toArray()).filter((sale) =>
-        paidTabIds.has(sale.tab_id)
-      );
-      return unsynced.length;
-    },
-    [],
-    0
-  );
+  // What the status dot counts: everything still waiting to reach the server,
+  // of every kind — a stock move that hasn't landed is as unsent as a sale.
+  const unsyncedCount = useLiveQuery(() => pendingCount(), [], 0);
+  // Items the queue has set aside because retrying cannot fix them. Rare, and
+  // deliberately visible: silence here is what caused the stock drift.
+  const stuckCount = useLiveQuery(() => deadCount(), [], 0);
 
   const activeTab = useLiveQuery(
     () => (activeTabId ? db.active_tabs.get(activeTabId) : null),
@@ -658,7 +650,7 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
       // On credit: record a debt for the (net) total, stamped with the waiter in
       // charge and the station. It syncs like a sale; recoveries happen later.
       if (paymentMethod === 'debt') {
-        await db.debts.add({
+        const debtRow = {
           id: crypto.randomUUID?.() ?? `debt-${Date.now()}`,
           customer_id: activeTab?.customer_id ?? null,
           customer_name: (debtName || activeTab?.customer_username || activeTab?.name || 'Customer').trim(),
@@ -671,25 +663,52 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
           note: debtNote.trim() || null,
           status: 'open',
           created_at: Date.now(),
-          synced_status: 0,
+        };
+        await db.debts.add({ ...debtRow, synced_status: 0 });
+        await enqueue('debt', {
+          localId: debtRow.id,
+          row: { ...debtRow, business_id: getBusinessId(), created_at: new Date(debtRow.created_at).toISOString() },
         });
       }
 
+      // The sale itself, queued as ONE item so a checkout arrives whole. The
+      // rows are frozen here rather than re-read at send time: the tab is
+      // closed, the figures are final, and the queue should not depend on
+      // local state that a later edit could change under it.
+      const soldLines = await db.sales.where('tab_id').equals(activeTabId).toArray();
+      await enqueue('sale', {
+        localIds: soldLines.map((s) => s.id),
+        rows: soldLines.map(saleRowForServer),
+      });
+
       // Decrement THIS station's local stock right away so the waiter sees the
-      // new count immediately. The authoritative server decrement happens at
-      // sync; the next stations down-sync reconciles the two. Only lines
-      // tracked at this station (a station_stock row exists) are touched.
+      // new count immediately, and queue the authoritative server decrement
+      // BEHIND the sale — the queue's order is what guarantees the sale lands
+      // first. Each move carries a uid so a retry cannot decrement twice
+      // (migration 0028). Only lines tracked at this station are touched.
       if (stationId) {
         const soldByItem = new Map();
         for (const row of cartItems) {
           soldByItem.set(String(row.item_id), (soldByItem.get(String(row.item_id)) ?? 0) + (row.quantity ?? 1));
         }
+        const moves = [];
         await Promise.all(
           [...soldByItem.entries()].map(async ([pid, qty]) => {
             const row = await db.station_stock.get([stationId, pid]);
-            if (row) await db.station_stock.update([stationId, pid], { quantity: row.quantity - qty });
+            if (!row) return; // not stocked here — nothing to decrement
+            await db.station_stock.update([stationId, pid], { quantity: row.quantity - qty });
+            moves.push({
+              uid: crypto.randomUUID(),
+              station_id: stationId,
+              product_id: pid,
+              business_id: getBusinessId(),
+              delta: -qty,
+              reason: 'sale',
+              staff_name: currentUser?.name ?? null,
+            });
           })
         );
+        if (moves.length) await enqueue('stock_move', { moves });
       }
 
       setDebtPrompt(false);
@@ -697,9 +716,8 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
       setDebtNote('');
       showToast(`${activeTab?.name ?? 'Tab'} ${paymentMethod === 'debt' ? 'on credit' : 'closed'} — ${receipt_no}`);
       closeTabView();
-      // Push the just-closed sale straight away if we're online; harmless if
-      // offline (it stays queued for the next sync).
-      syncDataRef.current?.({ silent: true });
+      // enqueue() already kicked the drain if there's network. Nothing here
+      // waits on it — the sale is committed locally and the tab is closed.
     } catch (err) {
       console.error('Failed to close tab:', err);
       showToast('Error: could not close tab');
@@ -758,164 +776,39 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
       if (!silent) showToast('Offline — will sync when connected');
       return;
     }
-    // A waiter's phone never uploads sales: the same round exists on the
-    // barman's device, and two devices pushing the same beer would double the
-    // venue's revenue. His tabs are handed over, never paid, so this is belt
-    // and braces on top of the 'paid' filter below.
-    if (handoverMode) {
-      if (!silent) showToast('Orders are recorded by the barman');
-      return;
-    }
+    // Nothing is assembled here any more: every write was queued at the moment
+    // it happened, in order, and the outbox owns delivery and retry. This is
+    // just the manual nudge behind the status dot (engineering rule 7).
+    //
+    // A waiter's phone has no sales to send — it never reaches checkout — but it
+    // may hold audit logs, so it drains like everything else.
     setSyncing(true);
     try {
-      const paidTabIds = new Set(
-        (await db.active_tabs.where('status').equals('paid').toArray()).map((tab) => tab.id)
-      );
-      const unsynced = (await db.sales.where('synced_status').equals(0).toArray()).filter((sale) =>
-        paidTabIds.has(sale.tab_id)
-      );
-      const unsyncedDebts = await db.debts.where('synced_status').equals(0).toArray();
-
-      if (unsynced.length === 0 && unsyncedDebts.length === 0) {
-        if (!silent) showToast('Sync Complete: 0 records uploaded');
-        return;
-      }
-
-      if (unsynced.length) {
-      const { error } = await supabase.from('hospitality_sales').upsert(
-        unsynced.map((sale) => ({
-          uid: sale.uid ?? null,
-          business_id: getBusinessId(),
-          item_id: sale.item_id,
-          quantity: sale.quantity ?? 1,
-          total_price: sale.total_price,
-          payment_method: sale.payment_method,
-          cost_price: sale.cost_price,
-          tax_label: sale.tax_label,
-          tax_rate: sale.tax_rate,
-          customer_tin: sale.customer_tin ?? null,
-          customer_phone: sale.customer_phone ?? null,
-          staff_id: sale.staff_id ?? null,
-          staff_name: sale.staff_name ?? null,
-          receipt_no: sale.receipt_no ?? null,
-          device_id: sale.device_id ?? null,
-          momo_ref: sale.momo_ref ?? null,
-          discount_amount: sale.discount_amount ?? 0,
-          guest_count: sale.guest_count ?? null,
-          check_in_date: sale.check_in_date ?? null,
-          check_out_date: sale.check_out_date ?? null,
-          station_id: sale.station_id ?? null,
-          station_name: sale.station_name ?? null,
-          customer_id: sale.customer_id ?? null,
-          customer_username: sale.customer_username ?? null,
-          timestamp: new Date(sale.timestamp).toISOString(),
-        })),
-        { onConflict: 'uid', ignoreDuplicates: true }
-      );
-      if (error) throw error;
-
-      await db.sales.bulkUpdate(
-        unsynced.map((sale) => ({ key: sale.id, changes: { synced_status: 1 } }))
-      );
-
-      // Authoritative per-station stock decrement for the sales just uploaded.
-      // One atomic RPC call carrying { station_id, product_id, delta:-qty }.
-      // Only lines tracked at their station (a station_stock row exists) are
-      // sent, so untracked items/rooms don't create spurious negative rows.
-      const moves = [];
-      const byStationItem = {};
-      for (const sale of unsynced) {
-        if (!sale.station_id) continue;
-        const k = `${sale.station_id}|${sale.item_id}`;
-        if (!byStationItem[k]) {
-          byStationItem[k] = { station_id: sale.station_id, product_id: String(sale.item_id), qty: 0 };
-        }
-        byStationItem[k].qty += sale.quantity ?? 1;
-      }
-      for (const v of Object.values(byStationItem)) {
-        const tracked = await db.station_stock.get([v.station_id, v.product_id]);
-        if (!tracked) continue;
-        moves.push({
-          station_id: v.station_id,
-          product_id: v.product_id,
-          business_id: getBusinessId(),
-          delta: -v.qty,
-          reason: 'sale',
-          staff_name: currentUser?.name ?? null,
-        });
-      }
-      if (moves.length) {
-        const { error: stockErr } = await supabase.rpc('apply_station_stock', { p_moves: moves });
-        if (stockErr) console.error('Station stock update failed:', stockErr.message);
-      }
-      } // end if (unsynced.length)
-
-      // Push debts created on this device (upsert by id so a retry is idempotent).
-      if (unsyncedDebts.length) {
-        const { error: debtErr } = await supabase.from('debts').upsert(
-          unsyncedDebts.map((d) => ({
-            id: d.id,
-            business_id: getBusinessId(),
-            customer_id: d.customer_id ?? null,
-            customer_name: d.customer_name,
-            amount: d.amount,
-            staff_id: d.staff_id ?? null,
-            staff_name: d.staff_name ?? null,
-            station_id: d.station_id ?? null,
-            station_name: d.station_name ?? null,
-            receipt_no: d.receipt_no ?? null,
-            note: d.note ?? null,
-            status: d.status ?? 'open',
-            created_at: new Date(d.created_at).toISOString(),
-          })),
-          { onConflict: 'id', ignoreDuplicates: true }
-        );
-        if (debtErr) throw debtErr;
-        await db.debts.bulkUpdate(unsyncedDebts.map((d) => ({ key: d.id, changes: { synced_status: 1 } })));
-      }
-
-      const unsyncedLogs = await db.audit_logs.where('synced_status').equals(0).toArray();
-      if (unsyncedLogs.length > 0) {
-        const { error: auditError } = await supabase.from('audit_logs').insert(
-          unsyncedLogs.map((log) => ({
-            business_id: getBusinessId(),
-            action_type: log.action_type,
-            details: log.details,
-            staff_id: log.staff_id ?? null,
-            staff_name: log.staff_name ?? null,
-            timestamp: new Date(log.timestamp).toISOString(),
-          }))
-        );
-        if (auditError) throw auditError;
-
-        await db.audit_logs.bulkUpdate(
-          unsyncedLogs.map((log) => ({ key: log.id, changes: { synced_status: 1 } }))
-        );
-      }
-
+      const { sent, failed } = await drain();
       await db.meta.put({ key: 'last_sync_at', value: Date.now() });
       setLastSyncAt(Date.now());
-      showToast(`Sync Complete: ${unsynced.length + unsyncedDebts.length} records uploaded`);
+      if (!silent) {
+        showToast(
+          failed > 0
+            ? 'Some records are still waiting — will keep retrying'
+            : `Saved: ${sent} record${sent === 1 ? '' : 's'} uploaded`
+        );
+      }
     } catch (err) {
-      console.error('Sync failed:', err.message, err.details, err.hint, err.code);
+      console.error('Drain failed:', err);
       if (!silent) showToast('Sync failed — will retry later');
     } finally {
       setSyncing(false);
     }
   };
 
-  // Keep a ref to the latest syncData so the mount-only effect below always
-  // calls the current closure without re-subscribing every render.
-  const syncDataRef = useRef(syncData);
-  syncDataRef.current = syncData;
-
   useEffect(() => {
     db.meta.get('last_sync_at').then((row) => row?.value && setLastSyncAt(row.value));
     db.meta.get('session_station').then((row) => row?.value && setSessionStation(row.value));
-    const autoSync = () => syncDataRef.current({ silent: true });
-    window.addEventListener('online', autoSync);
-    if (navigator.onLine) autoSync(); // opportunistic catch-up on open
-    return () => window.removeEventListener('online', autoSync);
+    // The queue owns reconnection, retry and the periodic nudge now, so the POS
+    // no longer wires its own 'online' listener. Idempotent — calling it on
+    // every mount is fine.
+    startOutbox();
   }, []);
 
   const pickStation = async (id) => {
@@ -1288,10 +1181,20 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
         <div className="bg-slate-800 text-slate-300 text-[11px] lg:text-xs px-3 sm:px-6 lg:px-10 py-1 flex justify-between items-center gap-3">
           <span className={unsyncedCount > 0 ? 'text-amber-300 font-semibold' : ''}>
             {unsyncedCount > 0
-              ? `${unsyncedCount} sale${unsyncedCount > 1 ? 's' : ''} pending upload`
-              : 'All sales uploaded'}
+              ? `${unsyncedCount} record${unsyncedCount > 1 ? 's' : ''} pending upload`
+              : 'All records uploaded'}
           </span>
           {lastSyncAt && <span>Last synced {relativeTime(lastSyncAt)}</span>}
+        </div>
+      )}
+
+      {/* Set-aside items. The whole point of the queue is that a failure is
+          never silent — this is the line that would have caught the stock
+          drift, so it says what it is and who to tell. */}
+      {stuckCount > 0 && (
+        <div className="bg-red-600 text-white text-[11px] lg:text-xs px-3 sm:px-6 lg:px-10 py-1.5 font-semibold">
+          {stuckCount} record{stuckCount > 1 ? 's' : ''} could not be saved to the cloud. Selling is
+          unaffected — tell the owner.
         </div>
       )}
 
