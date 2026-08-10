@@ -8,6 +8,7 @@ import { getDeviceId, nextReceiptNo } from './receipts';
 import { buildRoundPayload, encodeHandover, decodeHandover, applyHandover } from './handover';
 import QrScanner from './QrScanner';
 import RoundQr from './RoundQr';
+import WaiterSettlement from './WaiterSettlement';
 
 // "5m ago" style label for the last successful sync.
 function relativeTime(ms) {
@@ -63,6 +64,7 @@ function POS({ currentUser, onLogout }) {
   const handoverMode = currentUser?.role === 'WAITER';
   const [roundQr, setRoundQr] = useState(null); // the round being shown at the counter
   const [scanning, setScanning] = useState(false); // barman's camera open
+  const [showWaiters, setShowWaiters] = useState(false); // per-waiter settlement
 
   const showToast = (message, duration = 2500) => {
     setToast(message);
@@ -1336,12 +1338,20 @@ function POS({ currentUser, onLogout }) {
               {/* The counter's half of the handover. Not shown on a waiter's
                   phone — he shows codes, he doesn't receive them. */}
               {!handoverMode && (
-                <button
-                  onClick={() => setScanning(true)}
-                  className="h-16 lg:h-20 rounded-2xl text-base lg:text-xl font-bold bg-sky-600 text-white shadow-md transition active:scale-95"
-                >
-                  📷 Scan waiter round
-                </button>
+                <>
+                  <button
+                    onClick={() => setScanning(true)}
+                    className="h-16 lg:h-20 rounded-2xl text-base lg:text-xl font-bold bg-sky-600 text-white shadow-md transition active:scale-95"
+                  >
+                    📷 Scan waiter round
+                  </button>
+                  <button
+                    onClick={() => setShowWaiters(true)}
+                    className="h-14 lg:h-16 rounded-2xl text-sm lg:text-lg font-bold bg-white text-slate-700 shadow-md transition active:scale-95"
+                  >
+                    👤 Waiters — who owes me
+                  </button>
+                </>
               )}
             </div>
           </div>
@@ -1724,6 +1734,12 @@ function POS({ currentUser, onLogout }) {
           onClose={() => setScanning(false)}
           title="Scan the waiter’s round"
           hint="One code per round — the waiter shows a new one each time."
+        />
+      )}
+      {showWaiters && (
+        <WaiterSettlement
+          onClose={() => setShowWaiters(false)}
+          onOpenTab={(tabId) => { setShowWaiters(false); openTabWithBill(tabId); }}
         />
       )}
 
