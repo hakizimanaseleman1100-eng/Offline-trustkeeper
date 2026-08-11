@@ -109,10 +109,19 @@ const handlers = {
     if (localId) await db.debts.update(localId, { synced_status: 1 });
   },
 
-  async debt_payment({ row }) {
+  async debt_payment({ row, localId }) {
     // The client supplies `id`, so a retry collides with itself rather than
     // recording the customer's money twice.
     const { error } = await supabase.from('debt_payments').upsert(row, { onConflict: 'id', ignoreDuplicates: true });
+    if (error) throw error;
+    if (localId) await db.debt_payments.update(localId, { synced_status: 1 });
+  },
+
+  // Flipping a fully-paid debt to 'settled'. Naturally idempotent — setting the
+  // same status twice is the same as once — and queued BEHIND its payment, so
+  // it can never mark a debt settled before the money that settled it arrives.
+  async debt_settle({ id }) {
+    const { error } = await supabase.from('debts').update({ status: 'settled' }).eq('id', id);
     if (error) throw error;
   },
 

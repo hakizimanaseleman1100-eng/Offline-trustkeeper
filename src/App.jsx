@@ -90,6 +90,55 @@ async function syncStations() {
   }
 }
 
+// Mirrors the venue's debts and their recoveries so the counter can take a
+// repayment with no network. The customer who owes is rarely standing in front
+// of the same phone that recorded the debt, so this is the whole venue's
+// ledger, not just this device's.
+//
+// Rows still waiting in the outbox are preserved across the refresh: the server
+// has not seen them yet, so a wholesale replace would erase money that was
+// genuinely taken.
+async function syncDebts() {
+  try {
+    const bid = getBusinessId();
+    const [debtsRes, paysRes] = await Promise.all([
+      supabase.from('debts').select('*').eq('business_id', bid).neq('status', 'void'),
+      supabase.from('debt_payments').select('*').eq('business_id', bid),
+    ]);
+    if (debtsRes.error) throw debtsRes.error;
+    if (paysRes.error) throw paysRes.error;
+
+    const pendingDebts = await db.debts.where('synced_status').equals(0).toArray();
+    const pendingPays = await db.debt_payments.where('synced_status').equals(0).toArray();
+
+    // created_at is normalised to milliseconds: the POS writes Date.now() and
+    // the server returns ISO, and one table cannot hold both and still sort.
+    await db.debts.clear();
+    await db.debts.bulkPut([
+      ...(debtsRes.data ?? []).map((d) => ({
+        ...d,
+        created_at: new Date(d.created_at).getTime(),
+        synced_status: 1,
+      })),
+      ...pendingDebts,
+    ]);
+
+    await db.debt_payments.clear();
+    await db.debt_payments.bulkPut([
+      ...(paysRes.data ?? []).map((p) => ({
+        ...p,
+        created_at: new Date(p.created_at).getTime(),
+        synced_status: 1,
+      })),
+      ...pendingPays,
+    ]);
+  } catch (err) {
+    // Offline: keep whatever is local. The counter can still take a repayment
+    // against the debts it already knows about.
+    console.error('Debts down-sync skipped:', err.message);
+  }
+}
+
 // Mirrors the venue's Settings (name, address, TIN, MoMo pay number, receipt
 // footer, loyalty rule) into local meta so the POS can print a complete receipt
 // offline. Business-scoped; runs before login. Left untouched when offline.
@@ -124,6 +173,7 @@ function App() {
       await syncInventory();
       await syncStations();
       await syncBusiness();
+      await syncDebts();
     }
     setHasOwner(await syncStaff());
     setReady(true);

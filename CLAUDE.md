@@ -94,8 +94,36 @@ DONE:
   constraint, idempotent do$$ version) pushed; constraint already applied
   manually to the live database via SQL editor.
 - Sync button demoted to status dot.
+- Unified outbox (src/outbox.js): one ordered, retrying queue for sales, debts,
+  debt_payments, debt_settle, stock moves, audit logs, expenses. '++seq' IS the
+  order. Retryable failure stops the drain (order preserved); permanent failure
+  (bad payload / RLS / schema) is set aside as 'dead' and shown as a red strip
+  in the POS. Migration 0028 makes apply_station_stock retry-safe via a per-move
+  uid (the movement row is the receipt) + uid on audit_logs/expenses.
+- Reconcile: Expected Total = cash + MoMo + amadeni recovered − expenses (credit
+  sales excluded — no money arrived today). A shortfall MUST be booked as a debt
+  before the day can be saved (migration 0027: debts.source/business_day).
+  Counts are blind for non-owners: nothing prefilled, expected/variance hidden
+  until "Submit count", recounts recorded in the snapshot. Restocking is entered
+  in the IBYINJIYE column (deltas only) instead of per-product in Inventory.
+- Floor workflow (the real one): waiter takes the order at the table on his own
+  phone → shows a per-ROUND QR at the counter → barman scans, issues the stock,
+  and confirms the payment (he is accountable for stock and money). Two offline
+  phones cannot reach each other through Supabase and a PWA has no LAN/BT
+  channel, so QR is the handover. src/handover.js + QrScanner + RoundQr;
+  received_rounds is the idempotency ledger (a second scan is a no-op). The
+  waiter's phone never pushes sales — one writer of money per venue.
+- STOREMAN/barman lands on the POS (landingFor), not the dashboard; both
+  surfaces switch via buttons. WaiterSettlement = "who is still holding my
+  money". DebtRecovery = take an amadeni repayment at the counter, offline
+  (debts + debt_payments are down-synced into Dexie for the whole venue).
 
 VERIFY (may still be pending):
+- Migration 0028 applied before the outbox client deploys (0026/0027 are live).
+- QR handover on real hardware: BarcodeDetector needs Chrome on Android + HTTPS.
+  Never yet run on a physical phone.
+- Outbox torture test: sell offline → reconnect → kill network mid-drain →
+  reconnect. Expect exactly one sales row AND one stock decrement per sale.
 - Sync dot goes green; queued sales in hospitality_sales with uid filled;
   repeated sync taps do not increase row count.
 - Vercel Deployment Protection disabled (preview URLs were behind Vercel SSO,
@@ -109,9 +137,10 @@ VERIFY (may still be pending):
 
 1. DONE (see Current state). Follow-up when convenient: cut the owner-side
    portal/coupon/loyalty remnants listed above + drop `qrcode`.
-2. Unified outbox module: one shared sync engine (ordering + retry) used by
-   sales, debts, debt_payments, stock moves, audit logs. Stock RPC failures
-   currently only console.error after sales push — must retry in order.
+2. DONE (see Current state). Debt recovery at the POS is done too — the
+   remaining offline gaps are EXPENSE capture at the POS and a reconciliation
+   that survives a dead network (the close is still online-only, and the pilot
+   metric is closed-day rate at the hour connectivity is worst).
 3. Two-sided amadeni (THE demo feature): add customer_phone to debts
    (+ migration), SMS on debt creation and on every recovery via Africa's
    Talking or MTN SMS API, queued offline through the outbox. Kinyarwanda

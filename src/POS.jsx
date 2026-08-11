@@ -10,6 +10,7 @@ import { enqueue, drain, pendingCount, deadCount, startOutbox, saleRowForServer 
 import QrScanner from './QrScanner';
 import RoundQr from './RoundQr';
 import WaiterSettlement from './WaiterSettlement';
+import DebtRecovery from './DebtRecovery';
 
 // "5m ago" style label for the last successful sync.
 function relativeTime(ms) {
@@ -66,6 +67,7 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
   const [roundQr, setRoundQr] = useState(null); // the round being shown at the counter
   const [scanning, setScanning] = useState(false); // barman's camera open
   const [showWaiters, setShowWaiters] = useState(false); // per-waiter settlement
+  const [showDebts, setShowDebts] = useState(false); // amadeni recovery at the counter
 
   const showToast = (message, duration = 2500) => {
     setToast(message);
@@ -1267,6 +1269,15 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
                   >
                     👤 Waiters — who owes me
                   </button>
+                  {/* Recovery belongs where the money changes hands: a customer
+                      paying off their amadeni does it at the counter, usually
+                      with no network. */}
+                  <button
+                    onClick={() => setShowDebts(true)}
+                    className="h-14 lg:h-16 rounded-2xl text-sm lg:text-lg font-bold bg-white text-slate-700 shadow-md transition active:scale-95"
+                  >
+                    🧾 Amadeni — take a payment
+                  </button>
                 </>
               )}
             </div>
@@ -1656,6 +1667,13 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
         <WaiterSettlement
           onClose={() => setShowWaiters(false)}
           onOpenTab={(tabId) => { setShowWaiters(false); openTabWithBill(tabId); }}
+        />
+      )}
+      {showDebts && (
+        <DebtRecovery
+          currentUser={currentUser}
+          onClose={() => setShowDebts(false)}
+          onRecorded={(message) => showToast(message, 3500)}
         />
       )}
 

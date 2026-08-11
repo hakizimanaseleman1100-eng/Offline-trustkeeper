@@ -209,3 +209,22 @@ db.version(12).stores({
 db.version(13).stores({
   outbox: '++seq, state, next_try_at, kind',
 });
+
+/*
+ * version(14): debt recovery at the counter, offline.
+ *
+ * A customer walks in at 9pm to pay off part of their amadeni. That is the
+ * moment the debt ledger earns its keep, and until now it could only be
+ * recorded from the owner's dashboard, online — so in practice it went on paper
+ * and sometimes never made it back into the system.
+ *
+ * - debt_payments mirrors the server table. Primary key is a client-generated
+ *   uuid so the row keeps one identity from the counter to the cloud, and
+ *   synced_status is the usual 0/1 number.
+ * - debts is no longer only what THIS device created: the whole venue's open
+ *   debts are down-synced into it, because the customer who owes is rarely
+ *   standing in front of the phone that recorded the debt.
+ */
+db.version(14).stores({
+  debt_payments: 'id, debt_id, synced_status, created_at',
+});
