@@ -139,6 +139,76 @@ async function syncDebts() {
   }
 }
 
+// Mirrors what the reconcile screen needs to close a day with no network:
+// today's stock movements, today's expenses, and any sheet already saved for
+// today. Deliberately bounded to a two-day window — this exists to close
+// TONIGHT, not to keep a second copy of the venue's history on a cheap phone.
+async function syncReconcileInputs() {
+  try {
+    const bid = getBusinessId();
+    const since = new Date();
+    since.setHours(0, 0, 0, 0);
+    since.setDate(since.getDate() - 1);
+    const sinceIso = since.toISOString();
+    const today = new Date().toISOString().slice(0, 10);
+
+    const [movesRes, expRes, recRes] = await Promise.all([
+      supabase.from('stock_movements').select('*').eq('business_id', bid).gte('created_at', sinceIso),
+      supabase.from('expenses').select('*').eq('business_id', bid).gte('created_at', sinceIso),
+      supabase.from('reconciliations').select('*').eq('business_id', bid).gte('business_day', today),
+    ]);
+    if (movesRes.error) throw movesRes.error;
+    if (expRes.error) throw expRes.error;
+
+    // Rows with no uid predate the client keys (migration 0028) — they can't be
+    // reconciled against a local copy, so key them by their server id instead.
+    const pendingMoves = await db.stock_moves.where('synced_status').equals(0).toArray();
+    await db.stock_moves.clear();
+    await db.stock_moves.bulkPut([
+      ...(movesRes.data ?? []).map((m) => ({
+        uid: m.uid ?? m.id,
+        station_id: m.station_id,
+        product_id: String(m.product_id),
+        delta: Number(m.delta),
+        reason: m.reason,
+        staff_name: m.staff_name ?? null,
+        created_at: new Date(m.created_at).getTime(),
+        synced_status: 1,
+      })),
+      ...pendingMoves,
+    ]);
+
+    const pendingExpenses = await db.expenses.where('synced_status').equals(0).toArray();
+    await db.expenses.clear();
+    await db.expenses.bulkPut([
+      ...(expRes.data ?? []).map((e) => ({
+        uid: e.uid ?? e.id,
+        amount: Number(e.amount ?? 0),
+        category: e.category ?? null,
+        note: e.description ?? null, // the server column is `description`
+        created_at: new Date(e.created_at).getTime(),
+        synced_status: 1,
+      })),
+      ...pendingExpenses,
+    ]);
+
+    // Saved sheets are only replaced when the server actually has one, so a
+    // sheet saved offline and still queued is never wiped by a refresh.
+    for (const r of recRes.data ?? []) {
+      await db.reconciliations.put({
+        station_id: r.station_id,
+        business_day: r.business_day,
+        submitted_by: r.submitted_by,
+        submitted_at: r.submitted_at,
+        data: r.data,
+        synced_status: 1,
+      });
+    }
+  } catch (err) {
+    console.error('Reconcile inputs down-sync skipped:', err.message);
+  }
+}
+
 // Mirrors the venue's Settings (name, address, TIN, MoMo pay number, receipt
 // footer, loyalty rule) into local meta so the POS can print a complete receipt
 // offline. Business-scoped; runs before login. Left untouched when offline.
@@ -174,6 +244,7 @@ function App() {
       await syncStations();
       await syncBusiness();
       await syncDebts();
+      await syncReconcileInputs();
     }
     setHasOwner(await syncStaff());
     setReady(true);

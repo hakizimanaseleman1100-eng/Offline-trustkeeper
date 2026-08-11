@@ -228,3 +228,27 @@ db.version(13).stores({
 db.version(14).stores({
   debt_payments: 'id, debt_id, synced_status, created_at',
 });
+
+/*
+ * version(15): closing the day with no network.
+ *
+ * The reconcile screen read six tables straight from Supabase, so the close —
+ * the one workflow the pilot metric measures (closed-day rate) — was the only
+ * thing in the app that required connectivity, at the hour of night when a
+ * Rwandan venue is least likely to have any.
+ *
+ * These are the mirrors it falls back to:
+ * - stock_moves: today's movements, both down-synced and this device's own
+ *   (appended as they happen). Keyed by the same uid the outbox sends, so a
+ *   local row and its server copy converge instead of doubling.
+ * - expenses: money paid out of the drawer. Without it the cash-up is wrong,
+ *   and a missing expense now becomes somebody's debt.
+ * - reconciliations: the saved sheet, so re-opening the day offline shows what
+ *   was recorded rather than an empty form. Keyed [station_id+business_day],
+ *   the same pair the server upserts on.
+ */
+db.version(15).stores({
+  stock_moves: 'uid, station_id, created_at, synced_status',
+  expenses: 'uid, created_at, synced_status',
+  reconciliations: '[station_id+business_day], business_day, synced_status',
+});

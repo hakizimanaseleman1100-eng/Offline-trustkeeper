@@ -138,9 +138,21 @@ const handlers = {
     if (error) throw error;
   },
 
-  async expense({ row }) {
+  async expense({ row, localId }) {
     const { error } = await supabase.from('expenses').upsert(row, { onConflict: 'uid', ignoreDuplicates: true });
     if (error) throw error;
+    if (localId) await db.expenses.update(localId, { synced_status: 1 });
+  },
+
+  // The day's closing sheet. Upserted on the same (business, station, day) the
+  // table is keyed by, so re-saving a day the venue re-opened replaces it
+  // rather than growing a second record of the same night.
+  async reconciliation({ row, localKey }) {
+    const { error } = await supabase
+      .from('reconciliations')
+      .upsert(row, { onConflict: 'business_id,station_id,business_day' });
+    if (error) throw error;
+    if (localKey) await db.reconciliations.update(localKey, { synced_status: 1 });
   },
 };
 

@@ -4,6 +4,8 @@ import { db } from './db';
 import { supabase } from './supabaseClient';
 import { getBusinessId } from './session';
 import { hashPin, pinProblem } from './auth';
+import { enqueue } from './outbox';
+import { loadLocalDay, recordLocalMoves } from './reconcileLocal';
 import { allowedTabs, canOpenTab, roleLabel, ROLES } from './permissions';
 
 const STAFF_ROLES = ROLES; // assignable roles for the Team tab
@@ -761,16 +763,30 @@ function ExpensesTab({ notify }) {
 
   const handleAddExpense = async (e) => {
     e.preventDefault();
-    const { error } = await supabase.from('expenses').insert({
+    // Local first + queued. Ice, a moto, a crate bought mid-shift — these are
+    // paid out of the drawer while the network is whatever it is, and an
+    // expense that never gets recorded turns into somebody's cash shortfall.
+    const row = {
+      uid: crypto.randomUUID(),
       business_id: getBusinessId(),
       amount: Number(amount),
       category: expenseCategory,
       description,
       supplier_tin: advancedOpen ? supplierTin || null : null,
       ebm_receipt_ref: advancedOpen ? ebmReceiptRef || null : null,
-    });
-    if (error) {
-      notify(`Failed to log expense: ${error.message}`);
+    };
+    try {
+      await db.expenses.add({
+        uid: row.uid,
+        amount: row.amount,
+        category: row.category,
+        note: row.description,
+        created_at: Date.now(),
+        synced_status: 0,
+      });
+      await enqueue('expense', { localId: row.uid, row });
+    } catch (err) {
+      notify(`Failed to log expense: ${err.message}`);
       return;
     }
     setAmount('');
@@ -1457,11 +1473,46 @@ function ReconcilePanel({ station, currentUser }) {
   const [stockIn, setStockIn] = useState({}); // product_id -> quantity received today (string)
   const [stockInBusy, setStockInBusy] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0); // re-read after stock is applied
+  const [offline, setOffline] = useState(false); // sheet built from local mirrors
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       setLoading(true);
+
+      // No network: close the day from this device's mirrors instead of
+      // refusing to close it at all. The close is what the pilot metric counts,
+      // and it happens at the hour connectivity is worst.
+      if (!navigator.onLine) {
+        const local = await loadLocalDay(station.id, day);
+        if (cancelled) return;
+        setOffline(true);
+        setRows(local.rows);
+        setStockIn(Object.fromEntries(local.rows.filter((r) => r.tracked).map((r) => [r.id, String(r.received)])));
+        setSalesTotal(local.salesTotal);
+        setCashCollected(local.cash);
+        setMomoCollected(local.momo);
+        setCreditCollected(local.credit);
+        setExpensesTotal(local.expenses);
+        const { shortfallDebts: localShortfalls, ...localTotals } = local.debts;
+        setDebts(localTotals);
+        setShortfallDebts(localShortfalls);
+        if (localShortfalls[0]?.customer_name) setOweName(localShortfalls[0].customer_name);
+        setSavedRec(local.saved ?? null);
+        setHistory([]); // history lives on the server; not worth mirroring to close tonight
+        setClosing(
+          local.saved?.data?.lines
+            ? Object.fromEntries(local.saved.data.lines.filter((l) => l.tracked).map((l) => [l.id, String(l.counted)]))
+            : {}
+        );
+        setCountLocked(Boolean(local.saved));
+        setRecounts(local.saved?.data?.recounts ?? 0);
+        setActual(local.saved?.data?.cashCounted != null ? String(local.saved.data.cashCounted) : '');
+        setLoading(false);
+        return;
+      }
+      setOffline(false);
+
       // Window for the selected business day (local midnight to next midnight).
       const dayStart = new Date(`${day}T00:00:00`);
       const start = dayStart.toISOString();
@@ -1687,25 +1738,33 @@ function ReconcilePanel({ station, currentUser }) {
 
   const saveStockIn = async () => {
     if (stockInMoves.length === 0) return;
-    if (!navigator.onLine) {
-      return window.alert('Stock in needs a connection — it changes the shared stock every device reads.');
-    }
     setStockInBusy(true);
     // reason 'issue' is what the sheet reads back as IBYINJIYE; a correction
     // posts a negative 'issue', which nets to the right figure.
-    const { error } = await supabase.rpc('apply_station_stock', {
-      p_moves: stockInMoves.map(({ row, delta }) => ({
-        uid: crypto.randomUUID(),
-        station_id: station.id,
-        product_id: row.id,
-        business_id: getBusinessId(),
-        delta,
-        reason: 'issue',
-        staff_name: currentUser?.name ?? null,
-      })),
-    });
+    const moves = stockInMoves.map(({ row, delta }) => ({
+      uid: crypto.randomUUID(),
+      station_id: station.id,
+      product_id: row.id,
+      business_id: getBusinessId(),
+      delta,
+      reason: 'issue',
+      staff_name: currentUser?.name ?? null,
+    }));
+
+    // Queued rather than sent: a delivery can arrive during an outage, and the
+    // per-move uid (0028) makes the retry safe. The local mirrors below are
+    // what the sheet reads until the queue drains.
+    await recordLocalMoves(moves);
+    await enqueue('stock_move', { moves });
+    await Promise.all(
+      moves.map(async (m) => {
+        const key = [station.id, String(m.product_id)];
+        const existing = await db.station_stock.get(key);
+        if (existing) await db.station_stock.update(key, { quantity: existing.quantity + m.delta });
+      })
+    );
+
     setStockInBusy(false);
-    if (error) return window.alert(`Could not save stock in: ${error.message}`);
     setRefreshKey((n) => n + 1); // re-read so opening/expected reflect the delivery
   };
 
@@ -1720,7 +1779,11 @@ function ReconcilePanel({ station, currentUser }) {
     if (!name) return window.alert('Enter who owes this shortfall');
 
     setDebtBusy(true);
-    const { error } = await supabase.from('debts').insert({
+    // Local first + queued, like every other write: a shortfall must be
+    // recordable at the moment it is discovered, which may be the same moment
+    // the network is gone.
+    const debtRow = {
+      id: crypto.randomUUID(),
       business_id: getBusinessId(),
       customer_name: name,
       amount,
@@ -1732,15 +1795,25 @@ function ReconcilePanel({ station, currentUser }) {
       status: 'open',
       source: 'reconciliation',
       business_day: day,
-    });
-    if (error) {
+      created_at: Date.now(),
+    };
+    try {
+      await db.debts.add({ ...debtRow, synced_status: 0 });
+      await enqueue('debt', {
+        localId: debtRow.id,
+        row: { ...debtRow, created_at: new Date(debtRow.created_at).toISOString() },
+      });
+    } catch (err) {
       setDebtBusy(false);
-      return window.alert(`Could not save the debt: ${error.message}`);
+      return window.alert(`Could not save the debt: ${err.message}`);
     }
 
     // Re-read so the amadeni card, the outstanding balance and the Save gate all
-    // reflect the new debt from the server rather than an optimistic guess.
-    const figures = await loadDebtFigures(getBusinessId(), station.id, day);
+    // reflect the new debt — from the server when there is one, otherwise from
+    // the local mirror the row was just written to.
+    const figures = navigator.onLine
+      ? await loadDebtFigures(getBusinessId(), station.id, day)
+      : (await loadLocalDay(station.id, day)).debts;
     const { shortfallDebts: shortfalls, ...totals } = figures;
     setDebts(totals);
     setShortfallDebts(shortfalls);
@@ -1772,11 +1845,22 @@ function ReconcilePanel({ station, currentUser }) {
       shrinkage_cost: liveView.totals.varianceCost,
       data: liveView,
     };
-    const { error } = await supabase.from('reconciliations').upsert(row, { onConflict: 'business_id,station_id,business_day' });
+    // Saved locally first, then queued. A closed day must survive a dead
+    // network — losing the count because the wifi died at 11pm is exactly the
+    // failure that makes a venue go back to the notebook.
+    await db.reconciliations.put({
+      station_id: station.id,
+      business_day: day,
+      submitted_by: row.submitted_by,
+      submitted_at: row.submitted_at,
+      data: liveView,
+      synced_status: 0,
+    });
+    await enqueue('reconciliation', { row, localKey: [station.id, day] });
+
     setSaving(false);
-    if (error) return window.alert(`Could not save: ${error.message}`);
     setSavedRec(row);
-    refreshHistory();
+    if (navigator.onLine) refreshHistory();
   };
 
   // Build the whole reconciliation as a PDF (loaded on demand). Returns the doc
@@ -1922,6 +2006,14 @@ function ReconcilePanel({ station, currentUser }) {
             </span>
           )}
           {!isToday && <span className="text-xs font-semibold text-amber-600">Past day — read only</span>}
+          {/* Say where the numbers came from. An offline sheet is this device's
+              account of the night, and the barman should know that before he
+              signs his name to it. */}
+          {offline && (
+            <span className="text-xs font-semibold text-sky-700 bg-sky-50 border border-sky-200 rounded-lg px-2 py-1">
+              📴 Offline — from this device. Saves now, uploads when the network returns.
+            </span>
+          )}
           {(view.recounts ?? 0) > 0 && (
             <span className="text-xs font-semibold text-amber-600" title="The count was reopened after the variance was shown">
               ↺ Recounted {view.recounts}× after seeing the variance

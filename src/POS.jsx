@@ -7,6 +7,7 @@ import { can } from './permissions';
 import { getDeviceId, nextReceiptNo } from './receipts';
 import { buildRoundPayload, encodeHandover, decodeHandover, applyHandover } from './handover';
 import { enqueue, drain, pendingCount, deadCount, startOutbox, saleRowForServer } from './outbox';
+import { recordLocalMoves } from './reconcileLocal';
 import QrScanner from './QrScanner';
 import RoundQr from './RoundQr';
 import WaiterSettlement from './WaiterSettlement';
@@ -710,7 +711,12 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
             });
           })
         );
-        if (moves.length) await enqueue('stock_move', { moves });
+        if (moves.length) {
+          // Locally too, so tonight's reconcile can reconstruct opening stock
+          // without the server (same uid, so the copies converge).
+          await recordLocalMoves(moves);
+          await enqueue('stock_move', { moves });
+        }
       }
 
       setDebtPrompt(false);
