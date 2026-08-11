@@ -110,9 +110,14 @@ DONE:
   phone → shows a per-ROUND QR at the counter → barman scans, issues the stock,
   and confirms the payment (he is accountable for stock and money). Two offline
   phones cannot reach each other through Supabase and a PWA has no LAN/BT
-  channel, so QR is the handover. src/handover.js + QrScanner + RoundQr;
-  received_rounds is the idempotency ledger (a second scan is a no-op). The
-  waiter's phone never pushes sales — one writer of money per venue.
+  channel, so QR is the handover when there is no network. When there IS one the
+  round travels over Supabase (migration 0029, `handovers` table + realtime) and
+  lands at the counter by itself — but under the SAME handover id, so a barman
+  who scans out of habit gets "already received" instead of a doubled tab. Two
+  transports, one order. src/handover.js + QrScanner + RoundQr; received_rounds
+  is the local idempotency ledger, and received_at is claimed atomically so two
+  tills cannot both take the same round. The waiter's phone never pushes sales —
+  one writer of money per venue.
 - STOREMAN/barman lands on the POS (landingFor), not the dashboard; both
   surfaces switch via buttons. WaiterSettlement = "who is still holding my
   money". DebtRecovery = take an amadeni repayment at the counter, offline

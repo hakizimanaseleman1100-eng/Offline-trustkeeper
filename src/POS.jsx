@@ -5,7 +5,14 @@ import { supabase } from './supabaseClient';
 import { getBusinessId } from './session';
 import { can } from './permissions';
 import { getDeviceId, nextReceiptNo } from './receipts';
-import { buildRoundPayload, encodeHandover, decodeHandover, applyHandover } from './handover';
+import {
+  buildRoundPayload,
+  encodeHandover,
+  decodeHandover,
+  applyHandover,
+  handoverRowForServer,
+  pullHandovers,
+} from './handover';
 import { enqueue, drain, pendingCount, deadCount, startOutbox, saleRowForServer } from './outbox';
 import { recordLocalMoves } from './reconcileLocal';
 import QrScanner from './QrScanner';
@@ -496,6 +503,11 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
           payload,
           created_at: Date.now(),
         });
+        // Offer it to the counter over the network too. Same id as the QR, so
+        // whichever arrives first wins — the barman scanning out of habit after
+        // it already landed is recognised, not served twice. Queued, so a
+        // network that comes back later still delivers it.
+        await enqueue('handover', { row: handoverRowForServer(payload) });
       }
 
       await db.active_tabs.update(activeTabId, { current_round: currentRound + 1 });
@@ -742,6 +754,17 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
 
     try {
       const result = await applyHandover(payload, { barman: currentUser });
+      // Claim it server-side too, so another till doesn't pull the same round
+      // over the network after this one took it off the screen. Best-effort:
+      // the local ledger is what actually prevents a double.
+      if (navigator.onLine) {
+        supabase
+          .from('handovers')
+          .update({ received_at: new Date().toISOString(), received_by: currentUser?.name ?? null })
+          .eq('id', payload.id)
+          .is('received_at', null)
+          .then(({ error }) => error && console.error('Handover claim failed:', error.message));
+      }
       if (result.duplicate) {
         return showToast('Already received — this round is on the tab', 3500);
       }
@@ -809,6 +832,50 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
       setSyncing(false);
     }
   };
+
+  // The counter's online ear. Rounds land by themselves when there is network,
+  // so scanning is only for when there isn't. Both paths carry the same
+  // handover id, so a habit-scan after an automatic arrival is a no-op.
+  useEffect(() => {
+    if (handoverMode) return; // a waiter offers rounds, he doesn't receive them
+
+    let active = true;
+    const pull = async () => {
+      const applied = await pullHandovers({ barman: currentUser });
+      if (!active || applied.length === 0) return;
+      // Announce without stealing focus: the barman may be mid-sale, and
+      // yanking him into another tab is how the wrong bottle gets poured.
+      const last = applied[applied.length - 1];
+      showToast(
+        applied.length === 1
+          ? `Round ${last.payload.round} from ${last.payload.waiter.name || 'a waiter'} · ${last.result.total.toLocaleString()} RWF`
+          : `${applied.length} rounds received`,
+        4000
+      );
+    };
+    pull();
+
+    const channel = supabase
+      .channel('handovers')
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'handovers', filter: `business_id=eq.${getBusinessId()}` },
+        () => pull()
+      )
+      .subscribe();
+
+    // Realtime can miss things (a dropped socket, a round raised while this
+    // device was offline), so a slow poll backs it up.
+    const timer = setInterval(pull, 20_000);
+    window.addEventListener('online', pull);
+
+    return () => {
+      active = false;
+      supabase.removeChannel(channel);
+      clearInterval(timer);
+      window.removeEventListener('online', pull);
+    };
+  }, [handoverMode, currentUser]);
 
   useEffect(() => {
     db.meta.get('last_sync_at').then((row) => row?.value && setLastSyncAt(row.value));

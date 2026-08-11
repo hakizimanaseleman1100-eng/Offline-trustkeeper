@@ -1,4 +1,6 @@
 import { db } from './db';
+import { supabase } from './supabaseClient';
+import { getBusinessId } from './session';
 
 // Waiter → barman round handover, offline, over a QR code.
 //
@@ -100,6 +102,71 @@ export function decodeHandover(text) {
 
 export function payloadTotal(payload) {
   return payload.lines.reduce((sum, l) => sum + l.quantity * l.unit_price, 0);
+}
+
+// The row the waiter's phone offers to the counter over the network. Carries
+// the QR's payload verbatim, under the same id — one order, two transports.
+export function handoverRowForServer(payload) {
+  return {
+    id: payload.h,
+    business_id: getBusinessId(),
+    tab_uid: payload.t,
+    tab_name: payload.tn || null,
+    round: payload.n,
+    waiter_id: payload.w?.i ?? null,
+    waiter_name: payload.w?.n ?? null,
+    payload,
+  };
+}
+
+// The counter pulling rounds that arrived over the network.
+//
+// Claim BEFORE applying: the update only matches while received_at is null, so
+// if a venue runs two tills exactly one of them wins the row. Applying first
+// would let both apply it and put the same crate on two tabs — the doubling
+// this whole design exists to prevent, just between devices instead of between
+// transports.
+//
+// If the local apply then fails, the claim is released so the round is not
+// stranded. If it succeeds, a later QR scan of the same code hits the
+// received_rounds ledger and is a no-op.
+export async function pullHandovers({ barman } = {}) {
+  if (!navigator.onLine) return [];
+
+  const { data, error } = await supabase
+    .from('handovers')
+    .select('*')
+    .eq('business_id', getBusinessId())
+    .is('received_at', null)
+    .order('created_at');
+  if (error || !data?.length) return [];
+
+  const applied = [];
+  for (const row of data) {
+    const { payload, error: badPayload } = decodeHandover(JSON.stringify(row.payload));
+    if (badPayload) {
+      console.error('Handover payload rejected:', badPayload);
+      continue;
+    }
+
+    // Atomic claim — `.select()` returns the row only if this device won it.
+    const { data: claimed, error: claimErr } = await supabase
+      .from('handovers')
+      .update({ received_at: new Date().toISOString(), received_by: barman?.name ?? null })
+      .eq('id', row.id)
+      .is('received_at', null)
+      .select();
+    if (claimErr || !claimed?.length) continue; // another counter took it
+
+    try {
+      const result = await applyHandover(payload, { barman });
+      if (!result.duplicate) applied.push({ payload, result });
+    } catch (err) {
+      console.error('Handover apply failed after claim, releasing:', err);
+      await supabase.from('handovers').update({ received_at: null, received_by: null }).eq('id', row.id);
+    }
+  }
+  return applied;
 }
 
 // Applies a scanned round on the BARMAN's device: finds (or opens) the tab that

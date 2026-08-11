@@ -34,7 +34,12 @@ function RoundQr({ round, code, lines, total, onClose }) {
     <div className="fixed inset-0 z-50 bg-slate-900/95 flex flex-col items-center justify-center p-5 gap-4">
       <div className="text-center">
         <p className="text-white text-xl font-extrabold">Round {round}</p>
-        <p className="text-slate-400 text-sm">Show this to the barman</p>
+        {/* When there's network the round has already gone to the counter by
+            itself; the code is the fallback, not the delivery. Scanning it
+            anyway is safe — same id, so the barman gets "already received". */}
+        <p className="text-slate-400 text-sm">
+          {navigator.onLine ? 'Sent to the counter — show this only if asked' : 'Show this to the barman'}
+        </p>
       </div>
 
       <div className="bg-white rounded-2xl p-3 shadow-xl">

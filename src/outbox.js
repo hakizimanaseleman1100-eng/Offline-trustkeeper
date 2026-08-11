@@ -117,6 +117,14 @@ const handlers = {
     if (localId) await db.debt_payments.update(localId, { synced_status: 1 });
   },
 
+  // A waiter's round, offered to the counter over the network. Same id as the
+  // QR carries, so whichever transport arrives first wins and the other is
+  // recognised as already-received rather than served twice.
+  async handover({ row }) {
+    const { error } = await supabase.from('handovers').upsert(row, { onConflict: 'id', ignoreDuplicates: true });
+    if (error) throw error;
+  },
+
   // Flipping a fully-paid debt to 'settled'. Naturally idempotent — setting the
   // same status twice is the same as once — and queued BEHIND its payment, so
   // it can never mark a debt settled before the money that settled it arrives.
