@@ -219,6 +219,87 @@ export async function voidPurchase(purchase, staff) {
   });
 }
 
+// One row per product, ready to type into: what is on the shelf, what the last
+// supplier charged, and how many crates the sales history says to buy. Ordering
+// should be reading down a list and correcting numbers, not searching for
+// twenty products one at a time and remembering last month's prices.
+export async function buildOrderRows({ stationId = null, targetDays = 7 } = {}) {
+  const [suggestions, lastCosts, stockRows] = await Promise.all([
+    buildSuggestions({ targetDays }),
+    lastUnitCostByProduct(),
+    db.station_stock.toArray(),
+  ]);
+
+  // Stock at the station the goods will land at; venue-wide when there is none.
+  const stationStock = {};
+  for (const r of stockRows) {
+    if (stationId && String(r.station_id) !== String(stationId)) continue;
+    const id = String(r.product_id);
+    stationStock[id] = (stationStock[id] ?? 0) + Number(r.quantity ?? 0);
+  }
+
+  return suggestions.map((s) => {
+    const lastUnitCost = lastCosts[s.id] ?? s.cost_price ?? 0;
+    return {
+      ...s,
+      stationStock: stationId ? stationStock[s.id] ?? 0 : s.stock,
+      lastUnitCost,
+      // Bars quote crate prices, so that is what the field holds.
+      packageCost: Math.round(lastUnitCost * s.units_per_package),
+      // True when this price came from a real previous delivery rather than
+      // the product's standing cost — worth showing, so nobody trusts a guess.
+      pricedFromHistory: lastCosts[s.id] !== undefined,
+    };
+  });
+}
+
+// The most recent unit cost actually paid per product, from purchase history.
+async function lastUnitCostByProduct() {
+  const purchases = await db.purchases.orderBy('created_at').reverse().limit(40).toArray();
+  const byUid = new Map(purchases.filter((p) => p.status !== 'void').map((p) => [p.uid, p.created_at]));
+  if (byUid.size === 0) return {};
+
+  const lines = await db.purchase_lines.where('purchase_uid').anyOf([...byUid.keys()]).toArray();
+  const newest = {};
+  for (const l of lines) {
+    const when = byUid.get(l.purchase_uid) ?? 0;
+    const id = String(l.product_id);
+    if (!newest[id] || when > newest[id].when) newest[id] = { when, cost: l.unit_cost };
+  }
+  return Object.fromEntries(Object.entries(newest).map(([id, v]) => [id, v.cost]));
+}
+
+// The document the supplier actually receives — WhatsApp is how these orders
+// travel in practice, so plain text is the primary format, not a PDF.
+//
+// No EBM disclaimer here on purpose: engineering rule 4 governs customer bills,
+// and this is an order TO a supplier, not a receipt for a sale.
+export function orderText({ purchase, lines, venueName }) {
+  const money = (n) => Math.round(n || 0).toLocaleString();
+  const body = lines.map((l) => {
+    const per = Math.max(1, Number(l.units_per_package_snapshot) || 1);
+    const qty =
+      per > 1
+        ? `${l.packages} ${l.package_name || 'case'}${l.loose_units ? ` + ${l.loose_units}` : ''}`
+        : `${l.quantity}`;
+    return `${l.product_name} — ${qty} (${l.quantity} units) · ${money(l.line_cost)} RWF`;
+  });
+
+  return [
+    venueName || 'Order',
+    `ORDER ${purchase.po_number}`,
+    purchase.supplier_name ? `Supplier: ${purchase.supplier_name}` : null,
+    new Date(purchase.created_at ?? Date.now()).toLocaleDateString(),
+    '',
+    ...body,
+    '',
+    `TOTAL: ${money(purchase.total_cost)} RWF`,
+    purchase.notes ? `Note: ${purchase.notes}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
 // ---- Suggested order (amacupa) ---------------------------------------------
 
 const VELOCITY_DAYS = 14;

@@ -1,4 +1,5 @@
-import { useState, useMemo } from 'react';
+import { useState, useEffect, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './db';
 import { can } from './permissions';
@@ -6,7 +7,14 @@ import { can } from './permissions';
 // Purchases.jsx resolves to the wrong file on a case-insensitive filesystem
 // (Windows/macOS), and the import silently picks up the module with no default
 // export.
-import { savePurchase, voidPurchase, receiveDraft, buildSuggestions, unitCostFromPackage } from './purchaseOps';
+import {
+  savePurchase,
+  voidPurchase,
+  receiveDraft,
+  buildSuggestions,
+  buildOrderRows,
+  orderText,
+} from './purchaseOps';
 
 // Purchase management — its own module, deliberately NOT inside the 3k-line
 // OwnerDashboard.
@@ -15,11 +23,17 @@ import { savePurchase, voidPurchase, receiveDraft, buildSuggestions, unitCostFro
 // `expected = opening + purchases − sales`. Until deliveries are recorded, a
 // stock gap proves nothing, because "a crate came in and nobody wrote it down"
 // is always available as an answer — and is often the true one.
+//
+// Ordering is a LIST you read down, not a search box you use twenty times.
+// Stock, the last price the supplier charged, and how many crates the sales
+// history says to buy are all on the row before anyone types anything.
 
 const money = (n) => Math.round(n || 0).toLocaleString();
 
 function Purchases({ currentUser, notify }) {
   const [screen, setScreen] = useState('new'); // new | history | suggest
+  const [prefill, setPrefill] = useState(null); // { [product_id]: packages }
+  const [orderSheet, setOrderSheet] = useState(null); // a saved order to send/print
   const canVoid = can(currentUser?.role, 'purchases.void');
 
   return (
@@ -31,9 +45,9 @@ function Purchases({ currentUser, notify }) {
 
       <div className="flex gap-2">
         {[
-          ['new', '➕ New delivery'],
+          ['new', '🧾 Order / delivery'],
           ['history', '📋 History'],
-          ['suggest', '📊 Suggested order'],
+          ['suggest', '📊 Stock analysis'],
         ].map(([key, label]) => (
           <button
             key={key}
@@ -47,17 +61,43 @@ function Purchases({ currentUser, notify }) {
         ))}
       </div>
 
-      {screen === 'new' && <NewPurchase currentUser={currentUser} notify={notify} onSaved={() => setScreen('history')} />}
-      {screen === 'history' && <PurchaseHistory currentUser={currentUser} notify={notify} canVoid={canVoid} />}
-      {screen === 'suggest' && <SuggestedOrder currentUser={currentUser} notify={notify} onDrafted={() => setScreen('history')} />}
+      {screen === 'new' && (
+        <NewPurchase
+          currentUser={currentUser}
+          notify={notify}
+          prefill={prefill}
+          onConsumedPrefill={() => setPrefill(null)}
+          onSaved={(sheet) => {
+            if (sheet) setOrderSheet(sheet);
+            else setScreen('history');
+          }}
+        />
+      )}
+      {screen === 'history' && (
+        <PurchaseHistory
+          currentUser={currentUser}
+          notify={notify}
+          canVoid={canVoid}
+          onSend={setOrderSheet}
+        />
+      )}
+      {screen === 'suggest' && (
+        <StockAnalysis
+          onOrderThese={(map) => {
+            setPrefill(map);
+            setScreen('new');
+          }}
+        />
+      )}
+
+      {orderSheet && <OrderSheet {...orderSheet} notify={notify} onClose={() => setOrderSheet(null)} />}
     </div>
   );
 }
 
-// ---- 1. New delivery (the 90% flow) ----------------------------------------
+// ---- 1. Order / delivery — one row per product ------------------------------
 
-function NewPurchase({ currentUser, notify, onSaved }) {
-  const products = useLiveQuery(() => db.inventory.toArray(), [], []);
+function NewPurchase({ currentUser, notify, onSaved, prefill, onConsumedPrefill }) {
   const stations = useLiveQuery(() => db.stations.toArray(), [], []);
   const recentSuppliers = useLiveQuery(async () => {
     const rows = await db.purchases.orderBy('created_at').reverse().limit(50).toArray();
@@ -68,88 +108,138 @@ function NewPurchase({ currentUser, notify, onSaved }) {
   const [notes, setNotes] = useState('');
   const [stationId, setStationId] = useState(currentUser?.station_id ?? '');
   const [search, setSearch] = useState('');
-  const [lines, setLines] = useState([]);
+  const [showAll, setShowAll] = useState(false);
+  const [entries, setEntries] = useState({}); // product_id -> { packages, loose, packageCost }
   const [busy, setBusy] = useState(false);
 
-  // Default the station once they load: goods have to land somewhere, and a
-  // one-counter venue should never have to think about it.
   const effectiveStation = stationId || stations.find((s) => s.active !== false)?.id || '';
+  const rows = useLiveQuery(() => buildOrderRows({ stationId: effectiveStation || null }), [effectiveStation], null);
 
-  const matches = search.trim()
-    ? products
-        .filter((p) => (p.item_name ?? '').toLowerCase().includes(search.trim().toLowerCase()))
-        .slice(0, 8)
-    : [];
+  // Costs are prefilled from what the supplier last actually charged; quantities
+  // are NOT, because a list that arrives pre-filled with quantities is an order
+  // nobody decided to place.
+  useEffect(() => {
+    if (!rows) return;
+    setEntries((current) => {
+      const next = { ...current };
+      for (const r of rows) {
+        if (!next[r.id]) next[r.id] = { packages: '', loose: '', packageCost: String(r.packageCost || '') };
+      }
+      return next;
+    });
+  }, [rows]);
 
-  const addLine = (product) => {
-    const per = Math.max(1, Number(product.units_per_package) || 1);
-    setLines((current) => [
-      ...current,
-      {
-        key: crypto.randomUUID(),
-        product_id: String(product.id),
-        product_name: product.item_name,
-        package_name: product.package_name || 'case',
-        units_per_package_snapshot: per,
-        packages: '',
-        loose_units: '',
-        package_cost: per > 1 ? String(Math.round((product.cost_price ?? 0) * per)) : String(product.cost_price ?? 0),
-        current_cost: Number(product.cost_price ?? 0),
-      },
-    ]);
-    setSearch('');
+  // Arriving from the analysis screen with "order these".
+  useEffect(() => {
+    if (!prefill || !rows) return;
+    setEntries((current) => {
+      const next = { ...current };
+      for (const [id, packages] of Object.entries(prefill)) {
+        const row = rows.find((r) => r.id === id);
+        next[id] = {
+          packages: String(packages),
+          loose: next[id]?.loose ?? '',
+          packageCost: next[id]?.packageCost || String(row?.packageCost || ''),
+        };
+      }
+      return next;
+    });
+    onConsumedPrefill?.();
+  }, [prefill, rows, onConsumedPrefill]);
+
+  const patch = (id, changes) =>
+    setEntries((current) => ({ ...current, [id]: { ...current[id], ...changes } }));
+
+  const fillSuggested = () => {
+    if (!rows) return;
+    setEntries((current) => {
+      const next = { ...current };
+      for (const r of rows) {
+        if (r.suggestedPackages > 0) {
+          next[r.id] = { ...next[r.id], packages: String(r.suggestedPackages) };
+        }
+      }
+      return next;
+    });
   };
 
-  const patch = (key, changes) =>
-    setLines((current) => current.map((l) => (l.key === key ? { ...l, ...changes } : l)));
+  const visible = useMemo(() => {
+    if (!rows) return [];
+    const q = search.trim().toLowerCase();
+    return rows.filter((r) => {
+      if (q && !(r.name ?? '').toLowerCase().includes(q)) return false;
+      if (showAll) return true;
+      // By default: things a venue actually restocks — crated goods, anything
+      // held in stock, and anything already typed into this order.
+      const typed = Number(entries[r.id]?.packages) > 0 || Number(entries[r.id]?.loose) > 0;
+      return r.units_per_package > 1 || r.stationStock > 0 || typed;
+    });
+  }, [rows, search, showAll, entries]);
 
-  const computed = lines.map((l) => {
-    const per = Math.max(1, Number(l.units_per_package_snapshot) || 1);
-    const quantity = (Number(l.packages) || 0) * per + (Number(l.loose_units) || 0);
-    const unit_cost = unitCostFromPackage(l.package_cost, per);
-    const line_cost = quantity * unit_cost;
-    // Passive signal, never a block: supplier prices move, and the owner should
-    // simply be able to SEE that this crate cost more than the last one.
-    const changePct = l.current_cost > 0 ? ((unit_cost - l.current_cost) / l.current_cost) * 100 : 0;
-    return { ...l, per, quantity, unit_cost, line_cost, changePct };
-  });
+  const lines = useMemo(() => {
+    if (!rows) return [];
+    return rows
+      .map((r) => {
+        const e = entries[r.id] ?? {};
+        const packages = Number(e.packages) || 0;
+        const loose = Number(e.loose) || 0;
+        const quantity = packages * r.units_per_package + loose;
+        if (quantity <= 0) return null;
+        const unit_cost = Math.round((Number(e.packageCost) || 0) / Math.max(1, r.units_per_package));
+        return {
+          product_id: r.id,
+          product_name: r.name,
+          package_name: r.package_name,
+          packages,
+          loose_units: loose,
+          units_per_package_snapshot: r.units_per_package,
+          quantity,
+          unit_cost,
+          line_cost: quantity * unit_cost,
+        };
+      })
+      .filter(Boolean);
+  }, [rows, entries]);
 
-  const total = computed.reduce((sum, l) => sum + l.line_cost, 0);
-  const totalUnits = computed.reduce((sum, l) => sum + l.quantity, 0);
+  const total = lines.reduce((sum, l) => sum + l.line_cost, 0);
 
-  const save = async () => {
-    if (computed.every((l) => l.quantity === 0)) return notify('Enter how many came in');
+  const save = async ({ receive }) => {
+    if (lines.length === 0) return notify('Enter how many crates to order');
     setBusy(true);
     try {
       const result = await savePurchase({
         header: { supplier_name: supplier, notes },
-        lines: computed.map((l) => ({
-          product_id: l.product_id,
-          product_name: l.product_name,
-          packages: l.packages,
-          loose_units: l.loose_units,
-          units_per_package_snapshot: l.per,
-          unit_cost: l.unit_cost,
-        })),
+        lines,
         station_id: effectiveStation || null,
         staff: currentUser,
-        receive: true, // v1 flow is record-on-delivery; drafts come from the suggested order
+        receive,
       });
-      notify(`${result.po_number} received · ${money(result.total_cost)} RWF`);
-      setLines([]);
+      setEntries({});
       setSupplier('');
       setNotes('');
-      onSaved?.();
+      if (receive) {
+        notify(`${result.po_number} received · ${money(result.total_cost)} RWF`);
+        onSaved?.(null);
+      } else {
+        // A draft is an ORDER: hand back a document to send to the supplier.
+        notify(`Order ${result.po_number} saved`);
+        onSaved?.({
+          purchase: { ...result, supplier_name: supplier, notes, created_at: Date.now(), total_cost: result.total_cost },
+          lines,
+        });
+      }
     } catch (err) {
       console.error('Purchase save failed:', err);
-      notify(err.message ?? 'Could not save the delivery');
+      notify(err.message ?? 'Could not save');
     } finally {
       setBusy(false);
     }
   };
 
+  if (rows === null) return <p className="text-slate-400">Loading…</p>;
+
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 pb-24">
       <div className="bg-white rounded-2xl shadow-md p-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
         <input
           list="recent-suppliers"
@@ -185,133 +275,229 @@ function NewPurchase({ currentUser, notify, onSaved }) {
         />
       </div>
 
-      {/* Product search */}
-      <div className="bg-white rounded-2xl shadow-md p-4">
+      <div className="flex flex-wrap items-center gap-2">
         <input
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          placeholder="Search a product to add…"
-          className="w-full px-4 py-3 rounded-lg border border-gray-300"
+          placeholder="Filter the list…"
+          className="flex-1 min-w-[12rem] px-4 py-2 rounded-lg border border-gray-300"
         />
-        {matches.length > 0 && (
-          <div className="mt-2 divide-y divide-gray-100">
-            {matches.map((p) => (
-              <button
-                key={p.id}
-                onClick={() => addLine(p)}
-                className="w-full text-left px-2 py-2.5 hover:bg-slate-50 flex justify-between items-center"
-              >
-                <span className="font-semibold text-slate-700">{p.item_name}</span>
-                <span className="text-xs text-slate-400">
-                  {Number(p.units_per_package) > 1
-                    ? `${p.units_per_package} / ${p.package_name || 'case'}`
-                    : 'by unit'}
-                </span>
-              </button>
-            ))}
-          </div>
-        )}
+        <button
+          onClick={fillSuggested}
+          className="px-3 py-2 rounded-lg bg-white text-slate-700 text-sm font-semibold shadow-sm active:scale-95"
+        >
+          ✨ Fill suggested
+        </button>
+        <button
+          onClick={() => setShowAll((v) => !v)}
+          className="px-3 py-2 rounded-lg bg-white text-slate-600 text-sm font-semibold shadow-sm active:scale-95"
+        >
+          {showAll ? 'Stocked only' : 'Show all products'}
+        </button>
       </div>
 
-      {/* Lines */}
-      {computed.length > 0 && (
-        <div className="space-y-3">
-          {computed.map((l) => (
-            <div key={l.key} className="bg-white rounded-2xl shadow-md p-4 space-y-3">
-              <div className="flex justify-between items-start gap-3">
-                <div className="min-w-0">
-                  <p className="font-bold text-slate-800 truncate">{l.product_name}</p>
-                  <p className="text-xs text-slate-400">
-                    {l.per > 1 ? `${l.per} per ${l.package_name}` : 'sold by unit'}
-                  </p>
-                </div>
-                <button
-                  onClick={() => setLines((current) => current.filter((x) => x.key !== l.key))}
-                  className="text-slate-400 text-xl leading-none px-2"
-                  aria-label={`Remove ${l.product_name}`}
-                >
-                  ×
-                </button>
-              </div>
-
-              <div className="grid grid-cols-3 gap-2">
-                <label className="col-span-1">
-                  <span className="block text-[11px] uppercase tracking-wide text-slate-400 mb-1">
-                    {l.per > 1 ? 'Amakase' : 'Units'}
-                  </span>
-                  <input
-                    type="number"
-                    min="0"
-                    inputMode="numeric"
-                    value={l.packages}
-                    onChange={(e) => patch(l.key, { packages: e.target.value })}
-                    className="w-full px-3 py-3 rounded-lg border border-gray-300 text-xl font-bold text-center"
-                  />
-                </label>
-                {l.per > 1 && (
-                  <label>
-                    <span className="block text-[11px] uppercase tracking-wide text-slate-400 mb-1">Loose</span>
+      <div className="overflow-x-auto bg-white rounded-2xl shadow-md">
+        <table className="w-full text-left text-sm whitespace-nowrap">
+          <thead className="bg-slate-100 text-slate-600 text-[11px]">
+            <tr>
+              <th className="px-3 py-2">IBICURUZWA<div className="font-normal text-slate-400 normal-case">Item</div></th>
+              <th className="px-3 py-2 text-right">Stock</th>
+              <th className="px-3 py-2 text-right">Suggested</th>
+              <th className="px-3 py-2 text-right">AMAKASE<div className="font-normal text-slate-400 normal-case">Order</div></th>
+              <th className="px-3 py-2 text-right">Loose</th>
+              <th className="px-3 py-2 text-right">Cost / case</th>
+              <th className="px-3 py-2 text-right">Line</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-100">
+            {visible.map((r) => {
+              const e = entries[r.id] ?? {};
+              const packages = Number(e.packages) || 0;
+              const loose = Number(e.loose) || 0;
+              const quantity = packages * r.units_per_package + loose;
+              const unitCost = Math.round((Number(e.packageCost) || 0) / Math.max(1, r.units_per_package));
+              return (
+                <tr key={r.id} className={quantity > 0 ? 'bg-emerald-50/40' : ''}>
+                  <td className="px-3 py-2">
+                    <p className="font-semibold text-slate-700">{r.name}</p>
+                    <p className="text-[11px] text-slate-400">
+                      {r.units_per_package > 1 ? `${r.units_per_package} / ${r.package_name}` : 'by unit'}
+                      {r.daysLeft !== null && r.daysLeft < 3 && (
+                        <span className="text-red-600 font-semibold"> · {r.daysLeft.toFixed(1)}d left</span>
+                      )}
+                    </p>
+                  </td>
+                  <td className="px-3 py-2 text-right text-slate-500">{Math.round(r.stationStock)}</td>
+                  <td className="px-3 py-2 text-right">
+                    {r.suggestedPackages > 0 ? (
+                      <button
+                        onClick={() => patch(r.id, { packages: String(r.suggestedPackages) })}
+                        className="px-2 py-1 rounded-lg bg-amber-100 text-amber-700 font-bold text-xs active:scale-95"
+                      >
+                        {r.suggestedPackages}
+                      </button>
+                    ) : (
+                      <span className="text-slate-300">—</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-2 text-right">
                     <input
                       type="number"
                       min="0"
                       inputMode="numeric"
-                      value={l.loose_units}
-                      onChange={(e) => patch(l.key, { loose_units: e.target.value })}
-                      className="w-full px-3 py-3 rounded-lg border border-gray-300 text-center"
+                      value={e.packages ?? ''}
+                      onChange={(ev) => patch(r.id, { packages: ev.target.value })}
+                      className="w-16 px-2 py-1.5 rounded border border-gray-300 text-right font-bold"
                     />
-                  </label>
-                )}
-                <label className={l.per > 1 ? '' : 'col-span-2'}>
-                  <span className="block text-[11px] uppercase tracking-wide text-slate-400 mb-1">
-                    Cost / {l.per > 1 ? l.package_name : 'unit'}
-                  </span>
-                  <input
-                    type="number"
-                    min="0"
-                    inputMode="numeric"
-                    value={l.package_cost}
-                    onChange={(e) => patch(l.key, { package_cost: e.target.value })}
-                    className="w-full px-3 py-3 rounded-lg border border-gray-300 text-right"
-                  />
-                </label>
-              </div>
+                  </td>
+                  <td className="px-3 py-2 text-right">
+                    {r.units_per_package > 1 ? (
+                      <input
+                        type="number"
+                        min="0"
+                        inputMode="numeric"
+                        value={e.loose ?? ''}
+                        onChange={(ev) => patch(r.id, { loose: ev.target.value })}
+                        className="w-14 px-2 py-1.5 rounded border border-gray-300 text-right"
+                      />
+                    ) : (
+                      <span className="text-slate-300">—</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-2 text-right">
+                    <input
+                      type="number"
+                      min="0"
+                      inputMode="numeric"
+                      value={e.packageCost ?? ''}
+                      onChange={(ev) => patch(r.id, { packageCost: ev.target.value })}
+                      className="w-24 px-2 py-1.5 rounded border border-gray-300 text-right"
+                    />
+                    {/* Say when the price is a real one the supplier charged, so
+                        nobody mistakes the product's standing cost for it. */}
+                    {!r.pricedFromHistory && Number(e.packageCost) > 0 && (
+                      <span className="block text-[10px] text-slate-400">from product cost</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-2 text-right font-semibold text-slate-800">
+                    {quantity > 0 ? `${money(quantity * unitCost)}` : <span className="text-slate-300">—</span>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        {visible.length === 0 && (
+          <p className="px-4 py-6 text-slate-400 text-sm">
+            Nothing to show. Set “per case” on a product in Inventory, or tap “Show all products”.
+          </p>
+        )}
+      </div>
 
-              <div className="flex justify-between items-center text-sm">
-                <span className="text-slate-500">
-                  {l.quantity} units × {money(l.unit_cost)}
-                  {Math.abs(l.changePct) > 10 && l.current_cost > 0 && (
-                    <span className={`ml-2 font-semibold ${l.changePct > 0 ? 'text-amber-600' : 'text-emerald-600'}`}>
-                      {l.changePct > 0 ? '↑' : '↓'} was {money(l.current_cost)}
-                    </span>
-                  )}
-                </span>
-                <span className="font-bold text-slate-800">{money(l.line_cost)} RWF</span>
-              </div>
-            </div>
-          ))}
+      {/* Sticky action bar: the totals and both endings of the flow. */}
+      <div className="fixed bottom-0 inset-x-0 md:left-64 bg-slate-900 text-white px-4 py-3 flex items-center justify-between gap-3 z-20">
+        <div>
+          <p className="text-[11px] uppercase tracking-wide text-slate-400">
+            {lines.length} line{lines.length === 1 ? '' : 's'}
+          </p>
+          <p className="text-xl font-extrabold">{money(total)} RWF</p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => save({ receive: false })}
+            disabled={busy}
+            className="px-4 py-2.5 rounded-xl bg-white/10 font-bold text-sm active:scale-95 disabled:opacity-50"
+          >
+            📤 Save order
+          </button>
+          <button
+            onClick={() => save({ receive: true })}
+            disabled={busy}
+            className="px-4 py-2.5 rounded-xl bg-emerald-500 font-bold text-sm active:scale-95 disabled:opacity-50"
+          >
+            {busy ? '…' : '✔ Received now'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
-          <div className="bg-slate-900 text-white rounded-2xl p-4 flex justify-between items-center">
-            <div>
-              <p className="text-xs uppercase tracking-wide text-slate-400">Total · {totalUnits} units</p>
-              <p className="text-2xl font-extrabold">{money(total)} RWF</p>
-            </div>
-            <button
-              onClick={save}
-              disabled={busy}
-              className="px-6 py-3 rounded-xl bg-emerald-500 font-bold active:scale-95 disabled:opacity-50"
-            >
-              {busy ? 'Saving…' : '✔ Received'}
+// ---- The document the supplier gets ----------------------------------------
+
+function OrderSheet({ purchase, lines, notify, onClose }) {
+  const [venue, setVenue] = useState('');
+  useEffect(() => {
+    db.meta.get('business').then((row) => setVenue(row?.value?.name ?? ''));
+  }, []);
+
+  const text = orderText({ purchase, lines, venueName: venue });
+
+  const share = async () => {
+    const data = { title: `Order ${purchase.po_number}`, text };
+    if (navigator.share && (!navigator.canShare || navigator.canShare(data))) {
+      try {
+        await navigator.share(data);
+        return;
+      } catch (err) {
+        if (err?.name === 'AbortError') return;
+      }
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      notify?.('Order copied — paste it to the supplier');
+    } catch {
+      notify?.('Could not share the order');
+    }
+  };
+
+  // Print by hiding everything else on the page: the sheet is portalled to the
+  // body so no ancestor's `display:none` can swallow it (a descendant cannot
+  // override a hidden ancestor).
+  const print = () => {
+    document.body.classList.add('printing-order');
+    window.print();
+    document.body.classList.remove('printing-order');
+  };
+
+  return (
+    <>
+      <div className="fixed inset-0 z-50 bg-slate-900/80 flex items-center justify-center p-4">
+        <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-5 space-y-4">
+          <div>
+            <p className="font-extrabold text-slate-800 text-lg">Order {purchase.po_number}</p>
+            <p className="text-slate-500 text-sm">Send this to the supplier. Mark it received when it arrives.</p>
+          </div>
+          <pre className="bg-slate-50 rounded-xl p-3 text-xs text-slate-700 whitespace-pre-wrap max-h-64 overflow-y-auto">
+            {text}
+          </pre>
+          <div className="grid grid-cols-3 gap-2">
+            <button onClick={share} className="h-12 rounded-xl bg-amber-500 text-white font-bold active:scale-95">
+              ↗ Send
+            </button>
+            <button onClick={print} className="h-12 rounded-xl bg-slate-900 text-white font-bold active:scale-95">
+              🖨 Print
+            </button>
+            <button onClick={onClose} className="h-12 rounded-xl bg-slate-100 text-slate-600 font-bold active:scale-95">
+              Close
             </button>
           </div>
         </div>
+      </div>
+
+      {createPortal(
+        <div id="order-print" className="hidden print:block p-8 font-mono text-black whitespace-pre-wrap">
+          {text}
+        </div>,
+        document.body
       )}
-    </div>
+    </>
   );
 }
 
 // ---- 2. History -------------------------------------------------------------
 
-function PurchaseHistory({ currentUser, notify, canVoid }) {
+function PurchaseHistory({ currentUser, notify, canVoid, onSend }) {
   const [openUid, setOpenUid] = useState(null);
   const purchases = useLiveQuery(
     () => db.purchases.orderBy('created_at').reverse().limit(100).toArray(),
@@ -337,15 +523,20 @@ function PurchaseHistory({ currentUser, notify, canVoid }) {
   const doReceive = async (purchase) => {
     try {
       await receiveDraft(purchase, currentUser);
-      notify(`${purchase.po_number} received`);
+      notify(`${purchase.po_number} received — stock updated`);
     } catch (err) {
       notify(err.message ?? 'Could not receive');
     }
   };
 
+  const doSend = async (purchase) => {
+    const rows = await db.purchase_lines.where('purchase_uid').equals(purchase.uid).toArray();
+    onSend?.({ purchase, lines: rows });
+  };
+
   if (purchases === null) return <p className="text-slate-400">Loading…</p>;
   if (purchases.length === 0) {
-    return <div className="bg-white rounded-2xl shadow-md px-5 py-6 text-slate-400">No deliveries recorded yet.</div>;
+    return <div className="bg-white rounded-2xl shadow-md px-5 py-6 text-slate-400">No orders or deliveries yet.</div>;
   }
 
   return (
@@ -359,10 +550,14 @@ function PurchaseHistory({ currentUser, notify, canVoid }) {
             <div className="min-w-0">
               <p className={`font-semibold truncate ${p.status === 'void' ? 'text-slate-400 line-through' : 'text-slate-800'}`}>
                 {p.supplier_name || 'Supplier not named'}
+                {p.status === 'draft' && (
+                  <span className="ml-2 text-[10px] uppercase tracking-wide bg-amber-100 text-amber-700 rounded px-1.5 py-0.5">
+                    ordered
+                  </span>
+                )}
               </p>
               <p className="text-xs text-slate-400 truncate">
                 {p.po_number} · {new Date(p.created_at).toLocaleDateString()}
-                {p.status === 'draft' && ' · DRAFT'}
                 {p.synced_status === 0 && ' · waiting to upload'}
               </p>
             </div>
@@ -384,13 +579,19 @@ function PurchaseHistory({ currentUser, notify, canVoid }) {
                   <span className="shrink-0">{money(l.line_cost)}</span>
                 </div>
               ))}
-              <div className="flex gap-2 pt-2">
+              <div className="flex flex-wrap gap-2 pt-2">
+                <button
+                  onClick={() => doSend(p)}
+                  className="px-4 py-2 rounded-lg bg-slate-100 text-slate-700 text-sm font-semibold active:scale-95"
+                >
+                  ↗ Send / print
+                </button>
                 {p.status === 'draft' && (
                   <button
                     onClick={() => doReceive(p)}
                     className="px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm font-semibold active:scale-95"
                   >
-                    ✔ Mark received
+                    ✔ Mark received — update stock
                   </button>
                 )}
                 {canVoid && p.status !== 'void' && (
@@ -413,43 +614,19 @@ function PurchaseHistory({ currentUser, notify, canVoid }) {
   );
 }
 
-// ---- 3. Suggested order (amacupa) ------------------------------------------
+// ---- 3. Stock analysis (amacupa) -------------------------------------------
 
-function SuggestedOrder({ currentUser, notify, onDrafted }) {
+function StockAnalysis({ onOrderThese }) {
   const [targetDays, setTargetDays] = useState(7);
   const [empties, setEmpties] = useState({}); // product_id -> counted empties
-  const [busy, setBusy] = useState(false);
   const rows = useLiveQuery(() => buildSuggestions({ targetDays }), [targetDays], null);
-
-  // Only crated products by default — nobody reorders airtime by the case.
   const crated = useMemo(() => (rows ?? []).filter((r) => r.units_per_package > 1), [rows]);
 
-  const createDraft = async () => {
-    const wanted = crated.filter((r) => r.suggestedPackages > 0);
-    if (wanted.length === 0) return notify('Nothing needs reordering yet');
-    setBusy(true);
-    try {
-      await savePurchase({
-        header: { supplier_name: '', notes: `Suggested order · ${targetDays} days cover` },
-        lines: wanted.map((r) => ({
-          product_id: r.id,
-          product_name: r.name,
-          packages: r.suggestedPackages,
-          loose_units: 0,
-          units_per_package_snapshot: r.units_per_package,
-          unit_cost: r.cost_price,
-        })),
-        station_id: currentUser?.station_id ?? null,
-        staff: currentUser,
-        receive: false, // a draft: the storeman marks it received on delivery
-      });
-      notify('Draft order created — mark it received when it arrives');
-      onDrafted?.();
-    } catch (err) {
-      notify(err.message ?? 'Could not create the draft');
-    } finally {
-      setBusy(false);
-    }
+  const orderThese = () => {
+    const map = Object.fromEntries(
+      crated.filter((r) => r.suggestedPackages > 0).map((r) => [r.id, r.suggestedPackages])
+    );
+    onOrderThese?.(map);
   };
 
   if (rows === null) return <p className="text-slate-400">Loading…</p>;
@@ -470,11 +647,10 @@ function SuggestedOrder({ currentUser, notify, onDrafted }) {
         </label>
         <span className="text-xs text-slate-400">Velocity from the last 14 days of recorded sales.</span>
         <button
-          onClick={createDraft}
-          disabled={busy}
-          className="ml-auto px-4 py-2 rounded-lg bg-amber-500 text-white text-sm font-semibold active:scale-95 disabled:opacity-50"
+          onClick={orderThese}
+          className="ml-auto px-4 py-2 rounded-lg bg-amber-500 text-white text-sm font-semibold active:scale-95"
         >
-          {busy ? 'Creating…' : 'Create draft order'}
+          Order these →
         </button>
       </div>
 
@@ -534,7 +710,7 @@ function SuggestedOrder({ currentUser, notify, onDrafted }) {
 
       {crated.length === 0 && (
         <p className="text-slate-400 text-sm">
-          No crated products yet — set “units per {`{package}`}” on a product in Inventory and it will appear here.
+          No crated products yet — set “per case” on a product in Inventory and it will appear here.
         </p>
       )}
     </div>

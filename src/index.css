@@ -1,1 +1,11 @@
 @import "tailwindcss";
+
+/* Printing a supplier order.
+   The sheet is portalled to <body> and everything else is hidden, because a
+   descendant cannot override a hidden ancestor — printing from inside the
+   dashboard tree would otherwise print the sidebar and the whole page. */
+@media print {
+  body.printing-order > *:not(#order-print) {
+    display: none !important;
+  }
+}
