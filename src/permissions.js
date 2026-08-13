@@ -50,9 +50,10 @@ export function canSell(role) {
 //    (granting roles) — those stay with the owner.
 //  - STOREMAN / BARMAN: stock accountability — Reconcile, Inventory, Expenses.
 const TABS = {
-  OWNER: ['Dashboard', 'Sales', 'Reconcile', 'Reports', 'Stations', 'Inventory', 'Expenses', 'Team', 'Customers', 'Debts', 'Order QR', 'Settings'],
-  MANAGER: ['Dashboard', 'Sales', 'Reconcile', 'Reports', 'Stations', 'Inventory', 'Expenses', 'Customers', 'Debts', 'Order QR'],
-  STOREMAN: ['Reconcile', 'Inventory', 'Expenses'],
+  OWNER: ['Dashboard', 'Sales', 'Reconcile', 'Reports', 'Stations', 'Inventory', 'Purchases', 'Expenses', 'Team', 'Customers', 'Debts', 'Order QR', 'Settings'],
+  MANAGER: ['Dashboard', 'Sales', 'Reconcile', 'Reports', 'Stations', 'Inventory', 'Purchases', 'Expenses', 'Customers', 'Debts', 'Order QR'],
+  // The storeman receives the deliveries, so Purchases is his screen above all.
+  STOREMAN: ['Reconcile', 'Inventory', 'Purchases', 'Expenses'],
 };
 
 export function allowedTabs(role) {
@@ -64,10 +65,13 @@ export function canOpenTab(role, key) {
 
 // Granular capabilities — loss-prone POS actions and admin powers. Kept as a set
 // per role so new capabilities are a one-line change.
+// purchases.create is wide (the storeman meets the supplier at the door);
+// purchases.void is narrow, because voiding reverses stock and restores costs —
+// the same separation of duties as voiding a sale.
 const CAPABILITIES = {
-  OWNER: ['pos.void', 'pos.discount', 'pos.refund', 'team.manage', 'settings.manage'],
-  MANAGER: ['pos.void', 'pos.discount', 'pos.refund'],
-  STOREMAN: [],
+  OWNER: ['pos.void', 'pos.discount', 'pos.refund', 'team.manage', 'settings.manage', 'purchases.create', 'purchases.void'],
+  MANAGER: ['pos.void', 'pos.discount', 'pos.refund', 'purchases.create', 'purchases.void'],
+  STOREMAN: ['purchases.create'],
   WAITER: [],
   KITCHEN: [],
 };

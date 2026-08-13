@@ -6,6 +6,7 @@ import { getBusinessId } from './session';
 import { hashPin, pinProblem } from './auth';
 import { enqueue } from './outbox';
 import { loadLocalDay, recordLocalMoves } from './reconcileLocal';
+import Purchases from './Purchases';
 import { allowedTabs, canOpenTab, roleLabel, ROLES } from './permissions';
 
 const STAFF_ROLES = ROLES; // assignable roles for the Team tab
@@ -17,6 +18,7 @@ const NAV_LINKS = [
   { key: 'Reports', icon: '📈' },
   { key: 'Stations', icon: '🏪' },
   { key: 'Inventory', icon: '📦' },
+  { key: 'Purchases', icon: '🚚' },
   { key: 'Expenses', icon: '💵' },
   { key: 'Team', icon: '👥' },
   { key: 'Customers', icon: '🧑' },
@@ -455,6 +457,10 @@ function InventoryTab({ notify }) {
         sub_category: edit.sub_category || null,
         tax_label: edit.tax_label,
         tax_rate: taxRateFor(edit.tax_label),
+        // Packaging drives the Purchases screens: how many bottles in a crate,
+        // and what the venue calls it. 1 = bought as it is sold.
+        units_per_package: Math.max(1, Number(edit.units_per_package) || 1),
+        package_name: edit.package_name?.trim() || 'case',
       })
       .eq('id', edit.id);
     if (error) {
@@ -606,6 +612,8 @@ function InventoryTab({ notify }) {
                 <th className="px-5 py-3">Price</th>
                 <th className="px-5 py-3">Cost</th>
                 <th className="px-5 py-3">Tax</th>
+                {/* Packaging: what Purchases counts in. 1 = bought by the unit. */}
+                <th className="px-5 py-3">Per case</th>
                 <th className="px-5 py-3">Stock{selectedStation ? '' : ' (pick station)'}</th>
                 <th className="px-5 py-3 text-right">Actions</th>
               </tr>
@@ -631,6 +639,25 @@ function InventoryTab({ notify }) {
                         ))}
                       </select>
                     </td>
+                    <td className="px-5 py-3">
+                      <div className="flex gap-1">
+                        <input
+                          type="number"
+                          min="1"
+                          value={edit.units_per_package ?? 1}
+                          onChange={(e) => setEdit({ ...edit, units_per_package: e.target.value })}
+                          className="w-14 px-2 py-1 rounded border border-gray-300 text-right"
+                          aria-label="Units per package"
+                        />
+                        <input
+                          value={edit.package_name ?? 'case'}
+                          onChange={(e) => setEdit({ ...edit, package_name: e.target.value })}
+                          placeholder="ikase"
+                          className="w-20 px-2 py-1 rounded border border-gray-300"
+                          aria-label="Package name"
+                        />
+                      </div>
+                    </td>
                     <td className="px-5 py-3 text-slate-400">—</td>
                     <td className="px-5 py-3 text-right whitespace-nowrap">
                       <button onClick={saveEdit} className="px-3 py-1 rounded-lg bg-emerald-600 text-white text-sm font-semibold active:scale-95">Save</button>
@@ -645,6 +672,15 @@ function InventoryTab({ notify }) {
                     <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.unit_price?.toLocaleString()} RWF</td>
                     <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.cost_price?.toLocaleString()} RWF</td>
                     <td className="px-5 py-3 text-slate-500 whitespace-nowrap">{p.tax_label} ({p.tax_rate}%)</td>
+                    <td className="px-5 py-3 text-slate-500 whitespace-nowrap">
+                      {Number(p.units_per_package) > 1 ? (
+                        <>
+                          {p.units_per_package} <span className="text-slate-400">/ {p.package_name || 'case'}</span>
+                        </>
+                      ) : (
+                        <span className="text-slate-300">by unit</span>
+                      )}
+                    </td>
                     <td className="px-5 py-3 whitespace-nowrap">
                       {selectedStation ? (
                         <div className="flex items-center gap-1">
@@ -1542,7 +1578,11 @@ function ReconcilePanel({ station, currentUser }) {
       for (const m of movesRes.data ?? []) {
         const k = String(m.product_id);
         deltaSum[k] = (deltaSum[k] ?? 0) + Number(m.delta);
-        if (m.reason === 'issue') issued[k] = (issued[k] ?? 0) + Number(m.delta);
+        // A delivery recorded in Purchases is stock IN exactly like a manual
+        // issue — it is the `purchases` term in opening + purchases − sales.
+        if (m.reason === 'issue' || m.reason === 'purchase') {
+          issued[k] = (issued[k] ?? 0) + Number(m.delta);
+        }
       }
 
       // Sales are the money source of truth: per-item quantity + net revenue, and
@@ -3447,6 +3487,7 @@ function OwnerDashboard({ currentUser, onLogout, onOpenPos }) {
             {activeLink === 'Reconcile' && <ReconcileTab currentUser={currentUser} />}
             {activeLink === 'Stations' && <StationsTab notify={notify} />}
             {activeLink === 'Inventory' && <InventoryTab notify={notify} />}
+            {activeLink === 'Purchases' && <Purchases currentUser={currentUser} notify={notify} />}
             {activeLink === 'Expenses' && <ExpensesTab notify={notify} />}
             {activeLink === 'Team' && <TeamTab notify={notify} />}
             {activeLink === 'Customers' && <CustomersTab notify={notify} />}

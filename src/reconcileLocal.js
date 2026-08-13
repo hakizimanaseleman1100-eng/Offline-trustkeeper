@@ -44,7 +44,11 @@ export async function loadLocalDay(stationId, day) {
     if (!inDay(m.created_at)) continue;
     const k = String(m.product_id);
     deltaSum[k] = (deltaSum[k] ?? 0) + Number(m.delta);
-    if (m.reason === 'issue') issued[k] = (issued[k] ?? 0) + Number(m.delta);
+    // 'purchase' counts as stock IN too — a recorded delivery is the `purchases`
+    // term in opening + purchases − sales.
+    if (m.reason === 'issue' || m.reason === 'purchase') {
+      issued[k] = (issued[k] ?? 0) + Number(m.delta);
+    }
   }
 
   // Only checked-out lines are revenue: a line sitting in an open tab has been

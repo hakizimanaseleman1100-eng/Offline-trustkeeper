@@ -252,3 +252,18 @@ db.version(15).stores({
   expenses: 'uid, created_at, synced_status',
   reconciliations: '[station_id+business_day], business_day, synced_status',
 });
+
+/*
+ * version(16): purchases — the missing term in `expected = opening + purchases
+ * − sales`. Without it a variance proves nothing, because "a crate came in and
+ * nobody wrote it down" is always available as an answer, and is often true.
+ *
+ * Keyed by the client-generated `uid` rather than an auto-increment, because a
+ * delivery is recorded on whichever phone is at the store door and the line
+ * rows have to find their header again after both have synced. Lines are
+ * indexed by purchase_uid for exactly that lookup.
+ */
+db.version(16).stores({
+  purchases: 'uid, status, created_at, synced_status',
+  purchase_lines: 'uid, purchase_uid, product_id, synced_status',
+});

@@ -125,6 +125,34 @@ const handlers = {
     if (error) throw error;
   },
 
+  // A delivery, in three queued steps that MUST arrive in this order: header,
+  // then lines (they carry a foreign key to the header's uid), then the receive
+  // RPC that moves the stock and recomputes cost. The queue's ordering is what
+  // makes that safe — this is the clearest case for why it drains in sequence.
+  async purchase({ row }) {
+    const { error } = await supabase.from('purchases').upsert(row, { onConflict: 'uid', ignoreDuplicates: true });
+    if (error) throw error;
+    await db.purchases.update(row.uid, { synced_status: 1 });
+  },
+
+  async purchase_lines({ rows }) {
+    const { error } = await supabase.from('purchase_lines').upsert(rows, { onConflict: 'uid', ignoreDuplicates: true });
+    if (error) throw error;
+    await db.purchase_lines.bulkUpdate(rows.map((r) => ({ key: r.uid, changes: { synced_status: 1 } })));
+  },
+
+  // Idempotent server-side: a purchase already marked received returns without
+  // touching stock again (migration 0030).
+  async purchase_receive({ uid }) {
+    const { error } = await supabase.rpc('receive_purchase', { p_uid: uid });
+    if (error) throw error;
+  },
+
+  async purchase_void({ uid, staff }) {
+    const { error } = await supabase.rpc('void_purchase', { p_uid: uid, p_staff: staff ?? null });
+    if (error) throw error;
+  },
+
   // Flipping a fully-paid debt to 'settled'. Naturally idempotent — setting the
   // same status twice is the same as once — and queued BEHIND its payment, so
   // it can never mark a debt settled before the money that settled it arrives.

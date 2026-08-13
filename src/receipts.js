@@ -20,3 +20,16 @@ export async function nextReceiptNo() {
     return 'REC-' + String(seq).padStart(5, '0');
   });
 }
+
+// Next purchase order number, as "PO-a1b2c3d4-0007". The device id is IN the
+// number because the sequence is per device and a venue may record deliveries
+// on two phones — without it, two stores could both produce PO-0007.
+export async function nextPoNumber() {
+  const device = await getDeviceId();
+  return db.transaction('rw', db.meta, async () => {
+    const row = await db.meta.get('po_seq');
+    const seq = (row?.value ?? 0) + 1;
+    await db.meta.put({ key: 'po_seq', value: seq });
+    return `PO-${device}-${String(seq).padStart(4, '0')}`;
+  });
+}
