@@ -141,6 +141,15 @@ const handlers = {
     await db.purchase_lines.bulkUpdate(rows.map((r) => ({ key: r.uid, changes: { synced_status: 1 } })));
   },
 
+  // Corrections made when the delivery turned out to differ from the order.
+  // NOT ignoreDuplicates: the whole point is to overwrite what was ordered with
+  // what arrived, and this must land before purchase_receive reads the lines.
+  async purchase_lines_update({ rows }) {
+    const { error } = await supabase.from('purchase_lines').upsert(rows, { onConflict: 'uid' });
+    if (error) throw error;
+    await db.purchase_lines.bulkUpdate(rows.map((r) => ({ key: r.uid, changes: { synced_status: 1 } })));
+  },
+
   // Idempotent server-side: a purchase already marked received returns without
   // touching stock again (migration 0030).
   async purchase_receive({ uid }) {

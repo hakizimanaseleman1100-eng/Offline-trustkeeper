@@ -33,6 +33,23 @@ export function lineQuantity(line) {
   return (Number(line.packages) || 0) * (Number(line.units_per_package_snapshot) || 1) + (Number(line.loose_units) || 0);
 }
 
+// The server shape of a purchase line. `quantity` and `line_cost` are GENERATED
+// ALWAYS columns — Postgres rejects any write that includes them, so they are
+// stripped here rather than at each call site.
+export function serverLineRow(line) {
+  return {
+    uid: line.uid,
+    business_id: line.business_id,
+    purchase_uid: line.purchase_uid,
+    product_id: line.product_id,
+    product_name: line.product_name ?? null,
+    packages: line.packages,
+    loose_units: line.loose_units,
+    units_per_package_snapshot: line.units_per_package_snapshot,
+    unit_cost: line.unit_cost,
+  };
+}
+
 // Saves a delivery: local first (stock is up the moment the crates are on the
 // floor), then queued as header → lines → receive. The queue's ordering is what
 // makes that safe; the lines carry a foreign key to the header's uid.
@@ -89,7 +106,7 @@ export async function savePurchase({ header, lines, station_id, staff, receive =
 
   // Header, then lines, then the RPC that moves stock — in that order, always.
   await enqueue('purchase', { row: purchase });
-  await enqueue('purchase_lines', { rows: cleanLines });
+  await enqueue('purchase_lines', { rows: cleanLines.map(serverLineRow) });
 
   if (receive) {
     await applyReceiveLocally({ purchase, lines: cleanLines, staff });
@@ -157,13 +174,49 @@ async function applyReceiveLocally({ purchase, lines, staff }) {
   await recordLocalMoves(moves);
 }
 
-// Receiving a draft when the goods actually turn up. The header already exists
-// on the server (queued when the draft was created), so only the RPC is needed
-// — it is what flips the status and moves the stock.
-export async function receiveDraft(purchase, staff) {
-  const lines = await db.purchase_lines.where('purchase_uid').equals(purchase.uid).toArray();
-  await applyReceiveLocally({ purchase, lines, staff });
-  await db.purchases.update(purchase.uid, { status: 'received', received_at: Date.now() });
+// Receiving a draft when the goods actually turn up — which is rarely what was
+// ordered. The supplier is out of Fanta, brings 8 crates instead of 10, and the
+// price moved since the order. So `edits` carries what ACTUALLY arrived, keyed
+// by line uid: { packages, loose_units, unit_cost }. A line edited to zero is
+// kept, not deleted — "ordered but not delivered" is worth knowing about a
+// supplier, and deleting it would erase that.
+//
+// The lines are corrected on the server BEFORE the receive RPC runs, because
+// the RPC reads them to decide what to add to stock. The queue's ordering is
+// what makes that safe.
+export async function receiveDraft(purchase, staff, edits = null) {
+  let lines = await db.purchase_lines.where('purchase_uid').equals(purchase.uid).toArray();
+
+  if (edits) {
+    const changed = [];
+    lines = lines.map((line) => {
+      const edit = edits[line.uid];
+      if (!edit) return line;
+      const per = Math.max(1, Number(line.units_per_package_snapshot) || 1);
+      const packages = Math.max(0, Math.round(Number(edit.packages) || 0));
+      const loose_units = Math.max(0, Math.round(Number(edit.loose_units) || 0));
+      const unit_cost = Math.round(Number(edit.unit_cost ?? line.unit_cost) || 0);
+      const quantity = packages * per + loose_units;
+      const next = { ...line, packages, loose_units, unit_cost, quantity, line_cost: quantity * unit_cost };
+      const untouched =
+        next.packages === line.packages && next.loose_units === line.loose_units && next.unit_cost === line.unit_cost;
+      if (!untouched) changed.push(next);
+      return next;
+    });
+
+    if (changed.length) {
+      await db.purchase_lines.bulkPut(changed.map((l) => ({ ...l, synced_status: 0 })));
+      await enqueue('purchase_lines_update', { rows: changed.map(serverLineRow) });
+    }
+  }
+
+  // Only what actually arrived moves stock. A zero line is a record of a
+  // shortfall, not a delivery.
+  const delivered = lines.filter((l) => l.quantity > 0);
+  const total_cost = lines.reduce((sum, l) => sum + (l.line_cost ?? 0), 0);
+
+  await applyReceiveLocally({ purchase, lines: delivered, staff });
+  await db.purchases.update(purchase.uid, { status: 'received', received_at: Date.now(), total_cost });
   await enqueue('purchase_receive', { uid: purchase.uid });
   await enqueue('audit_log', {
     row: {

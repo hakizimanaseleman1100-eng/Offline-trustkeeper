@@ -499,6 +499,7 @@ function OrderSheet({ purchase, lines, notify, onClose }) {
 
 function PurchaseHistory({ currentUser, notify, canVoid, onSend }) {
   const [openUid, setOpenUid] = useState(null);
+  const [receiving, setReceiving] = useState(null); // { purchase, lines } being checked in
   const purchases = useLiveQuery(
     () => db.purchases.orderBy('created_at').reverse().limit(100).toArray(),
     [],
@@ -520,10 +521,18 @@ function PurchaseHistory({ currentUser, notify, canVoid, onSend }) {
     }
   };
 
-  const doReceive = async (purchase) => {
+  // Receiving opens the editor rather than applying the order blind: what was
+  // ordered and what turned up are different documents.
+  const openReceive = async (purchase) => {
+    const rows = await db.purchase_lines.where('purchase_uid').equals(purchase.uid).toArray();
+    setReceiving({ purchase, lines: rows });
+  };
+
+  const confirmReceive = async (purchase, edits) => {
     try {
-      await receiveDraft(purchase, currentUser);
+      await receiveDraft(purchase, currentUser, edits);
       notify(`${purchase.po_number} received — stock updated`);
+      setReceiving(null);
     } catch (err) {
       notify(err.message ?? 'Could not receive');
     }
@@ -588,10 +597,10 @@ function PurchaseHistory({ currentUser, notify, canVoid, onSend }) {
                 </button>
                 {p.status === 'draft' && (
                   <button
-                    onClick={() => doReceive(p)}
+                    onClick={() => openReceive(p)}
                     className="px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm font-semibold active:scale-95"
                   >
-                    ✔ Mark received — update stock
+                    ✔ Check in delivery
                   </button>
                 )}
                 {canVoid && p.status !== 'void' && (
@@ -610,6 +619,153 @@ function PurchaseHistory({ currentUser, notify, canVoid, onSend }) {
           )}
         </div>
       ))}
+
+      {receiving && (
+        <ReceiveSheet
+          {...receiving}
+          onCancel={() => setReceiving(null)}
+          onConfirm={(edits) => confirmReceive(receiving.purchase, edits)}
+        />
+      )}
+    </div>
+  );
+}
+
+// Checking in a delivery against the order it was raised from.
+//
+// Prefilled with what was ORDERED, because most lines arrive as asked and the
+// storeman should only have to touch the ones that didn't. "Not delivered"
+// zeroes a line without removing it — a supplier who keeps missing items is
+// something the owner should be able to see later.
+function ReceiveSheet({ purchase, lines, onCancel, onConfirm }) {
+  const [edits, setEdits] = useState(() =>
+    Object.fromEntries(
+      lines.map((l) => [
+        l.uid,
+        { packages: String(l.packages ?? 0), loose_units: String(l.loose_units ?? 0), unit_cost: String(l.unit_cost ?? 0) },
+      ])
+    )
+  );
+  const [busy, setBusy] = useState(false);
+
+  const patch = (uid, changes) => setEdits((current) => ({ ...current, [uid]: { ...current[uid], ...changes } }));
+
+  const computed = lines.map((l) => {
+    const e = edits[l.uid] ?? {};
+    const per = Math.max(1, Number(l.units_per_package_snapshot) || 1);
+    const quantity = (Number(e.packages) || 0) * per + (Number(e.loose_units) || 0);
+    const unit_cost = Math.round(Number(e.unit_cost) || 0);
+    const orderedQty = (l.packages ?? 0) * per + (l.loose_units ?? 0);
+    return { ...l, per, quantity, unit_cost, orderedQty, line_cost: quantity * unit_cost };
+  });
+
+  const total = computed.reduce((sum, l) => sum + l.line_cost, 0);
+  const short = computed.filter((l) => l.quantity < l.orderedQty).length;
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-900/80 flex items-center justify-center p-3">
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg max-h-[90vh] flex flex-col">
+        <div className="p-4 border-b border-gray-100">
+          <p className="font-extrabold text-slate-800 text-lg">Check in {purchase.po_number}</p>
+          <p className="text-slate-500 text-sm">
+            Change anything that arrived differently. Only what you confirm here goes into stock.
+          </p>
+        </div>
+
+        <div className="overflow-y-auto p-4 space-y-3">
+          {computed.map((l) => (
+            <div key={l.uid} className={`rounded-xl border p-3 space-y-2 ${l.quantity === 0 ? 'border-red-200 bg-red-50' : 'border-gray-200'}`}>
+              <div className="flex justify-between items-start gap-2">
+                <div className="min-w-0">
+                  <p className="font-semibold text-slate-800 truncate">{l.product_name}</p>
+                  <p className="text-[11px] text-slate-400">
+                    Ordered: {l.packages} × {l.per}
+                    {l.loose_units ? ` +${l.loose_units}` : ''} = {l.orderedQty} units
+                  </p>
+                </div>
+                <button
+                  onClick={() => patch(l.uid, { packages: '0', loose_units: '0' })}
+                  className="text-[11px] font-semibold text-red-600 shrink-0"
+                >
+                  Not delivered
+                </button>
+              </div>
+
+              <div className="grid grid-cols-3 gap-2">
+                <label>
+                  <span className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">Amakase</span>
+                  <input
+                    type="number"
+                    min="0"
+                    inputMode="numeric"
+                    value={edits[l.uid]?.packages ?? ''}
+                    onChange={(e) => patch(l.uid, { packages: e.target.value })}
+                    className="w-full px-2 py-2 rounded border border-gray-300 text-right font-bold"
+                  />
+                </label>
+                <label>
+                  <span className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">Loose</span>
+                  <input
+                    type="number"
+                    min="0"
+                    inputMode="numeric"
+                    value={edits[l.uid]?.loose_units ?? ''}
+                    onChange={(e) => patch(l.uid, { loose_units: e.target.value })}
+                    className="w-full px-2 py-2 rounded border border-gray-300 text-right"
+                  />
+                </label>
+                <label>
+                  <span className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">Cost / unit</span>
+                  <input
+                    type="number"
+                    min="0"
+                    inputMode="numeric"
+                    value={edits[l.uid]?.unit_cost ?? ''}
+                    onChange={(e) => patch(l.uid, { unit_cost: e.target.value })}
+                    className="w-full px-2 py-2 rounded border border-gray-300 text-right"
+                  />
+                </label>
+              </div>
+
+              <div className="flex justify-between text-xs">
+                <span className={l.quantity < l.orderedQty ? 'text-red-600 font-semibold' : 'text-slate-500'}>
+                  {l.quantity === 0
+                    ? 'Not delivered'
+                    : l.quantity < l.orderedQty
+                      ? `Short by ${l.orderedQty - l.quantity} units`
+                      : `${l.quantity} units`}
+                </span>
+                <span className="font-semibold text-slate-700">{money(l.line_cost)} RWF</span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="p-4 border-t border-gray-100 space-y-3">
+          <div className="flex justify-between items-center">
+            <span className="text-slate-500 text-sm">
+              {short > 0 ? `${short} line${short === 1 ? '' : 's'} short of the order` : 'Delivered in full'}
+            </span>
+            <span className="text-xl font-extrabold text-slate-900">{money(total)} RWF</span>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <button onClick={onCancel} className="h-12 rounded-xl bg-slate-100 text-slate-600 font-bold active:scale-95">
+              Cancel
+            </button>
+            <button
+              onClick={async () => {
+                setBusy(true);
+                await onConfirm(edits);
+                setBusy(false);
+              }}
+              disabled={busy}
+              className="h-12 rounded-xl bg-emerald-600 text-white font-bold active:scale-95 disabled:opacity-50"
+            >
+              {busy ? 'Saving…' : '✔ Confirm & update stock'}
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
