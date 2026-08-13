@@ -68,7 +68,7 @@ function NewPurchase({ currentUser, notify, onSaved }) {
   const [notes, setNotes] = useState('');
   const [stationId, setStationId] = useState(currentUser?.station_id ?? '');
   const [search, setSearch] = useState('');
-  const [lines, setLines] = useState(initialLines);
+  const [lines, setLines] = useState([]);
   const [busy, setBusy] = useState(false);
 
   // Default the station once they load: goods have to land somewhere, and a
