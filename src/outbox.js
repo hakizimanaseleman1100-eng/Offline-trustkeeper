@@ -54,6 +54,20 @@ function backoffFor(attempts) {
   return Math.min(BASE_BACKOFF_MS * 2 ** attempts, MAX_BACKOFF_MS);
 }
 
+// purchase_lines.quantity and .line_cost are GENERATED ALWAYS columns: Postgres
+// rejects (400) any write that mentions them, even with the right value.
+//
+// Stripped HERE, at the wire, and not only where the payload is built — a queue
+// stores payloads written by an older version of the app, so a fix at the call
+// site cannot reach the items already sitting in it. This is the last point
+// before the request, which makes it the only place that can repair them.
+function withoutGeneratedColumns(row) {
+  const { quantity, line_cost, ...rest } = row;
+  void quantity;
+  void line_cost;
+  return rest;
+}
+
 // The server shape of a local sale row. Shared so the checkout path and the
 // one-time migration below cannot drift apart.
 export function saleRowForServer(sale) {
@@ -136,18 +150,20 @@ const handlers = {
   },
 
   async purchase_lines({ rows }) {
-    const { error } = await supabase.from('purchase_lines').upsert(rows, { onConflict: 'uid', ignoreDuplicates: true });
+    const clean = rows.map(withoutGeneratedColumns);
+    const { error } = await supabase.from('purchase_lines').upsert(clean, { onConflict: 'uid', ignoreDuplicates: true });
     if (error) throw error;
-    await db.purchase_lines.bulkUpdate(rows.map((r) => ({ key: r.uid, changes: { synced_status: 1 } })));
+    await db.purchase_lines.bulkUpdate(clean.map((r) => ({ key: r.uid, changes: { synced_status: 1 } })));
   },
 
   // Corrections made when the delivery turned out to differ from the order.
   // NOT ignoreDuplicates: the whole point is to overwrite what was ordered with
   // what arrived, and this must land before purchase_receive reads the lines.
   async purchase_lines_update({ rows }) {
-    const { error } = await supabase.from('purchase_lines').upsert(rows, { onConflict: 'uid' });
+    const clean = rows.map(withoutGeneratedColumns);
+    const { error } = await supabase.from('purchase_lines').upsert(clean, { onConflict: 'uid' });
     if (error) throw error;
-    await db.purchase_lines.bulkUpdate(rows.map((r) => ({ key: r.uid, changes: { synced_status: 1 } })));
+    await db.purchase_lines.bulkUpdate(clean.map((r) => ({ key: r.uid, changes: { synced_status: 1 } })));
   },
 
   // Idempotent server-side: a purchase already marked received returns without
