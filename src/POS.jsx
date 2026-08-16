@@ -19,6 +19,7 @@ import QrScanner from './QrScanner';
 import RoundQr from './RoundQr';
 import WaiterSettlement from './WaiterSettlement';
 import DebtRecovery from './DebtRecovery';
+import StuckItems from './StuckItems';
 
 // "5m ago" style label for the last successful sync.
 function relativeTime(ms) {
@@ -76,6 +77,7 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
   const [scanning, setScanning] = useState(false); // barman's camera open
   const [showWaiters, setShowWaiters] = useState(false); // per-waiter settlement
   const [showDebts, setShowDebts] = useState(false); // amadeni recovery at the counter
+  const [showStuck, setShowStuck] = useState(false); // queue items that failed for good
 
   const showToast = (message, duration = 2500) => {
     setToast(message);
@@ -1267,10 +1269,13 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
           never silent — this is the line that would have caught the stock
           drift, so it says what it is and who to tell. */}
       {stuckCount > 0 && (
-        <div className="bg-red-600 text-white text-[11px] lg:text-xs px-3 sm:px-6 lg:px-10 py-1.5 font-semibold">
+        <button
+          onClick={() => setShowStuck(true)}
+          className="w-full text-left bg-red-600 text-white text-[11px] lg:text-xs px-3 sm:px-6 lg:px-10 py-1.5 font-semibold active:opacity-90"
+        >
           {stuckCount} record{stuckCount > 1 ? 's' : ''} could not be saved to the cloud. Selling is
-          unaffected — tell the owner.
-        </div>
+          unaffected — tap to see why.
+        </button>
       )}
 
       <main className="p-3 sm:p-5 lg:p-8 space-y-4 lg:space-y-6 max-w-7xl mx-auto">
@@ -1749,6 +1754,7 @@ function POS({ currentUser, onLogout, onOpenDashboard }) {
           onRecorded={(message) => showToast(message, 3500)}
         />
       )}
+      {showStuck && <StuckItems onClose={() => setShowStuck(false)} notify={showToast} />}
 
       {/* Toast */}
       {toast && (
