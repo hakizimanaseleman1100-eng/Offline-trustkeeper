@@ -135,6 +135,10 @@ function InventoryTab({ notify }) {
   const [productCategory, setProductCategory] = useState('');
   const [productSubCategory, setProductSubCategory] = useState('');
   const [taxLabel, setTaxLabel] = useState('B');
+  // Packaging: how many sellable units come in a crate, and what it is called.
+  // Blank means 1 — bought exactly as it is sold.
+  const [unitsPerPackage, setUnitsPerPackage] = useState('');
+  const [packageName, setPackageName] = useState('');
   const [initialStock, setInitialStock] = useState('');
   // Inline editing of catalog fields (name/price/cost/category/tax).
   const [edit, setEdit] = useState(null);
@@ -211,7 +215,7 @@ function InventoryTab({ notify }) {
   // download it, tweak prices, and import in one go. Columns are matched by
   // header name (see handleImportFile), so their order can be rearranged.
   const downloadTemplate = () => {
-    const header = 'Item Name,Category,Sub-category,Selling Price,Cost Price,Tax,Item Code,Quantity';
+    const header = 'Item Name,Category,Sub-category,Selling Price,Cost Price,Tax,Item Code,Quantity,Units per crate';
     const rows = [
       // Beverages — Beer
       ['Primus 65cl', 'Beverages', 'Beer', 1800, 1400, 'B', 'BR-001', 48],
@@ -292,8 +296,16 @@ function InventoryTab({ notify }) {
       ['Dunhill Pack', 'Tobacco', 'Cigarettes', 3000, 2400, 'B', 'TB-002', 20],
       ['Intore Pack', 'Tobacco', 'Cigarettes', 2500, 2000, 'B', 'TB-003', 20],
     ];
+    // Typical Rwandan crate sizes, filled in for the drinks so an imported
+    // venue can order by the case straight away. They vary by supplier and
+    // bottle size — the owner corrects them in Inventory. Everything else
+    // stays blank, which imports as 1 (bought as it is sold).
+    const perCrate = (row) => {
+      if (row[1] !== 'Beverages') return '';
+      return row[2] === 'Beer' ? 12 : 24;
+    };
     const cell = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
-    const csv = [header, ...rows.map((r) => r.map(cell).join(','))].join('\n');
+    const csv = [header, ...rows.map((r) => [...r, perCrate(r)].map(cell).join(','))].join('\n');
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
     const a = document.createElement('a');
     a.href = url;
@@ -325,6 +337,9 @@ function InventoryTab({ notify }) {
           const code = get(/code|barcode|sku/i);
           let tax = get(/tax/i).toUpperCase().replace(/[^ABCD]/g, '').slice(0, 1);
           const qty = get(/qty|quantity|stock|ibyinjiye|yatangiranye/i);
+          // Units per crate: what Purchases counts in. Without it a bulk import
+          // leaves every product "by unit" and the crate maths is unusable.
+          const perPackage = get(/per.?(case|crate|pack)|units.?per|ikase|amakase/i);
           if (!name && !price && !cost && !category && !qty) return null; // blank row
 
           const existing = byName[name.toLowerCase()];
@@ -335,7 +350,7 @@ function InventoryTab({ notify }) {
           else if (price !== '' && Number.isNaN(Number(price))) error = 'Price is not a number';
           else if (qty !== '' && Number.isNaN(Number(qty))) error = 'Quantity is not a number';
 
-          return { name, price, cost, category, subCategory, code, tax, qty, existing, error, action: existing ? 'update' : 'create' };
+          return { name, price, cost, category, subCategory, code, tax, qty, perPackage, existing, error, action: existing ? 'update' : 'create' };
         })
         .filter(Boolean);
 
@@ -369,6 +384,7 @@ function InventoryTab({ notify }) {
             item_code: r.code || null,
             tax_label: r.tax,
             tax_rate: taxRateFor(r.tax),
+            units_per_package: Math.max(1, Number(r.perPackage) || 1),
           })
           .select('id')
           .single();
@@ -387,6 +403,9 @@ function InventoryTab({ notify }) {
         if (r.category !== '') fields.category = r.category;
         if (r.subCategory !== '') fields.sub_category = r.subCategory;
         if (r.code !== '') fields.item_code = r.code;
+        if (r.perPackage !== '' && Number(r.perPackage) > 0) {
+          fields.units_per_package = Math.max(1, Number(r.perPackage));
+        }
         const { error } = await supabase.from('products').update(fields).eq('id', productId);
         if (error) {
           notify(`Failed on ${r.name}: ${error.message}`);
@@ -421,6 +440,10 @@ function InventoryTab({ notify }) {
         sub_category: productSubCategory || null,
         tax_label: taxLabel,
         tax_rate: taxRateFor(taxLabel),
+        // 1 = bought as it is sold (spirits, food, airtime). Anything higher
+        // makes the product orderable by the crate in Purchases.
+        units_per_package: Math.max(1, Number(unitsPerPackage) || 1),
+        package_name: packageName.trim() || 'case',
       })
       .select('id')
       .single();
@@ -438,6 +461,8 @@ function InventoryTab({ notify }) {
     setProductCategory('');
     setProductSubCategory('');
     setTaxLabel('B');
+    setUnitsPerPackage('');
+    setPackageName('');
     setInitialStock('');
     notify(`Added ${itemName}`);
     loadProducts();
@@ -548,6 +573,24 @@ function InventoryTab({ notify }) {
             </option>
           ))}
         </select>
+        {/* Packaging. Everything in Purchases counts in these: crates ordered,
+            crate prices, suggested amakase, and the units that reach stock.
+            Set it here or the product arrives as "by unit" and has to be
+            corrected later. */}
+        <input
+          type="number"
+          min="1"
+          placeholder="Units per crate (e.g. 12)"
+          value={unitsPerPackage}
+          onChange={(e) => setUnitsPerPackage(e.target.value)}
+          className="px-4 py-2 rounded-lg border border-gray-300"
+        />
+        <input
+          placeholder="Crate name (ikase, carton…)"
+          value={packageName}
+          onChange={(e) => setPackageName(e.target.value)}
+          className="px-4 py-2 rounded-lg border border-gray-300"
+        />
         <input
           type="number"
           placeholder={selectedStation ? 'Opening stock (blank = untracked)' : 'Select a station to stock'}
@@ -556,6 +599,12 @@ function InventoryTab({ notify }) {
           onChange={(e) => setInitialStock(e.target.value)}
           className="px-4 py-2 rounded-lg border border-gray-300 disabled:bg-slate-100"
         />
+        {Number(unitsPerPackage) > 1 && (
+          <p className="col-span-1 sm:col-span-2 lg:col-span-3 -mt-2 text-xs text-slate-500">
+            Opening stock is counted in UNITS ({unitsPerPackage} per {packageName.trim() || 'crate'}) — 5 crates is{' '}
+            {5 * Number(unitsPerPackage)}.
+          </p>
+        )}
         <button type="submit" className="col-span-1 sm:col-span-2 lg:col-span-3 py-2 rounded-lg bg-amber-500 text-white font-semibold active:scale-95">
           Add Product
         </button>
@@ -740,6 +789,7 @@ function InventoryTab({ notify }) {
                     <th className="px-4 py-2">Price</th>
                     <th className="px-4 py-2">Tax</th>
                     <th className="px-4 py-2">Qty</th>
+                    <th className="px-4 py-2">Per crate</th>
                     <th className="px-4 py-2">Status</th>
                   </tr>
                 </thead>
@@ -752,6 +802,9 @@ function InventoryTab({ notify }) {
                       <td className="px-4 py-2 text-slate-500">{r.price || (r.action === 'update' ? '(keep)' : '')}</td>
                       <td className="px-4 py-2 text-slate-500">{r.tax}</td>
                       <td className="px-4 py-2 text-slate-500">{r.qty || ''}</td>
+                      <td className="px-4 py-2 text-slate-500">
+                        {r.perPackage || (r.action === 'create' ? '1' : '(keep)')}
+                      </td>
                       <td className="px-4 py-2">
                         {r.error ? (
                           <span className="text-red-600 font-semibold">{r.error}</span>
