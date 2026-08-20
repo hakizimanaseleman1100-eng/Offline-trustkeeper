@@ -11,10 +11,10 @@ import {
   savePurchase,
   voidPurchase,
   receiveDraft,
-  buildSuggestions,
   buildOrderRows,
   orderText,
 } from './purchaseOps';
+import { nextPoNumber } from './receipts';
 
 // Purchase management — its own module, deliberately NOT inside the 3k-line
 // OwnerDashboard.
@@ -83,14 +83,25 @@ function Purchases({ currentUser, notify }) {
       )}
       {screen === 'suggest' && (
         <StockAnalysis
+          currentUser={currentUser}
+          notify={notify}
           onOrderThese={(map) => {
             setPrefill(map);
             setScreen('new');
           }}
+          onPreview={setOrderSheet}
         />
       )}
 
-      {orderSheet && <OrderSheet {...orderSheet} notify={notify} onClose={() => setOrderSheet(null)} />}
+      {orderSheet && (
+        <OrderSheet
+          purchase={orderSheet.purchase}
+          lines={orderSheet.lines}
+          onSave={orderSheet.onSave}
+          notify={notify}
+          onClose={() => setOrderSheet(null)}
+        />
+      )}
     </div>
   );
 }
@@ -203,7 +214,31 @@ function NewPurchase({ currentUser, notify, onSaved, prefill, onConsumedPrefill 
 
   const total = lines.reduce((sum, l) => sum + l.line_cost, 0);
 
-  const save = async ({ receive }) => {
+  // Print or send what is on screen without committing to it. The PO number is
+  // minted here and reused on save, so the supplier's copy and the record in
+  // History carry the same one.
+  const preview = async () => {
+    if (lines.length === 0) return notify('Enter how many crates to order');
+    const po_number = await nextPoNumber();
+    const total_cost = lines.reduce((sum, l) => sum + l.line_cost, 0);
+    onSaved?.({
+      purchase: { po_number, supplier_name: supplier, notes, total_cost, created_at: Date.now() },
+      lines,
+      onSave: async () => {
+        await savePurchase({
+          header: { po_number, supplier_name: supplier, notes },
+          lines,
+          station_id: effectiveStation || null,
+          staff: currentUser,
+          receive: false,
+        });
+        setEntries({});
+        notify(`Order ${po_number} saved`);
+      },
+    });
+  };
+
+  const save = async () => {
     if (lines.length === 0) return notify('Enter how many crates to order');
     setBusy(true);
     try {
@@ -212,22 +247,13 @@ function NewPurchase({ currentUser, notify, onSaved, prefill, onConsumedPrefill 
         lines,
         station_id: effectiveStation || null,
         staff: currentUser,
-        receive,
+        receive: true,
       });
       setEntries({});
       setSupplier('');
       setNotes('');
-      if (receive) {
-        notify(`${result.po_number} received · ${money(result.total_cost)} RWF`);
-        onSaved?.(null);
-      } else {
-        // A draft is an ORDER: hand back a document to send to the supplier.
-        notify(`Order ${result.po_number} saved`);
-        onSaved?.({
-          purchase: { ...result, supplier_name: supplier, notes, created_at: Date.now(), total_cost: result.total_cost },
-          lines,
-        });
-      }
+      notify(`${result.po_number} received · ${money(result.total_cost)} RWF`);
+      onSaved?.(null);
     } catch (err) {
       console.error('Purchase save failed:', err);
       notify(err.message ?? 'Could not save');
@@ -404,14 +430,14 @@ function NewPurchase({ currentUser, notify, onSaved, prefill, onConsumedPrefill 
         </div>
         <div className="flex gap-2">
           <button
-            onClick={() => save({ receive: false })}
+            onClick={preview}
             disabled={busy}
             className="px-4 py-2.5 rounded-xl bg-white/10 font-bold text-sm active:scale-95 disabled:opacity-50"
           >
-            📤 Save order
+            📄 Sheet
           </button>
           <button
-            onClick={() => save({ receive: true })}
+            onClick={save}
             disabled={busy}
             className="px-4 py-2.5 rounded-xl bg-emerald-500 font-bold text-sm active:scale-95 disabled:opacity-50"
           >
@@ -425,8 +451,10 @@ function NewPurchase({ currentUser, notify, onSaved, prefill, onConsumedPrefill 
 
 // ---- The document the supplier gets ----------------------------------------
 
-function OrderSheet({ purchase, lines, notify, onClose }) {
+function OrderSheet({ purchase, lines, notify, onClose, onSave }) {
   const [venue, setVenue] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
   useEffect(() => {
     db.meta.get('business').then((row) => setVenue(row?.value?.name ?? ''));
   }, []);
@@ -466,7 +494,11 @@ function OrderSheet({ purchase, lines, notify, onClose }) {
         <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-5 space-y-4">
           <div>
             <p className="font-extrabold text-slate-800 text-lg">Order {purchase.po_number}</p>
-            <p className="text-slate-500 text-sm">Send this to the supplier. Mark it received when it arrives.</p>
+            <p className="text-slate-500 text-sm">
+              {onSave && !saved
+                ? 'Send or print it now. Save it to check the delivery in later.'
+                : 'Send this to the supplier. Mark it received when it arrives.'}
+            </p>
           </div>
           <pre className="bg-slate-50 rounded-xl p-3 text-xs text-slate-700 whitespace-pre-wrap max-h-64 overflow-y-auto">
             {text}
@@ -482,6 +514,26 @@ function OrderSheet({ purchase, lines, notify, onClose }) {
               Close
             </button>
           </div>
+          {/* An unsaved preview: nothing is recorded until this is pressed, so
+              a sheet can be printed for a supplier without cluttering History
+              with orders that were never placed. */}
+          {onSave && (
+            <button
+              onClick={async () => {
+                setSaving(true);
+                try {
+                  await onSave();
+                  setSaved(true);
+                } finally {
+                  setSaving(false);
+                }
+              }}
+              disabled={saving || saved}
+              className="w-full h-12 rounded-xl bg-emerald-600 text-white font-bold active:scale-95 disabled:opacity-50"
+            >
+              {saved ? '✔ Saved — check it in from History' : saving ? 'Saving…' : '💾 Save this order'}
+            </button>
+          )}
         </div>
       </div>
 
@@ -772,10 +824,10 @@ function ReceiveSheet({ purchase, lines, onCancel, onConfirm }) {
 
 // ---- 3. Stock analysis (amacupa) -------------------------------------------
 
-function StockAnalysis({ onOrderThese }) {
+function StockAnalysis({ currentUser, notify, onOrderThese, onPreview }) {
   const [targetDays, setTargetDays] = useState(7);
   const [empties, setEmpties] = useState({}); // product_id -> counted empties
-  const rows = useLiveQuery(() => buildSuggestions({ targetDays }), [targetDays], null);
+  const rows = useLiveQuery(() => buildOrderRows({ targetDays }), [targetDays], null);
   const crated = useMemo(() => (rows ?? []).filter((r) => r.units_per_package > 1), [rows]);
 
   const orderThese = () => {
@@ -783,6 +835,45 @@ function StockAnalysis({ onOrderThese }) {
       crated.filter((r) => r.suggestedPackages > 0).map((r) => [r.id, r.suggestedPackages])
     );
     onOrderThese?.(map);
+  };
+
+  // The pre-made order: everything the sales history says to buy, at the crate
+  // size and the last price paid, as a document — without typing anything or
+  // committing to it first. Saving is a button inside the sheet.
+  const previewSuggested = async () => {
+    const wanted = crated.filter((r) => r.suggestedPackages > 0);
+    if (wanted.length === 0) return notify?.('Nothing needs reordering yet');
+
+    const lines = wanted.map((r) => ({
+      product_id: r.id,
+      product_name: r.name,
+      package_name: r.package_name,
+      packages: r.suggestedPackages,
+      loose_units: 0,
+      units_per_package_snapshot: r.units_per_package,
+      quantity: r.suggestedPackages * r.units_per_package,
+      unit_cost: r.lastUnitCost,
+      line_cost: r.suggestedPackages * r.units_per_package * r.lastUnitCost,
+    }));
+    const total_cost = lines.reduce((sum, l) => sum + l.line_cost, 0);
+    // The number is minted now and reused if it is saved, so the paper the
+    // supplier holds and the record in History carry the same PO.
+    const po_number = await nextPoNumber();
+
+    onPreview?.({
+      purchase: { po_number, supplier_name: '', notes: `Suggested order · ${targetDays} days cover`, total_cost, created_at: Date.now() },
+      lines,
+      onSave: async () => {
+        await savePurchase({
+          header: { po_number, supplier_name: '', notes: `Suggested order · ${targetDays} days cover` },
+          lines,
+          station_id: currentUser?.station_id ?? null,
+          staff: currentUser,
+          receive: false,
+        });
+        notify?.(`Order ${po_number} saved — mark it received when it arrives`);
+      },
+    });
   };
 
   if (rows === null) return <p className="text-slate-400">Loading…</p>;
@@ -802,12 +893,20 @@ function StockAnalysis({ onOrderThese }) {
           days
         </label>
         <span className="text-xs text-slate-400">Velocity from the last 14 days of recorded sales.</span>
-        <button
-          onClick={orderThese}
-          className="ml-auto px-4 py-2 rounded-lg bg-amber-500 text-white text-sm font-semibold active:scale-95"
-        >
-          Order these →
-        </button>
+        <div className="ml-auto flex gap-2">
+          <button
+            onClick={previewSuggested}
+            className="px-4 py-2 rounded-lg bg-slate-900 text-white text-sm font-semibold active:scale-95"
+          >
+            📄 Order sheet
+          </button>
+          <button
+            onClick={orderThese}
+            className="px-4 py-2 rounded-lg bg-amber-500 text-white text-sm font-semibold active:scale-95"
+          >
+            Edit first →
+          </button>
+        </div>
       </div>
 
       <div className="overflow-x-auto bg-white rounded-2xl shadow-md">

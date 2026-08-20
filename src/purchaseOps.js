@@ -329,13 +329,20 @@ async function lastUnitCostByProduct() {
 // and this is an order TO a supplier, not a receipt for a sale.
 export function orderText({ purchase, lines, venueName }) {
   const money = (n) => Math.round(n || 0).toLocaleString();
+  // A supplier reads crates and crate prices, not units and unit costs, so the
+  // document quotes what they quoted. Units are kept in brackets because that
+  // is what will actually be counted at the door.
   const body = lines.map((l) => {
     const per = Math.max(1, Number(l.units_per_package_snapshot) || 1);
+    const packageCost = (l.unit_cost ?? 0) * per;
     const qty =
       per > 1
-        ? `${l.packages} ${l.package_name || 'case'}${l.loose_units ? ` + ${l.loose_units}` : ''}`
+        ? `${l.packages} ${l.package_name || 'case'}${l.loose_units ? ` + ${l.loose_units}` : ''} (${l.quantity} units)`
         : `${l.quantity}`;
-    return `${l.product_name} — ${qty} (${l.quantity} units) · ${money(l.line_cost)} RWF`;
+    // An unpriced line is stated as such rather than printed as 0, which a
+    // supplier could reasonably read as "free".
+    const price = l.unit_cost > 0 ? `× ${money(packageCost)} = ${money(l.line_cost)} RWF` : '× price to confirm';
+    return `${l.product_name} — ${qty} ${price}`;
   });
 
   return [
@@ -347,6 +354,7 @@ export function orderText({ purchase, lines, venueName }) {
     ...body,
     '',
     `TOTAL: ${money(purchase.total_cost)} RWF`,
+    lines.some((l) => !(l.unit_cost > 0)) ? '(Some prices to be confirmed on delivery)' : null,
     purchase.notes ? `Note: ${purchase.notes}` : null,
   ]
     .filter(Boolean)
