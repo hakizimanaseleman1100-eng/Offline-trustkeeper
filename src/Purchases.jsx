@@ -126,15 +126,25 @@ function NewPurchase({ currentUser, notify, onSaved, prefill, onConsumedPrefill 
   const effectiveStation = stationId || stations.find((s) => s.active !== false)?.id || '';
   const rows = useLiveQuery(() => buildOrderRows({ stationId: effectiveStation || null }), [effectiveStation], null);
 
-  // Costs are prefilled from what the supplier last actually charged; quantities
-  // are NOT, because a list that arrives pre-filled with quantities is an order
-  // nobody decided to place.
+  // The list arrives filled in: suggested crates from the sales history, and
+  // the price the supplier last actually charged. Correcting numbers is faster
+  // than entering them, and the storeman is standing at the door.
+  //
+  // Only rows this session has not seen are defaulted, so a refresh (stock
+  // changing under the screen, another tab saving) never overwrites what
+  // someone has typed.
   useEffect(() => {
     if (!rows) return;
     setEntries((current) => {
       const next = { ...current };
       for (const r of rows) {
-        if (!next[r.id]) next[r.id] = { packages: '', loose: '', packageCost: String(r.packageCost || '') };
+        if (!next[r.id]) {
+          next[r.id] = {
+            packages: r.suggestedPackages > 0 ? String(r.suggestedPackages) : '',
+            loose: '',
+            packageCost: String(r.packageCost || ''),
+          };
+        }
       }
       return next;
     });
@@ -161,17 +171,24 @@ function NewPurchase({ currentUser, notify, onSaved, prefill, onConsumedPrefill 
   const patch = (id, changes) =>
     setEntries((current) => ({ ...current, [id]: { ...current[id], ...changes } }));
 
+  // Put the suggestions back after editing, and clear the lot — both are one
+  // tap because the list starts filled and the two things anyone wants are
+  // "undo my changes" and "start from nothing".
   const fillSuggested = () => {
     if (!rows) return;
     setEntries((current) => {
       const next = { ...current };
       for (const r of rows) {
-        if (r.suggestedPackages > 0) {
-          next[r.id] = { ...next[r.id], packages: String(r.suggestedPackages) };
-        }
+        next[r.id] = { ...next[r.id], packages: r.suggestedPackages > 0 ? String(r.suggestedPackages) : '' };
       }
       return next;
     });
+  };
+
+  const clearAll = () => {
+    setEntries((current) =>
+      Object.fromEntries(Object.entries(current).map(([id, e]) => [id, { ...e, packages: '', loose: '' }]))
+    );
   };
 
   const visible = useMemo(() => {
@@ -312,7 +329,13 @@ function NewPurchase({ currentUser, notify, onSaved, prefill, onConsumedPrefill 
           onClick={fillSuggested}
           className="px-3 py-2 rounded-lg bg-white text-slate-700 text-sm font-semibold shadow-sm active:scale-95"
         >
-          ✨ Fill suggested
+          ↺ Reset to suggested
+        </button>
+        <button
+          onClick={clearAll}
+          className="px-3 py-2 rounded-lg bg-white text-slate-600 text-sm font-semibold shadow-sm active:scale-95"
+        >
+          Clear all
         </button>
         <button
           onClick={() => setShowAll((v) => !v)}
