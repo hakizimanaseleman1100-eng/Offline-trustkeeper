@@ -140,6 +140,11 @@ function InventoryTab({ notify }) {
   const [unitsPerPackage, setUnitsPerPackage] = useState('');
   const [packageName, setPackageName] = useState('');
   const [initialStock, setInitialStock] = useState('');
+  // Add and Import are occasional; the catalogue is the point of the screen. So
+  // both start closed and the list gets the space.
+  const [showAdd, setShowAdd] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const [productSearch, setProductSearch] = useState('');
   // Inline editing of catalog fields (name/price/cost/category/tax).
   const [edit, setEdit] = useState(null);
   // Excel/CSV import: parsed preview rows and how to apply the stock column.
@@ -422,6 +427,7 @@ function InventoryTab({ notify }) {
     }
     setImporting(false);
     setImportRows(null);
+    setShowImport(false);
     notify(`Imported: ${created} new, ${updated} updated`);
     loadProducts();
     loadStock(selectedStation);
@@ -464,6 +470,7 @@ function InventoryTab({ notify }) {
     setUnitsPerPackage('');
     setPackageName('');
     setInitialStock('');
+    setShowAdd(false); // back to the list, where the new product now is
     notify(`Added ${itemName}`);
     loadProducts();
     loadStock(selectedStation);
@@ -535,28 +542,70 @@ function InventoryTab({ notify }) {
 
   const noStations = stations.length === 0;
 
+  // The catalogue is what this screen is FOR; adding and importing are things
+  // you do occasionally. They live behind buttons so the list is what you see.
+  const query = productSearch.trim().toLowerCase();
+  const visibleProducts = query
+    ? products.filter((p) =>
+        [p.item_name, p.category, p.sub_category, p.item_code]
+          .filter(Boolean)
+          .some((field) => String(field).toLowerCase().includes(query))
+      )
+    : products;
+  const stockedCount = products.filter((p) => stockMap[String(p.id)] !== undefined).length;
+
   return (
-    <div className="space-y-6">
-      {/* Station picker — stock is managed per station */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <span className="font-semibold text-slate-600">Stock at station:</span>
+    <div className="space-y-4">
+      {/* One toolbar: where stock is counted, how to find something, and the
+          two actions — instead of three stacked panels above the list. */}
+      <div className="bg-white rounded-2xl shadow-md p-3 flex flex-wrap items-center gap-2">
         {noStations ? (
-          <span className="text-slate-400 text-sm">Add a station in the Stations tab first.</span>
+          <span className="text-amber-600 text-sm font-semibold px-2">Add a station in the Stations tab first.</span>
         ) : (
-          <select
-            value={selectedStation}
-            onChange={(e) => setSelectedStation(e.target.value)}
-            className="px-4 py-2 rounded-lg border border-gray-300 bg-white"
-          >
-            {stations.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name}
-              </option>
-            ))}
-          </select>
+          <label className="flex items-center gap-2 text-sm">
+            <span className="text-slate-500 font-semibold whitespace-nowrap">Stock at</span>
+            <select
+              value={selectedStation}
+              onChange={(e) => setSelectedStation(e.target.value)}
+              className="px-3 py-2 rounded-lg border border-gray-300 bg-white font-semibold text-slate-700"
+            >
+              {stations.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name}
+                </option>
+              ))}
+            </select>
+          </label>
         )}
+
+        <input
+          value={productSearch}
+          onChange={(e) => setProductSearch(e.target.value)}
+          placeholder="Search products…"
+          className="flex-1 min-w-[10rem] px-4 py-2 rounded-lg border border-gray-300"
+        />
+
+        <button
+          type="button"
+          onClick={() => { setShowAdd((v) => !v); setShowImport(false); }}
+          className={`px-4 py-2 rounded-lg text-sm font-semibold active:scale-95 ${
+            showAdd ? 'bg-slate-200 text-slate-700' : 'bg-amber-500 text-white'
+          }`}
+        >
+          {showAdd ? '× Close' : '+ Add product'}
+        </button>
+        <button
+          type="button"
+          onClick={() => { setShowImport((v) => !v); setShowAdd(false); }}
+          className={`px-4 py-2 rounded-lg text-sm font-semibold active:scale-95 ${
+            showImport ? 'bg-slate-200 text-slate-700' : 'bg-white text-slate-600 border border-gray-300'
+          }`}
+        >
+          ⬆ Import
+        </button>
       </div>
 
+      {showAdd && (
       <form
         onSubmit={handleAddProduct}
         className="bg-white rounded-2xl shadow-md p-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"
@@ -605,12 +654,23 @@ function InventoryTab({ notify }) {
             {5 * Number(unitsPerPackage)}.
           </p>
         )}
-        <button type="submit" className="col-span-1 sm:col-span-2 lg:col-span-3 py-2 rounded-lg bg-amber-500 text-white font-semibold active:scale-95">
-          Add Product
-        </button>
+        <div className="col-span-1 sm:col-span-2 lg:col-span-3 grid grid-cols-3 gap-3">
+          <button
+            type="button"
+            onClick={() => setShowAdd(false)}
+            className="py-2 rounded-lg bg-slate-100 text-slate-600 font-semibold active:scale-95"
+          >
+            Cancel
+          </button>
+          <button type="submit" className="col-span-2 py-2 rounded-lg bg-amber-500 text-white font-semibold active:scale-95">
+            Add Product
+          </button>
+        </div>
       </form>
+      )}
 
       {/* Bulk import from Excel/CSV */}
+      {showImport && (
       <div className="bg-white rounded-2xl shadow-md p-6 space-y-3">
         <div className="flex items-center justify-between flex-wrap gap-3">
           <div>
@@ -649,8 +709,25 @@ function InventoryTab({ notify }) {
           <p className="text-xs text-amber-600">Stock column is ignored until a station is selected above.</p>
         )}
       </div>
+      )}
 
       <div className="bg-white rounded-2xl shadow-md overflow-hidden">
+        {/* What the list is showing, so a filtered view is never mistaken for
+            the whole catalogue. */}
+        <div className="px-5 py-3 border-b border-gray-100 flex flex-wrap items-baseline gap-x-2 text-sm">
+          <span className="font-semibold text-slate-700">
+            {query ? `${visibleProducts.length} of ${products.length}` : `${products.length}`} product
+            {products.length === 1 ? '' : 's'}
+          </span>
+          {!query && selectedStation && (
+            <span className="text-slate-400">· {stockedCount} stocked at this station</span>
+          )}
+          {query && (
+            <button onClick={() => setProductSearch('')} className="text-amber-600 font-semibold underline">
+              clear search
+            </button>
+          )}
+        </div>
         <div className="overflow-x-auto">
           <table className="w-full text-left">
             <thead className="bg-slate-100 text-slate-500 text-sm uppercase">
@@ -668,7 +745,16 @@ function InventoryTab({ notify }) {
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
-              {products.map((p) => {
+              {visibleProducts.length === 0 && (
+                <tr>
+                  <td colSpan={9} className="px-5 py-8 text-center text-slate-400">
+                    {products.length === 0
+                      ? 'No products yet — add one or import a list.'
+                      : `Nothing matches “${productSearch.trim()}”.`}
+                  </td>
+                </tr>
+              )}
+              {visibleProducts.map((p) => {
                 const key = String(p.id);
                 const qty = stockMap[key];
                 const tracked = qty !== undefined;
